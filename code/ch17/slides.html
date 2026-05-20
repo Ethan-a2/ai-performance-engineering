@@ -1,0 +1,1014 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch17 - Disaggregated Prefill/Decode & Routing</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface2: #1a1a26;
+    --border: #2a2a3a;
+    --text: #e8e8f0;
+    --text-dim: #8888a0;
+    --accent: #6366f1;
+    --accent2: #8b5cf6;
+    --green: #22c55e;
+    --red: #ef4444;
+    --orange: #f59e0b;
+    --cyan: #06b6d4;
+    --pink: #ec4899;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, sans-serif;
+    overflow: hidden;
+  }
+
+  .deck {
+    width: 100vw; height: 100vh;
+    position: relative;
+  }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    padding: 60px 80px;
+    opacity: 0;
+    transform: translateX(60px);
+    transition: opacity 0.5s ease, transform 0.5s ease;
+    pointer-events: none;
+    overflow: hidden;
+  }
+
+  .slide.active {
+    opacity: 1;
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  .slide.exit {
+    opacity: 0;
+    transform: translateX(-60px);
+  }
+
+  /* Slide counter */
+  .counter {
+    position: fixed;
+    bottom: 24px;
+    right: 32px;
+    font-size: 13px;
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+    z-index: 100;
+  }
+
+  /* Progress bar */
+  .progress {
+    position: fixed;
+    top: 0; left: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2), var(--pink));
+    transition: width 0.4s ease;
+    z-index: 100;
+  }
+
+  /* Navigation hint */
+  .nav-hint {
+    position: fixed;
+    bottom: 24px;
+    left: 32px;
+    font-size: 12px;
+    color: var(--text-dim);
+    opacity: 0.5;
+    z-index: 100;
+  }
+
+  /* ─── Typography ─── */
+  h1 {
+    font-size: 3.2rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+    background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    text-align: center;
+    margin-bottom: 16px;
+  }
+
+  h2 {
+    font-size: 2.2rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: #fff;
+    margin-bottom: 24px;
+  }
+
+  h3 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.85rem;
+  }
+
+  p, li {
+    font-size: 1.15rem;
+    line-height: 1.7;
+    color: var(--text);
+  }
+
+  .subtitle {
+    font-size: 1.25rem;
+    color: var(--text-dim);
+    font-weight: 400;
+    text-align: center;
+    max-width: 700px;
+  }
+
+  code, .mono {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9em;
+    background: var(--surface2);
+    padding: 2px 7px;
+    border-radius: 4px;
+    color: var(--cyan);
+  }
+
+  /* ─── Layout helpers ─── */
+  .content { max-width: 1100px; width: 100%; }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+    width: 100%;
+  }
+
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 24px;
+    width: 100%;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px;
+    transition: transform 0.2s, border-color 0.2s;
+  }
+
+  .card:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent);
+  }
+
+  .card h3 { margin-bottom: 10px; }
+
+  /* ─── Table ─── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 1rem;
+  }
+
+  th {
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 2px solid var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+  }
+
+  tr:hover td { background: var(--surface); }
+
+  .num { font-family: 'JetBrains Mono', monospace; color: var(--green); font-weight: 600; }
+  .num-big { font-family: 'JetBrains Mono', monospace; color: var(--orange); font-weight: 700; font-size: 1.3em; }
+
+  /* ─── Flow diagram ─── */
+  .flow {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
+    margin: 20px 0;
+  }
+
+  .flow-node {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 22px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    text-align: center;
+    min-width: 120px;
+  }
+
+  .flow-node.highlight {
+    border-color: var(--accent);
+    background: rgba(99, 102, 241, 0.1);
+    color: #a5b4fc;
+  }
+
+  .flow-arrow {
+    color: var(--text-dim);
+    font-size: 1.4rem;
+  }
+
+  /* ─── Tags ─── */
+  .tag {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+
+  .tag-green { background: rgba(34,197,94,0.15); color: var(--green); }
+  .tag-red   { background: rgba(239,68,68,0.15); color: var(--red); }
+  .tag-blue  { background: rgba(99,102,241,0.15); color: var(--accent); }
+  .tag-orange{ background: rgba(245,158,11,0.15); color: var(--orange); }
+
+  /* ─── Metric highlight ─── */
+  .metric {
+    text-align: center;
+    padding: 20px;
+  }
+
+  .metric .value {
+    font-size: 3.5rem;
+    font-weight: 800;
+    font-family: 'JetBrains Mono', monospace;
+    background: linear-gradient(135deg, var(--green), var(--cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .metric .label {
+    font-size: 0.9rem;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  /* ─── File tree ─── */
+  .file-tree {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.9;
+    color: var(--text-dim);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 28px;
+    max-height: 420px;
+    overflow-y: auto;
+  }
+
+  .file-tree .dir { color: var(--accent); font-weight: 600; }
+  .file-tree .file { color: var(--text); }
+  .file-tree .comment { color: var(--text-dim); opacity: 0.6; }
+
+  /* ─── Bullet list ─── */
+  ul.clean {
+    list-style: none;
+    padding: 0;
+  }
+
+  ul.clean li {
+    padding: 8px 0 8px 24px;
+    position: relative;
+  }
+
+  ul.clean li::before {
+    content: '▸';
+    position: absolute;
+    left: 0;
+    color: var(--accent);
+    font-weight: 700;
+  }
+
+  /* ─── Animated bg ─── */
+  .bg-glow {
+    position: absolute;
+    width: 600px; height: 600px;
+    border-radius: 50%;
+    filter: blur(120px);
+    opacity: 0.08;
+    pointer-events: none;
+  }
+
+  .glow-1 { background: var(--accent); top: -200px; right: -100px; }
+  .glow-2 { background: var(--pink); bottom: -200px; left: -100px; }
+  .glow-3 { background: var(--cyan); top: 50%; left: 50%; transform: translate(-50%,-50%); }
+
+  /* ─── Code block ─── */
+  .code-block {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    overflow-x: auto;
+    color: var(--text-dim);
+  }
+
+  .code-block .kw { color: var(--pink); }
+  .code-block .fn { color: var(--cyan); }
+  .code-block .str { color: var(--green); }
+  .code-block .cmt { color: #555570; font-style: italic; }
+
+  /* Responsive */
+  @media (max-width: 900px) {
+    .slide { padding: 32px 24px; }
+    h1 { font-size: 2.2rem; }
+    h2 { font-size: 1.6rem; }
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+<div class="counter" id="counter"></div>
+<div class="nav-hint">← → 或 点击翻页</div>
+
+<div class="deck" id="deck">
+
+<!-- ==================== SLIDE 1: Title ==================== -->
+<div class="slide active">
+  <div class="bg-glow glow-1"></div>
+  <div class="bg-glow glow-2"></div>
+  <h3>Chapter 17</h3>
+  <h1>Disaggregated Prefill/Decode<br>& Routing</h1>
+  <p class="subtitle">在 Blackwell 集群上实现分离式 Prefill/Decode 服务，叠加路由与调度策略，最大化 TTFT、TPOT 与吞吐</p>
+  <div style="margin-top:40px; display:flex; gap:16px;">
+    <span class="tag tag-blue">Python-focused</span>
+    <span class="tag tag-green">Strict Validity</span>
+    <span class="tag tag-orange">Policy + Orchestration</span>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 2: Problem ==================== -->
+<div class="slide">
+  <div class="bg-glow glow-3"></div>
+  <div class="content">
+    <h3>The Problem</h3>
+    <h2>路由不再是白板架构，而是要付租金的工程</h2>
+    <div class="grid-2" style="margin-top:24px;">
+      <div class="card">
+        <h3 style="color:var(--red);">❌ 核心问题</h3>
+        <ul class="clean">
+          <li>静态路由导致队列不均衡</li>
+          <li>KV Cache 迁移开销主导延迟</li>
+          <li>Prefill/Decode 阻塞式交接造成 GPU 空闲</li>
+          <li>统一 MoE 路由忽略拓扑局部性</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--green);">✅ 正确的问题</h3>
+        <p style="font-size:1.15rem; color:#a5b4fc; font-weight:600; margin-top:8px;">
+          "哪种路由器、队列策略和交接机制<br>能在完整 Prefill/Decode 路径下<br>真正改善 TTFT、TPOT 或吞吐？"
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 3: Architecture Overview ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Architecture</h3>
+    <h2>系统架构总览</h2>
+    <div class="flow" style="margin-top:20px;">
+      <div class="flow-node">Client<br><span style="font-size:0.75rem;color:var(--text-dim)">Requests</span></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-node highlight">Dynamic Router<br><span style="font-size:0.75rem;color:var(--text-dim)">Policy Engine</span></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-node">Early Rejection<br><span style="font-size:0.75rem;color:var(--text-dim)">Admission Control</span></div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-node highlight">Prefill Pool<br><span style="font-size:0.75rem;color:var(--text-dim)">Dedicated Workers</span></div>
+      <span class="flow-arrow">⇄</span>
+      <div class="flow-node highlight">Decode Pool<br><span style="font-size:0.75rem;color:var(--text-dim)">Dedicated Workers</span></div>
+    </div>
+    <div class="grid-3" style="margin-top:32px;">
+      <div class="card">
+        <h3>🧠 Dynamic Routing</h3>
+        <p>基于 TTFT/TPOT/KV 局部性的遥测驱动路由决策，替代静态分片</p>
+      </div>
+      <div class="card">
+        <h3>🚫 Early Rejection</h3>
+        <p>基于优先级 (Free/Standard/Premium) 的准入控制，保障 SLA 截止时间</p>
+      </div>
+      <div class="card">
+        <h3>🔀 MoE Topology</h3>
+        <p>拓扑感知的专家路由，减少跨岛远程传输，提升局部性</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 4: Baseline vs Optimized ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Baseline vs Optimized</h3>
+    <h2>两条路径的对比</h2>
+    <div class="grid-2" style="margin-top:20px;">
+      <div class="card" style="border-color:var(--red);">
+        <h3 style="color:var(--red);">🐢 Baseline Path</h3>
+        <ul class="clean">
+          <li>静态或最小自适应路由</li>
+          <li>保守的 Prefill/Decode 交接</li>
+          <li>更多阻塞行为</li>
+          <li>易于推理，但队列不均衡和 KV 迁移代价高昂</li>
+          <li>拓扑无关的统一 MoE 路由</li>
+        </ul>
+      </div>
+      <div class="card" style="border-color:var(--green);">
+        <h3 style="color:var(--green);">🚀 Optimized Path</h3>
+        <ul class="clean">
+          <li>拓扑感知 / 遥测感知路由</li>
+          <li>分离式 Prefill/Decode 减少空闲时间</li>
+          <li>批处理交接 / 重叠执行</li>
+          <li>通过共享 harness 度量，可与 kernel/memory 优化对比</li>
+          <li>拓扑感知专家路由</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 5: Benchmarks Results ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Measured Delta</h3>
+    <h2>实测性能提升</h2>
+    <table style="margin-top:20px;">
+      <thead>
+        <tr>
+          <th>Benchmark Target</th>
+          <th>Baseline</th>
+          <th>Optimized</th>
+          <th>Speedup</th>
+          <th>优化故事</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>routing_static</code></td>
+          <td class="num">5.680 ms</td>
+          <td class="num">0.804 ms</td>
+          <td class="num-big">7.07×</td>
+          <td>更智能的路由策略，不改变底层负载</td>
+        </tr>
+        <tr>
+          <td><code>moe_router_uniform</code></td>
+          <td class="num">4.719 ms</td>
+          <td class="num">0.931 ms</td>
+          <td class="num-big">5.07×</td>
+          <td>拓扑感知专家路由替代统一分配</td>
+        </tr>
+        <tr>
+          <td><code>prefill_decode_disagg_ttft</code></td>
+          <td class="num">2678.1 ms</td>
+          <td class="num">938.2 ms</td>
+          <td class="num-big">2.85×</td>
+          <td>针对 TTFT 优化的分离式交接</td>
+        </tr>
+      </tbody>
+    </table>
+    <p style="margin-top:20px; color:var(--text-dim); font-size:0.95rem;">
+      ⚡ 每个 target 是一个独立的系统故事 — 策略收益 + 编排收益混合呈现
+    </p>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 6: Routing Static Deep Dive ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Benchmark A</h3>
+    <h2>Routing Static — 策略开销 vs 路由质量</h2>
+    <div class="grid-2" style="margin-top:16px;">
+      <div>
+        <div class="card" style="margin-bottom:16px;">
+          <h3 style="color:var(--red);">Baseline: 静态路由</h3>
+          <p>每个请求都路由到大模型 — <code>LargeModel(2048, 24层)</code></p>
+          <p style="margin-top:8px;">512 请求/迭代，1024 条路由路径，无自适应</p>
+        </div>
+        <div class="card">
+          <h3 style="color:var(--green);">Optimized: 动态路由</h3>
+          <p>基于负载和延迟指标动态选择路由目标</p>
+          <p style="margin-top:8px;">相同工作量，智能分流减少排队延迟</p>
+        </div>
+      </div>
+      <div>
+        <div class="metric">
+          <div class="value">7.07×</div>
+          <div class="label">Speedup — 纯策略优化，无 kernel 变更</div>
+        </div>
+        <div class="code-block" style="margin-top:16px;">
+<span class="cmt"># baseline: every request → large model</span>
+<span class="kw">class</span> <span class="fn">BaselineRoutingStaticBenchmark</span>:
+    <span class="str">"""Static routing: every request uses the large model."""</span>
+    requests_per_iteration = <span class="num">512</span>
+    num_routes = <span class="num">1024</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 7: MoE Router ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Benchmark B</h3>
+    <h2>MoE Router — 拓扑感知 vs 统一路由</h2>
+    <div class="grid-2" style="margin-top:16px;">
+      <div>
+        <div class="flow" style="flex-direction:column; gap:16px;">
+          <div class="card">
+            <h3 style="color:var(--red);">Baseline: 统一路由</h3>
+            <p>拓扑无关，token 均匀分布到所有 island</p>
+            <p style="margin-top:6px;"><code>4 islands × 16 experts = 64 experts</code></p>
+            <p>大量跨岛远程传输，高 remote-transfer fraction</p>
+          </div>
+          <div class="card">
+            <h3 style="color:var(--green);">Optimized: 拓扑感知路由</h3>
+            <p>优先路由到本地 island 的专家</p>
+            <p>共享权重保证输出一致性 — 加速来自局部性改善</p>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="metric">
+          <div class="value">5.07×</div>
+          <div class="label">Speedup — 减少远程传输，提升局部性</div>
+        </div>
+        <div style="margin-top:20px;">
+          <h3>设计约束</h3>
+          <ul class="clean">
+            <li>所有专家共享相同权重</li>
+            <li>路由决策不改变输出张量语义</li>
+            <li>可度量的加速来自 locality，而非数学变化</li>
+            <li><code>256 batch × 64 seq</code>，模拟远程 EP 传输</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 8: Prefill/Decode Disaggregation ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Benchmark C</h3>
+    <h2>Prefill/Decode Disaggregation — TTFT 优化</h2>
+    <div class="flow" style="margin:20px 0;">
+      <div class="flow-node" style="border-color:var(--red);">
+        Monolithic<br><span style="font-size:0.75rem;color:var(--red);">Baseline</span><br>
+        <span style="font-size:0.8rem;color:var(--text-dim);">Prefill + Decode 一体</span>
+      </div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-node highlight">
+        Disaggregated<br><span style="font-size:0.75rem;color:var(--green);">Optimized</span><br>
+        <span style="font-size:0.8rem;color:var(--text-dim);">分离的 Prefill/Decode Pool</span>
+      </div>
+    </div>
+    <div class="grid-2" style="margin-top:16px;">
+      <div class="card">
+        <h3>Baseline: 单体推理</h3>
+        <ul class="clean">
+          <li>每个请求阻塞式 prefill → decode</li>
+          <li>per-request sync/barrier</li>
+          <li><code>SimpleLLM(1024, 12层)</code></li>
+          <li>Prefill 256 tokens + Decode 16 tokens</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Optimized: 分离式</h3>
+        <ul class="clean">
+          <li>批处理交接或连续 KV/seed slab</li>
+          <li>重叠执行减少空闲时间</li>
+          <li>专门的 Prefill/Decode worker pool</li>
+          <li>TTFT 降低 <span class="num-big" style="font-size:1rem;">2.85×</span></li>
+        </ul>
+      </div>
+    </div>
+    <div class="metric" style="margin-top:16px;">
+      <div class="value" style="font-size:2.5rem;">2678 ms → 938 ms</div>
+      <div class="label">TTFT (Time To First Token)</div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 9: Multi-GPU Variants ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Multi-GPU Variants</h3>
+    <h2>分离式推理的多种优化变体</h2>
+    <table style="margin-top:20px;">
+      <thead>
+        <tr>
+          <th>变体</th>
+          <th>优化焦点</th>
+          <th>运行方式</th>
+          <th>关键差异</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>prefill_decode_disagg</code></td>
+          <td>基础分离</td>
+          <td>单 GPU</td>
+          <td>单体 vs 分离基准对比</td>
+        </tr>
+        <tr>
+          <td><code>..._ttft_multigpu</code></td>
+          <td>TTFT 优化</td>
+          <td>torchrun</td>
+          <td>Prefill/Decode pool 分离，最小化首 token 延迟</td>
+        </tr>
+        <tr>
+          <td><code>..._overlap_multigpu</code></td>
+          <td>重叠执行</td>
+          <td>torchrun</td>
+          <td>Prefill/Decode 段重叠，减少 idle bubble</td>
+        </tr>
+        <tr>
+          <td><code>..._batched_multigpu</code></td>
+          <td>批处理交接</td>
+          <td>torchrun</td>
+          <td>per-group 批处理替代 per-request 阻塞</td>
+        </tr>
+        <tr>
+          <td><code>..._tpot_long_multigpu</code></td>
+          <td>长输出 TPOT</td>
+          <td>torchrun</td>
+          <td>长上下文场景下的每 token 延迟优化</td>
+        </tr>
+      </tbody>
+    </table>
+    <p style="margin-top:16px; color:var(--text-dim); font-size:0.9rem;">
+      📌 torchrun 多 GPU 变体默认 50/50 split（偶数 world size），可通过 <code>--prefill-ranks</code> 覆盖（如 2P1D）
+    </p>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 10: Dynamic Routing & Early Rejection ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Policy Layer</h3>
+    <h2>动态路由 + 早期拒绝策略</h2>
+    <div class="grid-2" style="margin-top:16px;">
+      <div class="card">
+        <h3>🔄 Dynamic Router</h3>
+        <div class="code-block" style="font-size:0.78rem;">
+<span class="kw">class</span> <span class="fn">DisaggregatedRouter</span>:
+    <span class="str">"""动态路由策略"""</span>
+    <span class="cmt"># WorkerMetrics:</span>
+    <span class="cmt">#   queue_length, gpu_utilization</span>
+    <span class="cmt">#   memory_usage, kv_cache_usage</span>
+    <span class="cmt">#   active_requests</span>
+    <span class="cmt"># Priority: LOW / STANDARD / HIGH</span>
+        </div>
+        <ul class="clean" style="margin-top:12px;">
+          <li>遥测驱动：TTFT、TPOT、KV 局部性</li>
+          <li>Prefix cache 命中率感知</li>
+          <li>线程安全的 worker 指标收集</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🚫 Early Rejection</h3>
+        <div class="code-block" style="font-size:0.78rem;">
+<span class="kw">class</span> <span class="fn">Priority</span>:
+    FREE = <span class="str">"free"</span>       <span class="cmt"># deadline: 1000ms</span>
+    STANDARD = <span class="str">"standard"</span> <span class="cmt"># deadline: 500ms</span>
+    PREMIUM = <span class="str">"premium"</span>  <span class="cmt"># deadline: 200ms</span>
+        </div>
+        <ul class="clean" style="margin-top:12px;">
+          <li>基于优先级的准入控制</li>
+          <li>实时系统指标：prefill/decode 队列长度</li>
+          <li>平均 prefill/decode 时间预估</li>
+          <li>超截止时间的请求提前拒绝</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 11: Pipeline Parallelism ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Pipeline Parallelism</h3>
+    <h2>流水线并行 — 消除 Idle Bubble</h2>
+    <div class="grid-2" style="margin-top:16px;">
+      <div>
+        <div class="card" style="margin-bottom:16px;">
+          <h3 style="color:var(--red);">Baseline: 顺序执行</h3>
+          <div class="flow" style="flex-direction:column; gap:6px; align-items:stretch;">
+            <div style="background:var(--surface2);padding:8px 12px;border-radius:6px;text-align:center;">Stage 0 → Stage 1 → Stage 2 → Stage 3</div>
+            <div style="color:var(--red);text-align:center;font-size:0.85rem;">所有层在单 GPU 上顺序执行</div>
+          </div>
+        </div>
+        <div class="card">
+          <h3 style="color:var(--green);">Optimized: 流水线重叠</h3>
+          <div class="flow" style="flex-direction:column; gap:6px; align-items:stretch;">
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:4px;">
+              <div style="background:rgba(99,102,241,0.2);padding:6px;border-radius:4px;text-align:center;font-size:0.8rem;">S0: Batch1</div>
+              <div style="background:rgba(99,102,241,0.2);padding:6px;border-radius:4px;text-align:center;font-size:0.8rem;">S1: Batch1</div>
+              <div style="background:rgba(99,102,241,0.2);padding:6px;border-radius:4px;text-align:center;font-size:0.8rem;">S2: Batch1</div>
+              <div style="background:rgba(99,102,241,0.2);padding:6px;border-radius:4px;text-align:center;font-size:0.8rem;">S3: Batch1</div>
+              <div style="background:rgba(34,197,94,0.2);padding:6px;border-radius:4px;text-align:center;font-size:0.8rem;">S0: Batch2</div>
+              <div style="background:rgba(34,197,94,0.2);padding:6px;border-radius:4px;text-align:center;font-size:0.8rem;">S1: Batch2</div>
+              <div style="background:rgba(34,197,94,0.2);padding:6px;border-radius:4px;text-align:center;font-size:0.8rem;">S2: Batch2</div>
+              <div style="background:rgba(34,197,94,0.2);padding:6px;border-radius:4px;text-align:center;font-size:0.8rem;">S3: Batch2</div>
+            </div>
+            <div style="color:var(--green);text-align:center;font-size:0.85rem;">4 个 stage 边界，micro-batch 流水线化</div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <h3>实现细节</h3>
+        <ul class="clean">
+          <li><code>_PIPELINE_STAGE_COUNT = 4</code></li>
+          <li>Stage 边界：<code>[(0,1), (2,3), (4,5), (6,6)]</code></li>
+          <li>模型：<code>Linear → GELU → Linear → GELU → ...</code></li>
+          <li>优化版重叠 Prefill/Decode 段</li>
+          <li>减少 idle bubble，提升 GPU 利用率</li>
+        </ul>
+        <div class="code-block" style="margin-top:16px;">
+<span class="cmt"># 7层模型，4个pipeline stage</span>
+<span class="fn">nn.Sequential</span>(
+  Linear(1024, 4096), GELU(),  <span class="cmt"># Stage 0</span>
+  Linear(4096, 4096), GELU(),  <span class="cmt"># Stage 1</span>
+  Linear(4096, 2048), GELU(),  <span class="cmt"># Stage 2</span>
+  Linear(2048, 10),           <span class="cmt"># Stage 3</span>
+)
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 12: NVFP4 MLP ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>NVFP4 Prefill</h3>
+    <h2>NVFP4 MLP — 低精度 Prefill 加速</h2>
+    <div class="grid-2" style="margin-top:20px;">
+      <div class="card">
+        <h3 style="color:var(--red);">Baseline: BF16 MLP</h3>
+        <div class="code-block">
+<span class="fn">NVFP4MLPConfig</span>(
+  batch_size  = <span class="num">512</span>,
+  d_model     = <span class="num">8192</span>,
+  d_ff        = <span class="num">32768</span>,
+  num_layers  = <span class="num">2</span>,
+  use_nvfp4   = <span class="kw">False</span>,  <span class="cmt"># BF16</span>
+)
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--green);">Optimized: NVFP4 MLP</h3>
+        <div class="code-block">
+<span class="fn">NVFP4MLPConfig</span>(
+  batch_size  = <span class="num">512</span>,
+  d_model     = <span class="num">8192</span>,
+  d_ff        = <span class="num">32768</span>,
+  num_layers  = <span class="num">2</span>,
+  use_nvfp4   = <span class="kw">True</span>,   <span class="cmt"># NVFP4</span>
+)
+        </div>
+      </div>
+    </div>
+    <p style="margin-top:24px; text-align:center; color:var(--text-dim);">
+      在 Prefill 阶段使用 NVFP4 量化，减少内存带宽占用<br>
+      <code>d_model=8192, d_ff=32768</code> — 典型 LLM MLP 维度
+    </p>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 13: Directory Layout ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Directory Layout</h3>
+    <h2>代码目录结构</h2>
+    <div class="file-tree">
+<span class="dir">ch17/</span>
+├── <span class="file">baseline_routing_static.py</span>          <span class="comment"># 静态路由基准</span>
+├── <span class="file">optimized_routing_static.py</span>         <span class="comment"># 动态路由优化</span>
+├── <span class="file">baseline_moe_router_uniform.py</span>      <span class="comment"># 统一 MoE 路由基准</span>
+├── <span class="file">optimized_moe_router_uniform_topology.py</span> <span class="comment"># 拓扑感知 MoE 路由</span>
+├── <span class="file">baseline_prefill_decode_disagg.py</span>    <span class="comment"># 单体推理基准</span>
+├── <span class="file">optimized_prefill_decode_disagg.py</span>   <span class="comment"># 分离式推理优化</span>
+├── <span class="file">*_ttft_multigpu.py</span>                  <span class="comment"># TTFT 优化 (torchrun)</span>
+├── <span class="file">*_overlap_multigpu.py</span>               <span class="comment"># 重叠执行 (torchrun)</span>
+├── <span class="file">*_batched_multigpu.py</span>               <span class="comment"># 批处理交接 (torchrun)</span>
+├── <span class="file">*_tpot_long_multigpu.py</span>             <span class="comment"># 长输出 TPOT (torchrun)</span>
+├── <span class="file">baseline_pipeline_parallelism.py</span>     <span class="comment"># 顺序执行基准</span>
+├── <span class="file">optimized_pipeline_parallelism.py</span>    <span class="comment"># 流水线并行优化</span>
+├── <span class="file">baseline_inference_full.py</span>           <span class="comment"># 全深度推理 (对比 pair)</span>
+├── <span class="file">optimized_inference_full.py</span>          <span class="comment"># 早退剪枝 (对比 pair)</span>
+├── <span class="file">baseline_nvfp4_mlp.py</span>               <span class="comment"># BF16 MLP</span>
+├── <span class="file">optimized_nvfp4_mlp.py</span>              <span class="comment"># NVFP4 MLP</span>
+├── <span class="file">dynamic_routing.py</span>                  <span class="comment"># 路由策略引擎</span>
+├── <span class="file">early_rejection.py</span>                  <span class="comment"># 准入控制策略</span>
+├── <span class="file">blackwell_profiling_guide.py</span>         <span class="comment"># Nsight 性能分析指南</span>
+├── <span class="file">compare.py</span> / <span class="file">Makefile</span>               <span class="comment"># Harness 入口 & 构建</span>
+└── <span class="file">expectations_{hw}.json</span>              <span class="comment"># 硬件期望基线</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 14: Profiling ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Profiler Evidence</h3>
+    <h2>深度性能分析命令</h2>
+    <div class="code-block" style="font-size:0.88rem; margin-top:20px;">
+<span class="cmt"># 策略开销 vs 路由质量</span>
+python -m cli.aisp bench run <span class="str">--targets ch17:routing_static</span> <span class="str">--profile deep_dive</span> <span class="str">--single-gpu</span>
+
+<span class="cmt"># 拓扑感知 MoE 路由收益</span>
+python -m cli.aisp bench run <span class="str">--targets ch17:moe_router_uniform</span> <span class="str">--profile deep_dive</span> <span class="str">--single-gpu</span>
+
+<span class="cmt"># 队列与交接行为</span>
+python -m cli.aisp bench run <span class="str">--targets ch17:prefill_decode_disagg_ttft</span> <span class="str">--profile deep_dive</span> <span class="str">--single-gpu</span>
+    </div>
+    <div class="grid-3" style="margin-top:24px;">
+      <div class="card" style="text-align:center;">
+        <h3>routing_static</h3>
+        <p style="color:var(--text-dim);">策略开销 vs<br>路由质量</p>
+      </div>
+      <div class="card" style="text-align:center;">
+        <h3>moe_router</h3>
+        <p style="color:var(--text-dim);">拓扑感知<br>MoE 路由收益</p>
+      </div>
+      <div class="card" style="text-align:center;">
+        <h3>prefill_decode</h3>
+        <p style="color:var(--text-dim);">队列与交接<br>行为分析</p>
+      </div>
+    </div>
+    <p style="margin-top:16px; color:var(--text-dim); font-size:0.9rem;">
+      📌 <code>blackwell_profiling_guide.py</code> — Nsight Systems/Compute 捕获 + roofline vs occupancy 瓶颈解读
+    </p>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 15: Validation ==================== -->
+<div class="slide">
+  <div class="content">
+    <h3>Validation</h3>
+    <h2>验证清单 & 复现命令</h2>
+    <div class="grid-2" style="margin-top:16px;">
+      <div class="card">
+        <h3>✅ 验证清单</h3>
+        <ul class="clean">
+          <li><code>optimized_dynamic_routing.py --trace</code><br>TTFT/TPOT 趋势比 baseline 更快收敛</li>
+          <li><code>optimized_pipeline_parallelism.py --profile minimal</code><br>重叠的 Prefill/Decode 段，更少 idle bubble</li>
+          <li><code>aisp tools roofline</code><br>复现文档中的 roofline 点</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🔧 复现命令</h3>
+        <div class="code-block" style="font-size:0.82rem;">
+<span class="cmt"># 快速对比</span>
+python -m ch17.compare
+
+<span class="cmt"># 列出所有 target</span>
+python -m cli.aisp bench list-targets \
+  <span class="str">--chapter ch17</span>
+
+<span class="cmt"># 全量运行</span>
+python -m cli.aisp bench run \
+  <span class="str">--targets ch17 --profile minimal</span>
+
+<span class="cmt"># 深度分析</span>
+python -m cli.aisp bench run \
+  <span class="str">--targets ch17:prefill_decode_disagg_ttft</span> \
+  <span class="str">--profile deep_dive --single-gpu</span>
+        </div>
+      </div>
+    </div>
+    <p style="margin-top:16px; color:var(--text-dim); font-size:0.85rem;">
+      ⚙️ Validity profile 默认 strict；虚拟化环境用 <code>--validity-profile portable</code>；期望基线在 <code>expectations_{hw}.json</code>
+    </p>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 16: Key Takeaways ==================== -->
+<div class="slide">
+  <div class="bg-glow glow-1"></div>
+  <div class="bg-glow glow-2"></div>
+  <div class="content">
+    <h3>Key Takeaways</h3>
+    <h2>本章核心收获</h2>
+    <div class="grid-2" style="margin-top:24px;">
+      <div class="card" style="border-color:var(--accent);">
+        <h3>🎯 学习目标</h3>
+        <ul class="clean">
+          <li>实现响应 TTFT/TPOT/KV 局部性的动态路由器</li>
+          <li>在真实合成负载下分析完整推理栈</li>
+          <li>融合流水线并行与路由逻辑</li>
+          <li>记录路由实验室的 profiling 步骤</li>
+        </ul>
+      </div>
+      <div class="card" style="border-color:var(--green);">
+        <h3>💡 关键洞察</h3>
+        <ul class="clean">
+          <li>策略优化可达 <span class="num">7×</span> 加速（无 kernel 变更）</li>
+          <li>拓扑感知路由是 MoE 的必修课</li>
+          <li>分离式 Prefill/Decode 是 TTFT 优化的核心</li>
+          <li>每个 target 是独立的系统故事</li>
+        </ul>
+      </div>
+    </div>
+    <div style="text-align:center; margin-top:32px;">
+      <p style="font-size:1.3rem; color:var(--accent); font-weight:600;">
+        "策略收益 + 编排收益 = 真正的系统级性能工程"
+      </p>
+    </div>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<script>
+(function() {
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length;
+  let current = 0;
+
+  const counter = document.getElementById('counter');
+  const progress = document.getElementById('progress');
+
+  function update() {
+    slides.forEach((s, i) => {
+      s.classList.remove('active', 'exit');
+      if (i === current) s.classList.add('active');
+      else if (i < current) s.classList.add('exit');
+    });
+    counter.textContent = `${current + 1} / ${total}`;
+    progress.style.width = `${((current + 1) / total) * 100}%`;
+  }
+
+  function go(n) {
+    current = Math.max(0, Math.min(total - 1, n));
+    update();
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'Enter') { e.preventDefault(); go(current + 1); }
+    else if (e.key === 'ArrowLeft' || e.key === 'Backspace') { e.preventDefault(); go(current - 1); }
+    else if (e.key === 'Home') { e.preventDefault(); go(0); }
+    else if (e.key === 'End') { e.preventDefault(); go(total - 1); }
+  });
+
+  document.addEventListener('click', e => {
+    if (e.clientX > window.innerWidth / 2) go(current + 1);
+    else go(current - 1);
+  });
+
+  // Touch support
+  let touchStart = 0;
+  document.addEventListener('touchstart', e => { touchStart = e.touches[0].clientX; });
+  document.addEventListener('touchend', e => {
+    const diff = touchStart - e.changedTouches[0].clientX;
+    if (Math.abs(diff) > 50) diff > 0 ? go(current + 1) : go(current - 1);
+  });
+
+  update();
+})();
+</script>
+</body>
+</html>

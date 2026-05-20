@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cluster Evaluation Harness — Architecture Overview</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --fg: #e2e8f0;
+    --accent: #38bdf8;
+    --accent2: #a78bfa;
+    --accent3: #34d399;
+    --accent4: #fb923c;
+    --accent5: #f472b6;
+    --card: #1e293b;
+    --card-border: #334155;
+    --dim: #94a3b8;
+    --code-bg: #0d1117;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:var(--bg); color:var(--fg); font-family:'Inter','Segoe UI',system-ui,sans-serif; }
+  .slide { display:none; width:100%; height:100%; padding:48px 64px; flex-direction:column; justify-content:center; position:relative; }
+  .slide.active { display:flex; }
+  h1 { font-size:2.6rem; font-weight:800; line-height:1.15; margin-bottom:16px; }
+  h2 { font-size:1.9rem; font-weight:700; margin-bottom:14px; color:var(--accent); }
+  h3 { font-size:1.3rem; font-weight:600; margin-bottom:10px; color:var(--accent2); }
+  p,li { font-size:1.05rem; line-height:1.65; color:var(--fg); }
+  .dim { color:var(--dim); }
+  .accent { color:var(--accent); }
+  .accent2 { color:var(--accent2); }
+  .accent3 { color:var(--accent3); }
+  .accent4 { color:var(--accent4); }
+  .accent5 { color:var(--accent5); }
+  ul { list-style:none; padding-left:0; }
+  ul li::before { content:"▸ "; color:var(--accent); font-weight:700; }
+  ol { padding-left:24px; }
+  ol li { margin-bottom:6px; }
+  code { background:var(--code-bg); padding:2px 8px; border-radius:4px; font-size:0.92rem; font-family:'JetBrains Mono','Fira Code',monospace; color:var(--accent3); }
+  pre { background:var(--code-bg); padding:16px 20px; border-radius:10px; overflow-x:auto; margin:10px 0; border:1px solid var(--card-border); }
+  pre code { padding:0; background:none; font-size:0.88rem; color:var(--fg); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+  .grid3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--card-border); border-radius:12px; padding:20px; }
+  .card h3 { margin-top:0; }
+  .badge { display:inline-block; padding:3px 10px; border-radius:20px; font-size:0.82rem; font-weight:600; margin-right:6px; }
+  .badge-green { background:#064e3b; color:#6ee7b7; }
+  .badge-blue { background:#1e3a5f; color:#7dd3fc; }
+  .badge-purple { background:#3b0764; color:#c4b5fd; }
+  .badge-orange { background:#7c2d12; color:#fdba74; }
+  .badge-red { background:#7f1d1d; color:#fca5a5; }
+  table { width:100%; border-collapse:collapse; margin:10px 0; font-size:0.95rem; }
+  th { text-align:left; padding:8px 12px; border-bottom:2px solid var(--accent); color:var(--accent); font-weight:600; }
+  td { padding:8px 12px; border-bottom:1px solid var(--card-border); }
+  tr:hover td { background:rgba(56,189,248,0.04); }
+  .hero { text-align:center; }
+  .hero h1 { font-size:3.2rem; background:linear-gradient(135deg,var(--accent),var(--accent2),var(--accent5)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+  .hero .subtitle { font-size:1.3rem; color:var(--dim); margin-top:8px; }
+  .metric-row { display:flex; gap:16px; flex-wrap:wrap; margin:12px 0; }
+  .metric { background:var(--card); border:1px solid var(--card-border); border-radius:10px; padding:16px 20px; flex:1; min-width:160px; text-align:center; }
+  .metric .value { font-size:2rem; font-weight:800; color:var(--accent); }
+  .metric .label { font-size:0.82rem; color:var(--dim); margin-top:4px; }
+  .flow { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:12px 0; }
+  .flow-step { background:var(--card); border:1px solid var(--card-border); border-radius:8px; padding:10px 16px; font-size:0.9rem; font-weight:600; }
+  .flow-arrow { color:var(--accent); font-size:1.4rem; }
+  .tree { font-family:'JetBrains Mono','Fira Code',monospace; font-size:0.92rem; line-height:1.7; color:var(--dim); }
+  .tree .dir { color:var(--accent); font-weight:700; }
+  .tree .file { color:var(--fg); }
+  .tree .note { color:var(--accent4); font-style:italic; }
+  .controls { position:fixed; bottom:20px; right:32px; display:flex; gap:10px; z-index:100; }
+  .controls button { background:var(--card); border:1px solid var(--card-border); color:var(--fg); padding:8px 16px; border-radius:8px; cursor:pointer; font-size:0.9rem; transition:all 0.2s; }
+  .controls button:hover { background:var(--accent); color:var(--bg); }
+  .progress { position:fixed; top:0; left:0; height:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); transition:width 0.3s; z-index:100; }
+  .slide-num { position:fixed; bottom:24px; left:32px; font-size:0.85rem; color:var(--dim); z-index:100; }
+  .tag { display:inline-block; background:var(--card); border:1px solid var(--card-border); border-radius:6px; padding:4px 10px; font-size:0.82rem; margin:3px; color:var(--dim); }
+  .icon { font-size:1.6rem; margin-right:8px; vertical-align:middle; }
+  .section-divider { font-size:0.85rem; text-transform:uppercase; letter-spacing:3px; color:var(--accent); margin-bottom:8px; font-weight:600; }
+  .highlight-box { border-left:4px solid var(--accent); padding:12px 16px; background:rgba(56,189,248,0.06); border-radius:0 8px 8px 0; margin:10px 0; }
+  .compare { display:grid; grid-template-columns:1fr auto 1fr; gap:16px; align-items:start; }
+  .compare-vs { display:flex; align-items:center; justify-content:center; font-size:1.5rem; font-weight:800; color:var(--accent4); padding-top:40px; }
+  .key { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:6px; }
+  @media(max-width:900px) { .slide{padding:24px 28px;} h1{font-size:1.8rem;} h2{font-size:1.4rem;} .grid2,.grid3{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+<div class="slide-num" id="slideNum"></div>
+<div class="controls">
+  <button onclick="prev()">← Prev</button>
+  <button onclick="next()">Next →</button>
+</div>
+
+<!-- ==================== SLIDE 1: TITLE ==================== -->
+<div class="slide active" id="s1">
+  <div class="hero">
+    <h1>Cluster Evaluation Harness</h1>
+    <p class="subtitle">AI Performance Engineering — Cluster Profiling, Benchmarking &amp; Field Reporting</p>
+    <p class="dim" style="margin-top:24px;font-size:1rem;">A unified framework for GPU cluster evaluation:<br>NCCL · vLLM · GEMM · Fabric · Operator Checks · Reproducibility</p>
+    <div style="margin-top:32px;">
+      <span class="badge badge-green">41/41 Suite Steps Green</span>
+      <span class="badge badge-blue">NVLink 2263 GB/s</span>
+      <span class="badge badge-purple">vLLM 484 tok/s</span>
+      <span class="badge badge-orange">Fabric Scorecard</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 2: DIRECTORY ==================== -->
+<div class="slide" id="s2">
+  <h2>Repository Structure</h2>
+  <div class="grid2">
+    <div>
+      <div class="tree">
+        <span class="dir">cluster/</span><br>
+        ├── <span class="dir">scripts/</span> <span class="note">← 87 scripts: benchmarks, collection, validation</span><br>
+        ├── <span class="dir">analysis/</span> <span class="note">← 50 scripts: plotting, scoring, coverage</span><br>
+        ├── <span class="dir">fabric/</span> <span class="note">← NVLink / IB / Spectrum-X evaluation</span><br>
+        ├── <span class="dir">docs/</span> <span class="note">← runbook, templates, schemas</span><br>
+        ├── <span class="dir">configs/</span> <span class="note">← CRD, stack profiles</span><br>
+        ├── <span class="dir">published/current/</span> <span class="note">← canonical package</span><br>
+        ├── <span class="dir">docker/</span> <span class="note">← container images</span><br>
+        ├── <span class="dir">env/</span> <span class="note">← environment setup</span><br>
+        ├── <span class="dir">tools/</span> <span class="note">← auxiliary utilities</span><br>
+        ├── <span class="file">field-report.md</span> <span class="note">← stakeholder report</span><br>
+        ├── <span class="file">field-report-notes.md</span> <span class="note">← evidence ledger</span><br>
+        └── <span class="file">setup.sh</span> <span class="note">← bootstrap</span>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h3>Key Principle</h3>
+        <p>Every run produces a <strong>self-contained artifact directory</strong>:</p>
+        <pre><code>cluster/runs/&lt;run_id&gt;/
+  manifest.json
+  structured/   ← machine-readable results
+  raw/          ← raw logs
+  figures/      ← generated plots
+  reports/      ← rendered reports</code></pre>
+        <p class="dim" style="margin-top:10px;">The run directory is the <strong>unit of record</strong> — not ad-hoc files.</p>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h3>Published State</h3>
+        <p>Canonical: <code>2026-03-17_localhost_fabric_canonical</code></p>
+        <p class="dim">Promoted via <code>cluster promote-run</code> CLI command.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 3: WORKFLOW ==================== -->
+<div class="slide" id="s3">
+  <h2>Evaluation Workflow</h2>
+  <div class="section-divider">Entry Point</div>
+  <pre><code>python -m cli.aisp cluster common-eval \
+  --preset &lt;preset&gt; --run-id &lt;run_id&gt; \
+  --hosts &lt;hosts&gt; --labels &lt;labels&gt;</code></pre>
+  <div class="grid3" style="margin-top:16px;">
+    <div class="card">
+      <h3 style="color:var(--accent3);">common-answer-fast</h3>
+      <p class="dim">Fastest useful bundle</p>
+      <ul>
+        <li>NCCL all-reduce</li>
+        <li>vLLM concurrency sweep</li>
+        <li>GEMM sanity</li>
+        <li>GPU STREAM</li>
+        <li>fio + nvbandwidth</li>
+        <li>Scorecard + coverage</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--accent);">core-system</h3>
+      <p class="dim">Standard single-node bundle</p>
+      <ul>
+        <li>All above +</li>
+        <li>NCCL env sensitivity</li>
+        <li>NUMA mem bandwidth</li>
+        <li>Hang triage readiness</li>
+        <li>Operator friction checks</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--accent2);">modern-llm</h3>
+      <p class="dim">Full LLM bundle</p>
+      <ul>
+        <li>All above +</li>
+        <li>vLLM request-rate sweep</li>
+        <li>Fabric capability matrix</li>
+        <li>AI-correlation artifact</li>
+        <li>Fabric scorecard</li>
+      </ul>
+    </div>
+  </div>
+  <div style="margin-top:16px;">
+    <span class="tag">fabric-systems — modern-llm + full fabric matrix</span>
+    <span class="tag">multinode-readiness — contract/env only, no workloads</span>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 4: EXECUTION FLOW ==================== -->
+<div class="slide" id="s4">
+  <h2>Execution Pipeline</h2>
+  <div class="flow" style="margin-bottom:20px;">
+    <div class="flow-step" style="border-color:var(--accent);">Preflight</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent2);">Discovery</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent3);">Hang Triage</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent4);">Connectivity</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent5);">NCCL Sweep</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent);">vLLM Serve</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent3);">Validate</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent2);">Report</div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>Reliability Gates (must pass)</h3>
+      <table>
+        <tr><th>Gate</th><th>Status</th></tr>
+        <tr><td>Hang-triage readiness</td><td><span class="badge badge-green">ok</span></td></tr>
+        <tr><td>Torchrun connectivity probe</td><td><span class="badge badge-green">ok</span></td></tr>
+        <tr><td>NCCL env sensitivity sweep</td><td><span class="badge badge-green">ok</span></td></tr>
+        <tr><td>Required artifact validation</td><td><span class="badge badge-green">0 failures</span></td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Timeline (Canonical Run)</h3>
+      <table>
+        <tr><th>UTC</th><th>Milestone</th></tr>
+        <tr><td>02:48:48</td><td>Preflight + Discovery started</td></tr>
+        <tr><td>02:48:52</td><td>Hang triage + Connectivity done</td></tr>
+        <tr><td>02:49:11</td><td>NCCL env sweep completed</td></tr>
+        <tr><td>02:50:14</td><td>vLLM serve sweep completed</td></tr>
+        <tr><td>03:00:15</td><td>Validation + Report rendered</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 5: BENCHMARK A — NETWORKING ==================== -->
+<div class="slide" id="s5">
+  <h2>Benchmark A — Networking Story (NCCL)</h2>
+  <div class="metric-row">
+    <div class="metric"><div class="value">2263.5</div><div class="label">Peak Aligned BW (GB/s)</div></div>
+    <div class="metric"><div class="value">64MB</div><div class="label">Peak Message Size</div></div>
+    <div class="metric"><div class="value">84.9</div><div class="label">Connectivity Algbw (GB/s)</div></div>
+    <div class="metric"><div class="value">0.072ms</div><div class="label">Barrier Mean Latency</div></div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>NCCL All-Reduce Bandwidth vs Message Size</h3>
+      <div style="background:var(--code-bg);border-radius:8px;padding:20px;text-align:center;">
+        <div style="display:flex;align-items:flex-end;justify-content:center;gap:6px;height:140px;">
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:15%;" title="1KB"></div>
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:25%;" title="4KB"></div>
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:40%;" title="16KB"></div>
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:55%;" title="64KB"></div>
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:70%;" title="256KB"></div>
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:82%;" title="1MB"></div>
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:92%;" title="4MB"></div>
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:100%;" title="16MB"></div>
+          <div style="width:30px;background:linear-gradient(to top,var(--accent),var(--accent2));border-radius:4px 4px 0 0;height:100%;" title="64MB"></div>
+        </div>
+        <div style="display:flex;justify-content:center;gap:6px;margin-top:6px;">
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">1K</span>
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">4K</span>
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">16K</span>
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">64K</span>
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">256K</span>
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">1M</span>
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">4M</span>
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">16M</span>
+          <span style="width:30px;font-size:0.65rem;color:var(--dim);">64M</span>
+        </div>
+        <p class="dim" style="margin-top:8px;font-size:0.8rem;">Algbw scales with message size — peak at 64MB</p>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Interpretation</h3>
+      <div class="highlight-box">
+        <p>Single-node communication path is <strong style="color:var(--accent3);">healthy</strong>.</p>
+      </div>
+      <ul style="margin-top:12px;">
+        <li>Rank-1 <code>busbw=0.0</code> is <strong>expected</strong> — not a fabric bottleneck</li>
+        <li>NVLink/NVSwitch runtime verified at peak algbw</li>
+        <li>Connectivity probe confirms payload transfer at 84.9 GB/s</li>
+        <li>Barrier mean 0.072ms indicates low synchronization overhead</li>
+      </ul>
+      <div style="margin-top:14px;">
+        <span class="badge badge-green">NVLink: full_stack_verified</span>
+        <span class="badge badge-blue">InfiniBand: not_present</span>
+        <span class="badge badge-purple">Spectrum-X: not_present</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 6: BENCHMARK B — INFERENCE ==================== -->
+<div class="slide" id="s6">
+  <h2>Benchmark B — Inference Story (vLLM)</h2>
+  <div class="metric-row">
+    <div class="metric"><div class="value">484.5</div><div class="label">Total tok/s (c=1)</div></div>
+    <div class="metric"><div class="value">27.0ms</div><div class="label">Mean TTFT</div></div>
+    <div class="metric"><div class="value">77.6ms</div><div class="label">p99 TTFT</div></div>
+    <div class="metric"><div class="value">5.71ms</div><div class="label">p99 TPOT</div></div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>Throughput vs Concurrency</h3>
+      <div style="background:var(--code-bg);border-radius:8px;padding:20px;">
+        <div style="display:flex;align-items:flex-end;gap:20px;justify-content:center;height:120px;">
+          <div style="text-align:center;">
+            <div style="width:80px;background:linear-gradient(to top,var(--accent3),var(--accent));border-radius:6px 6px 0 0;height:100%;"></div>
+            <span style="font-size:0.8rem;color:var(--dim);">c=1</span>
+            <span style="display:block;font-size:0.9rem;font-weight:700;color:var(--accent3);">484.5 tok/s</span>
+          </div>
+        </div>
+        <p class="dim" style="margin-top:10px;font-size:0.8rem;text-align:center;">Canary sweep — single concurrency point</p>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Sweep Configuration</h3>
+      <table>
+        <tr><th>Parameter</th><th>Value</th></tr>
+        <tr><td>Model</td><td><code>openai-community/gpt2</code></td></tr>
+        <tr><td>Tensor Parallel</td><td>TP=1</td></tr>
+        <tr><td>Input Seq Len</td><td>128</td></tr>
+        <tr><td>Output Seq Len</td><td>64</td></tr>
+        <tr><td>Concurrency Range</td><td>1 → 2</td></tr>
+        <tr><td>Request Rate</td><td>1 → 2 req/s</td></tr>
+      </table>
+      <div class="highlight-box" style="margin-top:12px;">
+        <p class="dim">This is a <strong>canary/sparse sweep</strong> — use for smoke directionality, not full knee modeling.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 7: FABRIC EVALUATION ==================== -->
+<div class="slide" id="s7">
+  <h2>Fabric Evaluation Stack</h2>
+  <div class="grid3">
+    <div class="card" style="border-top:3px solid var(--accent3);">
+      <h3 style="color:var(--accent3);">NVLink / NVSwitch</h3>
+      <p><span class="badge badge-green">Present: True</span></p>
+      <p><strong>Completeness:</strong> full_stack_verified</p>
+      <p><strong>Mgmt Plane:</strong> configured</p>
+      <p><strong>Link Health:</strong> runtime_verified</p>
+      <p><strong>Routing:</strong> pass</p>
+      <p class="dim" style="margin-top:8px;">Peak 2263.5 GB/s algbw on single-node NCCL path.</p>
+    </div>
+    <div class="card" style="border-top:3px solid var(--dim);">
+      <h3 style="color:var(--dim);">InfiniBand</h3>
+      <p><span class="badge badge-blue">Present: False</span></p>
+      <p><strong>Completeness:</strong> not_present</p>
+      <p><strong>HCAs visible:</strong> 0</p>
+      <p><strong>Routing checks:</strong> none</p>
+      <p class="dim" style="margin-top:8px;">No direct AI workload finding.</p>
+    </div>
+    <div class="card" style="border-top:3px solid var(--dim);">
+      <h3 style="color:var(--dim);">Spectrum-X / RoCE</h3>
+      <p><span class="badge badge-purple">Present: False</span></p>
+      <p><strong>Completeness:</strong> not_present</p>
+      <p><strong>Switches:</strong> 0</p>
+      <p><strong>Adaptive routing:</strong> not visible</p>
+      <p class="dim" style="margin-top:8px;">No direct AI workload finding.</p>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px;">
+    <h3>NMX Topology (NVLink72 Chassis)</h3>
+    <div class="metric-row">
+      <div class="metric"><div class="value">1</div><div class="label">Chassis</div></div>
+      <div class="metric"><div class="value">18</div><div class="label">Compute Nodes</div></div>
+      <div class="metric"><div class="value">72</div><div class="label">GPUs</div></div>
+      <div class="metric"><div class="value">18</div><div class="label">Switch ASICs</div></div>
+      <div class="metric"><div class="value">2592</div><div class="label">Ports</div></div>
+    </div>
+    <p class="dim">Supports Alpha+Beta 4-GPU split partitioning. 45 unassigned GPUs ready for partition create.</p>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 8: OPERATOR CHECKS ==================== -->
+<div class="slide" id="s8">
+  <h2>Operator Friction &amp; Monitoring</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>Quick Friction Battery</h3>
+      <table>
+        <tr><th>Check</th><th>Status</th><th>Details</th></tr>
+        <tr><td>quick_friction</td><td><span class="badge badge-green">ok</span></td><td>pass=1, failed=0</td></tr>
+        <tr><td>expected_failed</td><td><span class="badge badge-green">none</span></td><td>no expected failures</td></tr>
+        <tr><td>unexpected_failed</td><td><span class="badge badge-green">none</span></td><td>no blockers</td></tr>
+      </table>
+      <div class="highlight-box" style="margin-top:12px;">
+        <p>Expected failures are tracked <strong>separately</strong> from unexpected blockers — prevents false-red localhost status.</p>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Monitoring Expectations</h3>
+      <table>
+        <tr><th>Signal</th><th>Status</th></tr>
+        <tr><td>GPU Telemetry</td><td><span class="badge badge-green">ok</span></td></tr>
+        <tr><td>Control Plane</td><td><span class="badge badge-blue">not_requested</span></td></tr>
+        <tr><td>System Signals</td><td><span class="badge badge-blue">not_requested</span></td></tr>
+      </table>
+      <div class="highlight-box" style="margin-top:12px;">
+        <p>Control-plane checks can be <code>not_applicable</code> without kubeconfig — expected non-K8s behavior.</p>
+      </div>
+    </div>
+  </div>
+  <div class="card" style="margin-top:16px;">
+    <h3>Weird / New / Interesting Findings</h3>
+    <table>
+      <tr><th>Area</th><th>Normal</th><th>Weird</th><th>Impact</th></tr>
+      <tr><td>Preflight services</td><td>strict checks pass</td><td>flaky <code>systemctl show</code> path removed</td><td>no false negatives</td></tr>
+      <tr><td>NVLink parser</td><td>topology summary</td><td>single-GPU header format edge case</td><td>robust on localhost</td></tr>
+      <tr><td>NCCL env sweep</td><td>all profiles ok</td><td><code>busbw=0.0</code> in rank-1</td><td>expected, not a bug</td></tr>
+      <tr><td>Fabric coverage</td><td>scorecard generated</td><td><code>not_configured</code> is explicit</td><td>auditable</td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 9: SCRIPTS & ANALYSIS ==================== -->
+<div class="slide" id="s9">
+  <h2>Scripts &amp; Analysis Toolkit</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>scripts/ — 87 Collection Scripts</h3>
+      <div style="font-size:0.88rem;">
+        <p style="margin-bottom:8px;"><span class="badge badge-green">Benchmark Runners</span></p>
+        <ul>
+          <li><code>run_nccl_all_reduce.sh</code> — NCCL all-reduce</li>
+          <li><code>run_vllm_bench.sh</code> — vLLM serving</li>
+          <li><code>run_gemm_bench.sh</code> — GEMM sanity</li>
+          <li><code>run_fio_bench.sh</code> — storage I/O</li>
+          <li><code>run_gpu_stream_bench.sh</code> — GPU STREAM</li>
+        </ul>
+        <p style="margin:8px 0;"><span class="badge badge-blue">Collection</span></p>
+        <ul>
+          <li><code>collect_discovery_and_tcp_sysctl.sh</code></li>
+          <li><code>collect_hang_triage_bundle.sh</code></li>
+          <li><code>collect_software_versions.sh</code></li>
+        </ul>
+        <p style="margin:8px 0;"><span class="badge badge-purple">Validation</span></p>
+        <ul>
+          <li><code>validate_field_report_requirements.sh</code></li>
+          <li><code>preflight_cluster_services.sh</code></li>
+          <li><code>write_manifest.py</code></li>
+        </ul>
+      </div>
+    </div>
+    <div class="card">
+      <h3>analysis/ — 50 Plotting &amp; Scoring Scripts</h3>
+      <div style="font-size:0.88rem;">
+        <p style="margin-bottom:8px;"><span class="badge badge-orange">Plots</span></p>
+        <ul>
+          <li><code>plot_nccl.py</code> — NCCL bandwidth charts</li>
+          <li><code>plot_vllm_serve_sweep.py</code> — vLLM throughput/latency</li>
+          <li><code>plot_gemm.py</code> — GEMM performance</li>
+          <li><code>plot_fio.py</code> — Storage I/O</li>
+          <li><code>plot_nvlink_topology.py</code> — NVLink topology</li>
+          <li><code>plot_cluster_story_dashboard.py</code> — story dashboard</li>
+        </ul>
+        <p style="margin:8px 0;"><span class="badge badge-red">Scoring</span></p>
+        <ul>
+          <li><code>build_cluster_scorecard.py</code></li>
+          <li><code>build_coverage_delta.py</code></li>
+          <li><code>build_mlperf_alignment.py</code></li>
+          <li><code>analyze_benchmark_coverage.py</code></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 10: FABRIC DETAIL ==================== -->
+<div class="slide" id="s10">
+  <h2>Fabric Module Deep Dive</h2>
+  <div class="grid2">
+    <div>
+      <div class="card">
+        <h3>Architecture</h3>
+        <pre><code>fabric/
+├── catalog.py          <span class="note"># command catalog builder</span>
+├── evaluator.py        <span class="note"># fabric evaluation engine</span>
+├── fabric_command_catalog.json
+├── README.md           <span class="note"># handbook</span>
+├── nvlink.md           <span class="note"># NVLink specifics</span>
+├── infiniband.md       <span class="note"># IB specifics</span>
+├── spectrum_x.md       <span class="note"># Spectrum-X specifics</span>
+└── cross_fabric.md     <span class="note"># cross-fabric analysis</span></code></pre>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h3>Completeness Levels</h3>
+        <table>
+          <tr><th>Level</th><th>Meaning</th></tr>
+          <tr><td><code>not_present</code></td><td>Family not detected</td></tr>
+          <tr><td><code>present_unverified</code></td><td>Detected but not validated</td></tr>
+          <tr><td><code>runtime_verified</code></td><td>Runtime evidence collected</td></tr>
+          <tr><td><code>full_stack_verified</code></td><td>Mgmt + link + routing + AI impact</td></tr>
+        </table>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h3>Entrypoint</h3>
+        <pre><code>python -m cli.aisp cluster fabric-eval \
+  --run-id &lt;run_id&gt; \
+  --hosts &lt;h1,h2&gt; \
+  --labels &lt;l1,l2&gt; \
+  --ssh-user &lt;user&gt; \
+  --ssh-key &lt;key&gt;</code></pre>
+        <p class="dim" style="margin-top:8px;">Defaults to capability-aware partial completion. Use <code>--strict-canonical-completeness</code> for publish-grade gates.</p>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h3>555 Catalog Entries</h3>
+        <p>The fabric command catalog contains <strong>555 entries</strong> covering NVLink, InfiniBand, and Spectrum-X command surfaces.</p>
+        <p class="dim" style="margin-top:8px;">Each entry maps a management-plane command to its expected output, verification criteria, and AI workload impact.</p>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h3>NMX Telemetry</h3>
+        <div class="metric-row">
+          <div class="metric"><div class="value">3078</div><div class="label">Switch Temp Series</div></div>
+          <div class="metric"><div class="value">3078</div><div class="label">Xmit/Rcv Series</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 11: REPORTING ==================== -->
+<div class="slide" id="s11">
+  <h2>Field Report &amp; Reproducibility</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>Report Contract (19 Required Sections)</h3>
+      <div style="font-size:0.85rem;columns:2;column-gap:20px;">
+        <p>1. TL;DR</p>
+        <p>2. Scope + Canonical Artifacts</p>
+        <p>3. Required Reliability Gates</p>
+        <p>4. Fabric Evaluation</p>
+        <p>5. Operator Friction</p>
+        <p>6. Cluster Story</p>
+        <p>7. Weird / New / Interesting</p>
+        <p>8. Benchmark A (Networking)</p>
+        <p>9. Benchmark B (Inference)</p>
+        <p>10. Required Issues</p>
+        <p>11. Root Cause + Fix Mapping</p>
+        <p>12. Completeness Delta</p>
+        <p>13. Gaps, Risks, Smell Checks</p>
+        <p>14. Implications for Small Teams</p>
+        <p>15. Stakeholder Recommendations</p>
+        <p>16. Repro Steps</p>
+        <p>17. Reproducibility Package</p>
+        <p>18. Appendix</p>
+        <p>19. Activity Log</p>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h3>Validation Gate</h3>
+        <pre><code>cluster/scripts/validate_field_report_requirements.sh \
+  --report cluster/field-report.md \
+  --notes cluster/field-report-notes.md \
+  --template cluster/docs/field-report-template.md \
+  --runbook cluster/docs/advanced-runbook.md \
+  --canonical-run-id &lt;RUN_ID&gt;</code></pre>
+        <p class="dim" style="margin-top:8px;">Validator failures are <strong>blockers</strong> — must fix before sign-off.</p>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h3>Promotion Workflow</h3>
+        <div class="flow">
+          <div class="flow-step">Run Suite</div>
+          <span class="flow-arrow">→</span>
+          <div class="flow-step">Inspect</div>
+          <span class="flow-arrow">→</span>
+          <div class="flow-step">Promote</div>
+          <span class="flow-arrow">→</span>
+          <div class="flow-step">Sync Reports</div>
+          <span class="flow-arrow">→</span>
+          <div class="flow-step">Validate</div>
+        </div>
+        <pre><code>python -m cli.aisp cluster promote-run \
+  --run-id &lt;run_id&gt; --label localhost --cleanup</code></pre>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h3>4 Synced Documents</h3>
+        <ul>
+          <li><code>field-report.md</code></li>
+          <li><code>field-report-notes.md</code></li>
+          <li><code>docs/field-report-template.md</code></li>
+          <li><code>docs/advanced-runbook.md</code></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 12: DECLARATIVE BENCHMARKS ==================== -->
+<div class="slide" id="s12">
+  <h2>Declarative BenchmarkRuns (K8s CRD)</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>Contract Flow</h3>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;">
+        <div class="flow-step" style="width:100%;">1. Freeze workload → <code>performance_intake.yaml</code></div>
+        <span class="flow-arrow" style="transform:rotate(90deg);">→</span>
+        <div class="flow-step" style="width:100%;">2. Spec → <code>benchmark_workload_spec.yaml</code></div>
+        <span class="flow-arrow" style="transform:rotate(90deg);">→</span>
+        <div class="flow-step" style="width:100%;">3. Define run → <code>benchmark_run.yaml</code></div>
+        <span class="flow-arrow" style="transform:rotate(90deg);">→</span>
+        <div class="flow-step" style="width:100%;">4. Validate → <code>validate_benchmark_run</code></div>
+        <span class="flow-arrow" style="transform:rotate(90deg);">→</span>
+        <div class="flow-step" style="width:100%;">5. Deploy → K8s CRD (<code>benchmarkrun-crd.yaml</code>)</div>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h3>Purpose</h3>
+        <ul>
+          <li>Declarative scheduling for CI automation</li>
+          <li>SLINKY + Kueue operator mapping</li>
+          <li>Publication-vs-realism policy enforcement</li>
+          <li>Existing <code>common-eval</code> presets remain the execution backend</li>
+        </ul>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h3>Multi-Node Readiness</h3>
+        <pre><code>python -m cli.aisp cluster common-eval \
+  --preset multinode-readiness \
+  --run-id &lt;run_id&gt; \
+  --hosts &lt;h1,h2&gt; \
+  --labels &lt;l1,l2&gt;</code></pre>
+        <p class="dim" style="margin-top:8px;">Contract/env check only — no workloads. Use before first multi-node run.</p>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <h3>Canonical 2-Node Inference</h3>
+        <p>Use <code>multinode-readiness</code> as preflight gate → then <code>modern-llm</code> on 2 hosts.</p>
+        <p class="dim">Contract: <code>canonical_2node_inference_surface.md</code></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 13: SUMMARY ==================== -->
+<div class="slide" id="s13">
+  <div class="hero">
+    <h1 style="font-size:2.4rem;">Summary</h1>
+    <div class="grid3" style="margin-top:24px;text-align:left;">
+      <div class="card">
+        <h3 style="color:var(--accent3);">What It Does</h3>
+        <ul>
+          <li>Evaluates GPU cluster readiness</li>
+          <li>Benchmarks NCCL, vLLM, GEMM, fio</li>
+          <li>Characterizes fabric (NVLink, IB, Spectrum-X)</li>
+          <li>Produces reproducible artifact packages</li>
+          <li>Generates stakeholder field reports</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--accent);">How It Works</h3>
+        <ul>
+          <li>Single CLI entrypoint</li>
+          <li>Preset-driven evaluation bundles</li>
+          <li>Reliability gates block bad evidence</li>
+          <li>Structured JSON + raw logs + figures</li>
+          <li>Validator enforces report completeness</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--accent2);">Why It Matters</h3>
+        <ul>
+          <li>Fast localhost proof before larger spend</li>
+          <li>Operator friction explicitly classified</li>
+          <li>Full package regenerable in one run</li>
+          <li>No false-green benchmark evidence</li>
+          <li>Small team bring-up confidence</li>
+        </ul>
+      </div>
+    </div>
+    <div style="margin-top:32px;">
+      <span class="badge badge-green">41/41 Steps Green</span>
+      <span class="badge badge-blue">NVLink Verified</span>
+      <span class="badge badge-purple">vLLM Canary</span>
+      <span class="badge badge-orange">Fabric Scorecard</span>
+      <span class="badge badge-red">Report Validated</span>
+    </div>
+    <p class="dim" style="margin-top:24px;font-size:0.9rem;">Cluster Evaluation Harness — AI Performance Engineering</p>
+  </div>
+</div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  let cur = 0;
+  const total = slides.length;
+
+  function show(i) {
+    slides.forEach(s => s.classList.remove('active'));
+    slides[i].classList.add('active');
+    document.getElementById('progress').style.width = ((i+1)/total*100)+'%';
+    document.getElementById('slideNum').textContent = (i+1)+' / '+total;
+  }
+
+  function next() { if(cur < total-1) { cur++; show(cur); } }
+  function prev() { if(cur > 0) { cur--; show(cur); } }
+
+  document.addEventListener('keydown', e => {
+    if(e.key==='ArrowRight'||e.key===' ') { e.preventDefault(); next(); }
+    if(e.key==='ArrowLeft') { e.preventDefault(); prev(); }
+    if(e.key==='Home') { cur=0; show(cur); }
+    if(e.key==='End') { cur=total-1; show(cur); }
+  });
+
+  show(0);
+</script>
+</body>
+</html>

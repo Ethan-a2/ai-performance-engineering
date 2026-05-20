@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AISP CLI - AI Systems Performance CLI 架构可视化</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            overflow: hidden;
+        }
+        
+        .presentation {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 40px;
+            opacity: 0;
+            transform: translateX(100%);
+            transition: all 0.5s ease-in-out;
+        }
+        
+        .slide.active {
+            opacity: 1;
+            transform: translateX(0);
+        }
+        
+        .slide.prev {
+            opacity: 0;
+            transform: translateX(-100%);
+        }
+        
+        h1 {
+            font-size: 3.5em;
+            margin-bottom: 20px;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+        }
+        
+        h2 {
+            font-size: 2.5em;
+            margin-bottom: 30px;
+            color: #00d2ff;
+            text-align: center;
+        }
+        
+        h3 {
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            color: #3a7bd5;
+        }
+        
+        p {
+            font-size: 1.3em;
+            line-height: 1.6;
+            text-align: center;
+            max-width: 800px;
+            margin-bottom: 20px;
+        }
+        
+        .subtitle {
+            font-size: 1.5em;
+            color: #a0a0a0;
+            margin-bottom: 30px;
+        }
+        
+        .domain-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            width: 100%;
+            max-width: 1200px;
+            margin-top: 30px;
+        }
+        
+        .domain-card {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 20px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .domain-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        }
+        
+        .domain-icon {
+            font-size: 2.5em;
+            margin-bottom: 15px;
+        }
+        
+        .domain-name {
+            font-size: 1.3em;
+            font-weight: bold;
+            color: #00d2ff;
+            margin-bottom: 10px;
+        }
+        
+        .domain-desc {
+            font-size: 0.9em;
+            color: #b0b0b0;
+            line-height: 1.4;
+        }
+        
+        .command-box {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 1.1em;
+            border-left: 4px solid #00d2ff;
+            max-width: 800px;
+            width: 100%;
+        }
+        
+        .command {
+            color: #00ff88;
+            margin: 10px 0;
+        }
+        
+        .comment {
+            color: #888;
+        }
+        
+        .architecture-diagram {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            padding: 30px;
+            margin: 30px 0;
+            width: 100%;
+            max-width: 1000px;
+        }
+        
+        .layer {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 15px 0;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        
+        .layer-box {
+            background: linear-gradient(90deg, #3a7bd5, #00d2ff);
+            padding: 15px 25px;
+            border-radius: 10px;
+            font-weight: bold;
+            min-width: 150px;
+            text-align: center;
+        }
+        
+        .arrow {
+            font-size: 2em;
+            color: #00d2ff;
+            margin: 10px 0;
+        }
+        
+        .feature-list {
+            text-align: left;
+            max-width: 800px;
+            margin: 20px auto;
+        }
+        
+        .feature-item {
+            display: flex;
+            align-items: center;
+            margin: 15px 0;
+            font-size: 1.1em;
+        }
+        
+        .feature-icon {
+            margin-right: 15px;
+            font-size: 1.5em;
+        }
+        
+        .navigation {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 100;
+        }
+        
+        .nav-btn {
+            background: rgba(255, 255, 255, 0.2);
+            border: none;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1em;
+            transition: background 0.3s ease;
+        }
+        
+        .nav-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .slide-counter {
+            position: fixed;
+            top: 30px;
+            right: 30px;
+            background: rgba(255, 255, 255, 0.2);
+            padding: 10px 20px;
+            border-radius: 20px;
+            font-size: 1.1em;
+        }
+        
+        .highlight {
+            color: #00ff88;
+            font-weight: bold;
+        }
+        
+        .code-block {
+            background: #1e1e1e;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            font-family: 'Courier New', monospace;
+            text-align: left;
+            max-width: 800px;
+            width: 100%;
+            overflow-x: auto;
+        }
+        
+        .code-line {
+            margin: 5px 0;
+        }
+        
+        .keyword {
+            color: #569cd6;
+        }
+        
+        .string {
+            color: #ce9178;
+        }
+        
+        .function {
+            color: #dcdcaa;
+        }
+        
+        .number {
+            color: #b5cea8;
+        }
+        
+        .progress-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            transition: width 0.3s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="progress-bar" id="progressBar"></div>
+    <div class="slide-counter" id="slideCounter">1 / 10</div>
+    
+    <div class="presentation" id="presentation">
+        <!-- Slide 1: Title -->
+        <div class="slide active" id="slide1">
+            <h1>🚀 AISP CLI</h1>
+            <p class="subtitle">AI Systems Performance CLI</p>
+            <p>统一的10领域AI性能工程命令行接口</p>
+            <div style="margin-top: 40px;">
+                <p style="font-size: 1.1em; color: #a0a0a0;">基于 Typer 框架构建</p>
+                <p style="font-size: 1.1em; color: #a0a0a0;">单一入口点 · 模块化设计 · 10个专业领域</p>
+            </div>
+        </div>
+        
+        <!-- Slide 2: Architecture Overview -->
+        <div class="slide" id="slide2">
+            <h2>🏗️ 系统架构</h2>
+            <div class="architecture-diagram">
+                <div class="layer">
+                    <div class="layer-box">CLI 入口 (aisp.py)</div>
+                </div>
+                <div class="arrow">↕</div>
+                <div class="layer">
+                    <div class="layer-box">Typer 框架</div>
+                </div>
+                <div class="arrow">↕</div>
+                <div class="layer">
+                    <div class="layer-box">10个领域命令组</div>
+                </div>
+                <div class="arrow">↕</div>
+                <div class="layer">
+                    <div class="layer-box">PerformanceEngine (核心引擎)</div>
+                </div>
+                <div class="arrow">↕</div>
+                <div class="layer">
+                    <div class="layer-box">底层工具 (nsys/ncu/PyTorch/CUDA)</div>
+                </div>
+            </div>
+            <p>分层架构：CLI → 命令组 → 引擎 → 工具链</p>
+        </div>
+        
+        <!-- Slide 3: 10 Domain Model -->
+        <div class="slide" id="slide3">
+            <h2>🎯 10领域模型</h2>
+            <div class="domain-grid">
+                <div class="domain-card">
+                    <div class="domain-icon">🖥️</div>
+                    <div class="domain-name">GPU</div>
+                    <div class="domain-desc">硬件信息、拓扑、功耗、带宽</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">📦</div>
+                    <div class="domain-name">System</div>
+                    <div class="domain-desc">软件栈、依赖、能力、环境</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">📊</div>
+                    <div class="domain-name">Profile</div>
+                    <div class="domain-desc">nsys/ncu分析、火焰图、HTA</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">🔍</div>
+                    <div class="domain-name">Analyze</div>
+                    <div class="domain-desc">瓶颈分析、帕累托、扩展性</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">⚡</div>
+                    <div class="domain-name">Optimize</div>
+                    <div class="domain-desc">优化建议、ROI、技术栈</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">🌐</div>
+                    <div class="domain-name">Distributed</div>
+                    <div class="domain-desc">并行策略、NCCL、FSDP</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">🤖</div>
+                    <div class="domain-name">Inference</div>
+                    <div class="domain-desc">vLLM配置、量化、部署</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">📈</div>
+                    <div class="domain-name">Benchmark</div>
+                    <div class="domain-desc">微基准测试、速度测试</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">🧠</div>
+                    <div class="domain-name">AI</div>
+                    <div class="domain-desc">问答、解释、故障诊断</div>
+                </div>
+                <div class="domain-card">
+                    <div class="domain-icon">📤</div>
+                    <div class="domain-name">Export</div>
+                    <div class="domain-desc">CSV、PDF、HTML报告</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 4: GPU Domain -->
+        <div class="slide" id="slide4">
+            <h2>🖥️ GPU 领域</h2>
+            <p>硬件信息、拓扑、功耗、带宽分析</p>
+            <div class="command-box">
+                <div class="comment"># GPU 信息查询</div>
+                <div class="command">aisp gpu info</div>
+                <div class="comment"># GPU 拓扑分析</div>
+                <div class="command">aisp gpu topology</div>
+                <div class="comment"># 功耗监控</div>
+                <div class="command">aisp gpu power</div>
+                <div class="comment"># 带宽测试</div>
+                <div class="command">aisp gpu bandwidth</div>
+                <div class="comment"># 硬件特性检测</div>
+                <div class="command">aisp gpu features</div>
+            </div>
+            <div class="feature-list">
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>支持 NVLink、PCIe、P2P 拓扑分析</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>实时功耗和温度监控</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>TMA、Tensor Core、FP8 特性检测</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 5: System Domain -->
+        <div class="slide" id="slide5">
+            <h2>📦 System 领域</h2>
+            <p>软件栈、依赖、系统能力、环境配置</p>
+            <div class="command-box">
+                <div class="comment"># 系统状态概览</div>
+                <div class="command">aisp system status</div>
+                <div class="comment"># 软件版本信息</div>
+                <div class="command">aisp system software</div>
+                <div class="comment"># 依赖健康检查</div>
+                <div class="command">aisp system deps</div>
+                <div class="comment"># 硬件能力检测</div>
+                <div class="command">aisp system capabilities</div>
+                <div class="comment"># 网络状态</div>
+                <div class="command">aisp system network</div>
+                <div class="comment"># 时钟锁定验证</div>
+                <div class="command">aisp system clock-lock-check</div>
+            </div>
+            <div class="feature-list">
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>PyTorch、CUDA、Python 版本追踪</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>NUMA、CPU、内存层次分析</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>容器/cgroup 限制检测</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 6: Profile Domain -->
+        <div class="slide" id="slide6">
+            <h2>📊 Profile 领域</h2>
+            <p>性能分析、内核分析、瓶颈识别</p>
+            <div class="command-box">
+                <div class="comment"># Nsight Systems 分析</div>
+                <div class="command">aisp profile nsys python train.py</div>
+                <div class="comment"># Nsight Compute 内核分析</div>
+                <div class="command">aisp profile ncu python train.py</div>
+                <div class="comment"># 火焰图生成</div>
+                <div class="command">aisp profile flame</div>
+                <div class="comment"># 内存时间线分析</div>
+                <div class="command">aisp profile memory</div>
+                <div class="comment"># 基线/优化对比</div>
+                <div class="command">aisp profile compare ch07</div>
+            </div>
+            <div class="feature-list">
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>NVTX 追踪、CUDA API 分析</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>内核级性能指标（内存/计算/张量核心）</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>自动瓶颈检测和优化建议</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 7: Benchmark Domain -->
+        <div class="slide" id="slide7">
+            <h2>📈 Benchmark 领域</h2>
+            <p>硬件微基准测试、速度测试、诊断</p>
+            <div class="command-box">
+                <div class="comment"># GPU 内存带宽测试</div>
+                <div class="command">aisp benchmark memory</div>
+                <div class="comment"># PCIe 带宽测试</div>
+                <div class="command">aisp benchmark pcie</div>
+                <div class="comment"># 张量核心吞吐量</div>
+                <div class="command">aisp benchmark tc --precision fp16</div>
+                <div class="comment"># 综合速度测试</div>
+                <div class="command">aisp benchmark speed --type all</div>
+                <div class="comment"># InfiniBand 带宽</div>
+                <div class="command">aisp benchmark ib</div>
+                <div class="comment"># NCCL 集合通信</div>
+                <div class="command">aisp benchmark nccl --collective all_reduce</div>
+            </div>
+            <div class="feature-list">
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>内存层次结构（L1/L2/全局内存）</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>多精度支持（FP16/BF16/TF32/FP8）</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>P2P/NVLink 带宽测试</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 8: Distributed & Inference -->
+        <div class="slide" id="slide8">
+            <h2>🌐 Distributed & 🤖 Inference</h2>
+            <p>分布式训练策略与推理优化</p>
+            <div style="display: flex; gap: 40px; flex-wrap: wrap; justify-content: center;">
+                <div class="command-box" style="flex: 1; min-width: 350px;">
+                    <h3 style="color: #00d2ff; margin-bottom: 15px;">分布式训练</h3>
+                    <div class="comment"># 并行策略规划</div>
+                    <div class="command">aisp distributed plan --model-size 70 --gpus 16</div>
+                    <div class="comment"># NCCL 调优</div>
+                    <div class="command">aisp distributed nccl --nodes 2 --gpus 8</div>
+                    <div class="comment"># ZeRO/FSDP 配置</div>
+                    <div class="command">aisp distributed zero --model-size 70</div>
+                </div>
+                <div class="command-box" style="flex: 1; min-width: 350px;">
+                    <h3 style="color: #00d2ff; margin-bottom: 15px;">推理优化</h3>
+                    <div class="comment"># vLLM 配置</div>
+                    <div class="command">aisp inference vllm --model-size 70 --gpus 4</div>
+                    <div class="comment"># 量化建议</div>
+                    <div class="command">aisp inference quantize --model-size 70</div>
+                    <div class="comment"># 部署配置</div>
+                    <div class="command">aisp inference serve --model llama-70b</div>
+                </div>
+            </div>
+            <div class="feature-list" style="margin-top: 30px;">
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>TP/PP/DP 并行策略自动规划</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>SLURM 脚本自动生成</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>vLLM 吞吐量/延迟估算</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 9: AI & Cluster -->
+        <div class="slide" id="slide9">
+            <h2>🧠 AI & 🏢 Cluster</h2>
+            <p>AI辅助分析与集群评估</p>
+            <div style="display: flex; gap: 40px; flex-wrap: wrap; justify-content: center;">
+                <div class="command-box" style="flex: 1; min-width: 350px;">
+                    <h3 style="color: #00d2ff; margin-bottom: 15px;">AI 助手</h3>
+                    <div class="comment"># 性能问答</div>
+                    <div class="command">aisp ai ask "为什么训练这么慢？"</div>
+                    <div class="comment"># 概念解释</div>
+                    <div class="command">aisp ai explain "Tensor并行"</div>
+                    <div class="comment"># 故障诊断</div>
+                    <div class="command">aisp ai troubleshoot "CUDA OOM"</div>
+                </div>
+                <div class="command-box" style="flex: 1; min-width: 350px;">
+                    <h3 style="color: #00d2ff; margin-bottom: 15px;">集群评估</h3>
+                    <div class="comment"># 评估套件</div>
+                    <div class="command">aisp cluster eval-suite --mode full --hosts node1,node2</div>
+                    <div class="comment"># 通用评估</div>
+                    <div class="command">aisp cluster common-eval --preset core-system --hosts node1</div>
+                    <div class="comment"># 字段报告验证</div>
+                    <div class="command">aisp cluster validate-field-report --report field-report.md</div>
+                </div>
+            </div>
+            <div class="feature-list" style="margin-top: 30px;">
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>LLM 驱动的性能分析</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>书籍引用和最佳实践</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">✅</span>
+                    <span>集群级基准测试和报告生成</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 10: Summary -->
+        <div class="slide" id="slide10">
+            <h2>🎯 总结</h2>
+            <div class="feature-list" style="max-width: 1000px;">
+                <div class="feature-item">
+                    <span class="feature-icon">🚀</span>
+                    <span><strong>统一入口</strong>：单一 CLI 覆盖 AI 性能工程全流程</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">📊</span>
+                    <span><strong>10个领域</strong>：GPU、系统、分析、优化、分布式、推理、基准测试、AI、导出、集群</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">⚡</span>
+                    <span><strong>深度集成</strong>：Nsight Systems/Compute、PyTorch、CUDA、NCCL</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">🤖</span>
+                    <span><strong>AI 辅助</strong>：LLM 驱动的性能问答和故障诊断</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">📈</span>
+                    <span><strong>基准测试</strong>：自动化性能评估和对比分析</span>
+                </div>
+                <div class="feature-item">
+                    <span class="feature-icon">🌐</span>
+                    <span><strong>集群支持</strong>：多节点评估、SLURM 集成、Fabric 分析</span>
+                </div>
+            </div>
+            <div style="margin-top: 40px; text-align: center;">
+                <p style="font-size: 1.5em; color: #00d2ff;">开始使用：aisp --help</p>
+                <p style="color: #a0a0a0;">交互模式：直接运行 aisp 启动 TUI</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="navigation">
+        <button class="nav-btn" onclick="prevSlide()">◀ 上一页</button>
+        <button class="nav-btn" onclick="nextSlide()">下一页 ▶</button>
+    </div>
+    
+    <script>
+        let currentSlide = 1;
+        const totalSlides = 10;
+        
+        function showSlide(n) {
+            const slides = document.querySelectorAll('.slide');
+            slides.forEach(slide => {
+                slide.classList.remove('active', 'prev');
+            });
+            
+            if (n > totalSlides) currentSlide = 1;
+            if (n < 1) currentSlide = totalSlides;
+            
+            const current = document.getElementById(`slide${currentSlide}`);
+            current.classList.add('active');
+            
+            document.getElementById('slideCounter').textContent = `${currentSlide} / ${totalSlides}`;
+            document.getElementById('progressBar').style.width = `${(currentSlide / totalSlides) * 100}%`;
+        }
+        
+        function nextSlide() {
+            currentSlide++;
+            showSlide(currentSlide);
+        }
+        
+        function prevSlide() {
+            currentSlide--;
+            showSlide(currentSlide);
+        }
+        
+        // Keyboard navigation
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowRight' || e.key === ' ') {
+                nextSlide();
+            } else if (e.key === 'ArrowLeft') {
+                prevSlide();
+            }
+        });
+        
+        // Touch support
+        let touchStartX = 0;
+        let touchEndX = 0;
+        
+        document.addEventListener('touchstart', function(e) {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+        
+        document.addEventListener('touchend', function(e) {
+            touchEndX = e.changedTouches[0].screenX;
+            handleSwipe();
+        });
+        
+        function handleSwipe() {
+            if (touchEndX < touchStartX - 50) {
+                nextSlide();
+            }
+            if (touchEndX > touchStartX + 50) {
+                prevSlide();
+            }
+        }
+        
+        // Initialize
+        showSlide(1);
+    </script>
+</body>
+</html>

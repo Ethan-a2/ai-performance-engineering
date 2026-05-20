@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch18 - Advanced Attention & Decoding</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --accent: #58a6ff;
+    --accent2: #3fb950;
+    --accent3: #d2a8ff;
+    --accent4: #f0883e;
+    --text: #c9d1d9;
+    --dim: #8b949e;
+    --red: #f85149;
+    --border: #30363d;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+    height: 100vh;
+  }
+  .deck { position:relative; width:100vw; height:100vh; }
+  .slide {
+    position:absolute; inset:0;
+    display:flex; flex-direction:column;
+    justify-content:center; align-items:center;
+    padding: 60px 80px;
+    opacity:0; pointer-events:none;
+    transition: opacity .4s ease, transform .4s ease;
+    transform: translateX(40px);
+  }
+  .slide.active {
+    opacity:1; pointer-events:auto;
+    transform: translateX(0);
+  }
+  h1 { font-size:2.6em; color:var(--accent); margin-bottom:.3em; text-align:center; line-height:1.2; }
+  h2 { font-size:1.9em; color:var(--accent2); margin-bottom:.4em; text-align:center; }
+  h3 { font-size:1.3em; color:var(--accent3); margin-bottom:.3em; }
+  p, li { font-size:1.05em; line-height:1.65; }
+  ul { list-style:none; padding-left:0; }
+  ul li::before { content:"▸ "; color:var(--accent); font-weight:bold; }
+  ul li { margin-bottom:.35em; }
+  .cols { display:flex; gap:40px; width:100%; max-width:1200px; }
+  .col { flex:1; }
+  .card {
+    background:var(--card); border:1px solid var(--border);
+    border-radius:10px; padding:24px 28px; margin-bottom:16px;
+  }
+  .card h3 { margin-top:0; }
+  .metric {
+    display:inline-block;
+    background: linear-gradient(135deg, #1a2332, #0d1117);
+    border:1px solid var(--accent);
+    border-radius:8px;
+    padding:10px 20px;
+    margin:6px;
+    text-align:center;
+  }
+  .metric .val { font-size:2em; color:var(--accent); font-weight:bold; }
+  .metric .label { font-size:.75em; color:var(--dim); display:block; margin-top:2px; }
+  .tag {
+    display:inline-block; padding:3px 10px; border-radius:12px;
+    font-size:.8em; margin:2px;
+  }
+  .tag-blue { background:#1a3a5c; color:var(--accent); }
+  .tag-green { background:#1a3c2a; color:var(--accent2); }
+  .tag-purple { background:#2a1a4c; color:var(--accent3); }
+  .tag-orange { background:#3c2a1a; color:var(--accent4); }
+  pre {
+    background:#0d1117; border:1px solid var(--border);
+    border-radius:8px; padding:18px 22px;
+    font-size:.82em; line-height:1.5;
+    overflow-x:auto; max-width:100%;
+    color:#e6edf3;
+  }
+  code { color:var(--accent2); }
+  .file-tree { text-align:left; font-size:.88em; line-height:1.8; }
+  .file-tree .dir { color:var(--accent); font-weight:bold; }
+  .file-tree .file { color:var(--text); }
+  .file-tree .desc { color:var(--dim); font-size:.85em; }
+  table {
+    border-collapse:collapse; width:100%; max-width:1000px;
+    font-size:.88em;
+  }
+  th, td {
+    border:1px solid var(--border);
+    padding:10px 16px; text-align:left;
+  }
+  th { background:var(--card); color:var(--accent); font-weight:600; }
+  td { background:var(--bg); }
+  .speedup { color:var(--accent2); font-weight:bold; font-size:1.1em; }
+  .nav {
+    position:fixed; bottom:24px; right:32px;
+    display:flex; gap:10px; z-index:100;
+  }
+  .nav button {
+    background:var(--card); color:var(--text); border:1px solid var(--border);
+    border-radius:6px; padding:8px 18px; cursor:pointer;
+    font-family:inherit; font-size:.85em;
+    transition: background .2s;
+  }
+  .nav button:hover { background:#21262d; }
+  .progress {
+    position:fixed; top:0; left:0; height:3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width .3s ease; z-index:100;
+  }
+  .page-num {
+    position:fixed; bottom:28px; left:32px;
+    color:var(--dim); font-size:.85em; z-index:100;
+  }
+  .flow-box {
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+    justify-content:center; margin:16px 0;
+  }
+  .flow-step {
+    background:var(--card); border:1px solid var(--border);
+    border-radius:8px; padding:12px 18px;
+    font-size:.85em; text-align:center; min-width:120px;
+  }
+  .flow-arrow { color:var(--accent); font-size:1.4em; }
+  .highlight { color:var(--accent); font-weight:bold; }
+  .warn { color:var(--accent4); }
+  .good { color:var(--accent2); }
+  .arch-diagram {
+    display:grid;
+    grid-template-columns: 1fr 60px 1fr 60px 1fr;
+    align-items:center;
+    gap:0;
+    max-width:900px;
+    margin:20px auto;
+  }
+  .arch-box {
+    background:var(--card); border:2px solid var(--border);
+    border-radius:10px; padding:18px; text-align:center;
+  }
+  .arch-box h3 { margin:0 0 6px; font-size:1em; }
+  .arch-box p { font-size:.8em; color:var(--dim); margin:0; }
+  .arch-arrow { text-align:center; color:var(--accent); font-size:1.6em; }
+  .kernel-block {
+    background:#0d1117; border-left:3px solid var(--accent3);
+    padding:10px 16px; margin:8px 0; border-radius:0 6px 6px 0;
+    font-size:.82em; line-height:1.5;
+  }
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+<div class="page-num" id="pageNum"></div>
+<div class="nav">
+  <button onclick="prev()">← Prev</button>
+  <button onclick="next()">Next →</button>
+</div>
+
+<div class="deck" id="deck">
+
+<!-- ==================== SLIDE 1: Title ==================== -->
+<div class="slide active">
+  <h1>Chapter 18</h1>
+  <h2 style="font-size:2.2em; margin-bottom:.2em;">Advanced Attention<br>& Decoding</h2>
+  <p style="color:var(--dim); margin-top:1em; font-size:1.1em;">
+    FlexAttention · FlexDecoding · Speculative Decoding · Tensor Cores · Paged Attention · vLLM
+  </p>
+  <div style="margin-top:2em; display:flex; gap:12px; flex-wrap:wrap; justify-content:center;">
+    <span class="tag tag-blue">PyTorch</span>
+    <span class="tag tag-green">CUDA</span>
+    <span class="tag tag-purple">Triton</span>
+    <span class="tag tag-orange">vLLM</span>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 2: Problem ==================== -->
+<div class="slide">
+  <h2>Core Question</h2>
+  <p style="font-size:1.3em; color:var(--accent); text-align:center; max-width:800px; margin-bottom:1.5em;">
+    "Does decoder complexity actually buy you anything?"
+  </p>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>Baseline Path</h3>
+        <ul>
+          <li>Straightforward FlexAttention / decode execution</li>
+          <li>Conservative serving integration</li>
+          <li>Good correctness anchor</li>
+          <li>Too much launch & data-movement overhead</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Optimized Path</h3>
+        <ul>
+          <li>FlexDecoding + tensor-core-specialized kernels</li>
+          <li>Cache-aware paths</li>
+          <li>Graph replay & serving-integrated decode</li>
+          <li>Benchmarked through shared harness</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 3: Architecture Overview ==================== -->
+<div class="slide">
+  <h2>Chapter Architecture</h2>
+  <div class="arch-diagram">
+    <div class="arch-box" style="border-color:var(--accent);">
+      <h3>Input / Embedding</h3>
+      <p>Token embeddings + position</p>
+    </div>
+    <div class="arch-arrow">→</div>
+    <div class="arch-box" style="border-color:var(--accent3);">
+      <h3>Attention Engine</h3>
+      <p>FlexAttention · Paged · FlashMLA</p>
+    </div>
+    <div class="arch-arrow">→</div>
+    <div class="arch-box" style="border-color:var(--accent2);">
+      <h3>Decode Output</h3>
+      <p>Next-token prediction</p>
+    </div>
+  </div>
+  <div class="flow-box" style="margin-top:30px;">
+    <div class="flow-step" style="border-color:var(--accent);">FlexDecoding<br><span style="font-size:.75em;color:var(--dim)">Work reduction</span></div>
+    <span class="flow-arrow">+</span>
+    <div class="flow-step" style="border-color:var(--accent3);">Tensor Cores<br><span style="font-size:.75em;color:var(--dim)">Kernel accel</span></div>
+    <span class="flow-arrow">+</span>
+    <div class="flow-step" style="border-color:var(--accent2);">RoPE Cache<br><span style="font-size:.75em;color:var(--dim)">Fuse & reuse</span></div>
+    <span class="flow-arrow">+</span>
+    <div class="flow-step" style="border-color:var(--accent4);">Paged Attn<br><span style="font-size:.75em;color:var(--dim)">Memory mgmt</span></div>
+    <span class="flow-arrow">+</span>
+    <div class="flow-step" style="border-color:var(--red);">vLLM Serving<br><span style="font-size:.75em;color:var(--dim)">Production</span></div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 4: Measured Deltas ==================== -->
+<div class="slide">
+  <h2>Measured Performance Deltas</h2>
+  <table>
+    <tr>
+      <th>Target</th>
+      <th>Baseline</th>
+      <th>Optimized</th>
+      <th>Speedup</th>
+      <th>What Changed</th>
+    </tr>
+    <tr>
+      <td><code>flexdecoding</code></td>
+      <td>161.596 ms</td>
+      <td>81.980 ms</td>
+      <td class="speedup">1.97×</td>
+      <td>Slice active decode window instead of full KV cache</td>
+    </tr>
+    <tr>
+      <td><code>tensor_cores</code></td>
+      <td>3.805 ms</td>
+      <td>0.243 ms</td>
+      <td class="speedup">15.65×</td>
+      <td>Tensor-core decode kernel</td>
+    </tr>
+    <tr>
+      <td><code>rope_q_cache</code></td>
+      <td>106.429 ms</td>
+      <td>4.523 ms</td>
+      <td class="speedup">23.53×</td>
+      <td>Cache-aware RoPE/Q-path reuse</td>
+    </tr>
+  </table>
+  <p style="margin-top:1.2em; color:var(--dim); font-size:.9em;">
+    Different stories: moderate work-reduction (flexdecoding) vs big kernel-level wins (tensor_cores, rope_q_cache).
+  </p>
+</div>
+
+<!-- ==================== SLIDE 5: Directory Layout ==================== -->
+<div class="slide">
+  <h2>Directory Layout</h2>
+  <div class="cols" style="font-size:.78em;">
+    <div class="col">
+      <div class="card file-tree">
+        <span class="dir">FlexDecoding</span><br>
+        <span class="file">baseline_flexdecoding.py</span> <span class="desc">→ SDPA fallback</span><br>
+        <span class="file">optimized_flexdecoding.py</span> <span class="desc">→ active window</span><br>
+        <span class="file">optimized_flexdecoding_graphs.py</span> <span class="desc">→ graph replay</span><br>
+        <span class="file">flexdecoding.py</span> <span class="desc">→ shared module</span><br><br>
+        <span class="dir">Tensor Cores</span><br>
+        <span class="file">baseline_tensor_cores.py</span> <span class="desc">→ FP32 no TC</span><br>
+        <span class="file">optimized_tensor_cores.py</span> <span class="desc">→ FP16 TC</span><br>
+        <span class="file">flashmla_kernel.cu</span> <span class="desc">→ Blackwell decode</span><br>
+        <span class="file">warp_specialized_triton.py</span> <span class="desc">→ Triton equiv</span><br>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card file-tree">
+        <span class="dir">Paged Attention</span><br>
+        <span class="file">baseline_paged_attn_backend.py</span> <span class="desc">→ dense math</span><br>
+        <span class="file">optimized_paged_attn_backend.py</span> <span class="desc">→ flash backend</span><br>
+        <span class="file">baseline_paged_attn_layout.py</span> <span class="desc">→ dense mask</span><br>
+        <span class="file">optimized_paged_attn_layout.py</span> <span class="desc">→ block-table sparse</span><br><br>
+        <span class="dir">RoPE + Q Cache</span><br>
+        <span class="file">baseline_rope_q_cache.py</span> <span class="desc">→ unfused per-head</span><br>
+        <span class="file">optimized_rope_q_cache.py</span> <span class="desc">→ fused cache path</span><br><br>
+        <span class="dir">Serving / vLLM</span><br>
+        <span class="file">baseline_vllm_v1_integration.py</span><br>
+        <span class="file">optimized_vllm_v1_integration.py</span><br>
+        <span class="file">baseline_vllm_decode_graphs.py</span><br>
+        <span class="file">optimized_vllm_decode_graphs.py</span><br>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 6: FlexDecoding Deep Dive ==================== -->
+<div class="slide">
+  <h2>FlexDecoding: Work Reduction Story</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>Baseline Problem</h3>
+        <p>Scores the <span class="highlight">full KV cache</span> with a sliding-window mask.</p>
+        <div class="kernel-block">
+          Q @ K^T → full [seq_len × seq_len]<br>
+          Apply sliding-window mask → O(seq²) compute<br>
+          Most work discarded by mask
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Optimized Solution</h3>
+        <p>Trims decode step to <span class="good">active window</span> before attention.</p>
+        <div class="kernel-block">
+          Slice K/V to window [pos-w : pos]<br>
+          Q @ K_sliced^T → O(w) compute<br>
+          No wasted masked-out work
+        </div>
+      </div>
+    </div>
+  </div>
+  <div style="margin-top:1.5em; text-align:center;">
+    <div class="metric">
+      <span class="val">1.97×</span>
+      <span class="label">SPEEDUP</span>
+    </div>
+    <div class="metric">
+      <span class="val">161.6 → 82.0 ms</span>
+      <span class="label">LATENCY</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 7: Tensor Cores ==================== -->
+<div class="slide">
+  <h2>Tensor Core Acceleration</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>Baseline: FP32 MatMul</h3>
+        <div class="kernel-block">
+<pre style="margin:0;background:none;border:none;padding:0;">
+<span style="color:var(--dim)"># FP32 → no tensor cores</span>
+A = torch.randn(4096, 4096,
+    dtype=torch.float32)
+B = torch.randn(4096, 4096,
+    dtype=torch.float32)
+out = A @ B  <span style="color:var(--dim)"># CUDA cores</span>
+</pre>
+        </div>
+        <p style="margin-top:.5em;font-size:.85em;">Standard FP32 FMA units — no hardware acceleration for matrix ops.</p>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Optimized: FP16 Tensor Cores</h3>
+        <div class="kernel-block">
+<pre style="margin:0;background:none;border:none;padding:0;">
+<span style="color:var(--dim)"># FP16 → tensor cores</span>
+A = torch.randn(4096, 4096,
+    dtype=torch.float16)
+B = torch.randn(4096, 4096,
+    dtype=torch.float16)
+out = A @ B  <span style="color:var(--good)"># Tensor Cores!</span>
+</pre>
+        </div>
+        <p style="margin-top:.5em;font-size:.85em;">Tensor cores: 4×4×4 FMA per clock — massive throughput for matmul.</p>
+      </div>
+    </div>
+  </div>
+  <div style="text-align:center; margin-top:1em;">
+    <div class="metric">
+      <span class="val">15.65×</span>
+      <span class="label">SPEEDUP</span>
+    </div>
+    <div class="metric">
+      <span class="val">3.805 → 0.243 ms</span>
+      <span class="label">LATENCY</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 8: FlashMLA CUDA Kernel ==================== -->
+<div class="slide">
+  <h2>FlashMLA Decode Kernel (Blackwell sm_120)</h2>
+  <div class="card" style="max-width:900px;">
+    <pre style="font-size:.78em; line-height:1.6;">
+<span style="color:var(--accent3)">__global__</span> <span style="color:var(--accent)">void</span> flashmla_decode(
+    <span style="color:var(--accent2)">const half*</span> q,          <span style="color:var(--dim)">// [B, H, D]</span>
+    <span style="color:var(--accent2)">const half*</span> k_cache,    <span style="color:var(--dim)">// [B, S, H, D]</span>
+    <span style="color:var(--accent2)">const half*</span> v_cache,    <span style="color:var(--dim)">// [B, S, H, D]</span>
+    <span style="color:var(--accent2)">half*</span>       out,        <span style="color:var(--dim)">// [B, H, D]</span>
+    <span style="color:var(--accent2)">const int*</span>  lengths,    <span style="color:var(--dim)">// [B] seq lengths</span>
+    <span style="color:var(--accent2)">int</span> num_heads, <span style="color:var(--accent2)">int</span> head_dim, <span style="color:var(--accent2)">int</span> stride)
+{
+  <span style="color:var(--dim)">// Per-head attention: Q·K scores → softmax → V weighted sum</span>
+  <span style="color:var(--accent2)">half</span> acc = 0, denom = 0;
+  <span style="color:var(--accent3)">for</span> (<span style="color:var(--accent2)">int</span> pos = 0; pos &lt; lengths[batch]; ++pos) {
+    score = <span style="color:var(--accent)">__hfma</span>(q[d], k[pos][d], score);  <span style="color:var(--dim)">// FMA</span>
+    weight = <span style="color:var(--accent)">hexp</span>(score / sqrt(head_dim));    <span style="color:var(--dim)">// softmax</span>
+    acc = <span style="color:var(--accent)">__hfma</span>(weight, v[pos][d], acc);     <span style="color:var(--dim)">// accumulate</span>
+  }
+  out = acc / denom;  <span style="color:var(--dim)">// normalize</span>
+}</pre>
+  </div>
+  <p style="margin-top:.8em; color:var(--dim); font-size:.85em;">
+    Illustrative sketch — production uses FlashMLA/ThunderMLA or PyTorch FlexDecoding kernels.
+    Includes Blackwell TMEM guard for SM121 compilation.
+  </p>
+</div>
+
+<!-- ==================== SLIDE 9: RoPE + Q Cache ==================== -->
+<div class="slide">
+  <h2>RoPE + Q Projection + KV Cache</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>Baseline: Unfused Per-Head</h3>
+        <div class="flow-box" style="flex-direction:column; gap:8px;">
+          <div class="flow-step" style="width:100%;">Input → Q projection (matmul)</div>
+          <span class="flow-arrow">↓</span>
+          <div class="flow-step" style="width:100%;">Per-head RoPE rotation</div>
+          <span class="flow-arrow">↓</span>
+          <div class="flow-step" style="width:100%;">Separate KV cache write</div>
+          <span class="flow-arrow">↓</span>
+          <div class="flow-step" style="width:100%; border-color:var(--red);">3 kernel launches + sync</div>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Optimized: Fused Cache Path</h3>
+        <div class="flow-box" style="flex-direction:column; gap:8px;">
+          <div class="flow-step" style="width:100%; border-color:var(--accent2);">Fused: Q proj + RoPE + cache write</div>
+          <span class="flow-arrow">↓</span>
+          <div class="flow-step" style="width:100%; border-color:var(--accent2);">Single kernel, shared memory</div>
+          <span class="flow-arrow">↓</span>
+          <div class="flow-step" style="width:100%; border-color:var(--accent2);">No intermediate syncs</div>
+          <span class="flow-arrow">↓</span>
+          <div class="flow-step" style="width:100%; border-color:var(--accent2);">Cache-aware reuse</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div style="text-align:center; margin-top:1em;">
+    <div class="metric">
+      <span class="val">23.53×</span>
+      <span class="label">SPEEDUP</span>
+    </div>
+    <div class="metric">
+      <span class="val">106.4 → 4.5 ms</span>
+      <span class="label">LATENCY</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 10: Paged Attention ==================== -->
+<div class="slide">
+  <h2>Paged Attention: Two Axes of Optimization</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>Backend Selection</h3>
+        <p style="font-size:.88em; margin-bottom:.8em;">
+          Dense SDPA math backend vs flash backend for the same paged layout.
+        </p>
+        <table style="font-size:.82em;">
+          <tr><th>Variant</th><th>Backend</th></tr>
+          <tr><td>Baseline</td><td><code>math</code> — dense SDPA</td></tr>
+          <tr><td>Optimized</td><td><code>flash</code> — FlashAttention</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Layout: Dense vs Block-Table</h3>
+        <p style="font-size:.88em; margin-bottom:.8em;">
+          Dense masked decode vs block-table-driven FlexAttention sparse kernels.
+        </p>
+        <table style="font-size:.82em;">
+          <tr><th>Variant</th><th>Approach</th></tr>
+          <tr><td>Baseline</td><td>Dense mask over full KV</td></tr>
+          <tr><td>Optimized</td><td>Block-table sparse kernel</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+  <p style="margin-top:1em; color:var(--dim); font-size:.9em; text-align:center;">
+    <code>paged_attn_split_common.py</code> — shared infrastructure for both comparisons
+  </p>
+</div>
+
+<!-- ==================== SLIDE 11: FlexAttention Examples ==================== -->
+<div class="slide">
+  <h2>FlexAttention Examples</h2>
+  <div class="cols" style="font-size:.85em;">
+    <div class="col">
+      <div class="card">
+        <h3>Mask Types</h3>
+        <ul>
+          <li><span class="highlight">Sliding Window</span> — local attention</li>
+          <li><span class="highlight">Document Attention</span> — per-doc masking</li>
+          <li><span class="highlight">Block Sparse</span> — structured sparsity</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Scaling Levels</h3>
+        <ul>
+          <li><code>flex_attention_native.py</code> — toy sizes</li>
+          <li><code>flex_attention_enhanced.py</code> — enhanced masks</li>
+          <li><code>flex_attention_large_model.py</code> — large model + KV cache</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Key APIs</h3>
+        <div class="kernel-block">
+<pre style="margin:0;background:none;border:none;padding:0;font-size:.88em;">
+<span style="color:var(--accent3)">from</span> torch.nn.attention.flex_attention
+  <span style="color:var(--accent3)">import</span> (
+    create_block_mask,
+    create_mask,
+    flex_attention,
+)
+</pre>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Env-Configurable</h3>
+        <p>Sweep shapes without editing code:</p>
+        <div class="kernel-block">
+<pre style="margin:0;background:none;border:none;padding:0;font-size:.88em;">
+BLOCK_SIZE=128  DOC_SPAN=64  SEQ_LEN=4096
+</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 12: Speculative Decoding ==================== -->
+<div class="slide">
+  <h2>Speculative Decoding</h2>
+  <p style="color:var(--dim); margin-bottom:1.5em; text-align:center;">
+    Trade extra compute for lower latency — draft + verify pipeline
+  </p>
+  <div class="flow-box">
+    <div class="flow-step" style="border-color:var(--accent4); min-width:140px;">
+      Draft Model<br><span style="font-size:.75em;color:var(--dim)">Fast, small model</span>
+    </div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent); min-width:140px;">
+      K Candidates<br><span style="font-size:.75em;color:var(--dim)">Speculative tokens</span>
+    </div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent2); min-width:140px;">
+      Target Verify<br><span style="font-size:.75em;color:var(--dim)">Accept / reject</span>
+    </div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step" style="border-color:var(--accent3); min-width:140px;">
+      Output<br><span style="font-size:.75em;color:var(--dim)">1+ tokens/step</span>
+    </div>
+  </div>
+  <div class="card" style="max-width:700px; margin-top:1.5em;">
+    <h3>Config Sweep Tool</h3>
+    <p><code>speculative_decode/spec_config_sweep.py</code></p>
+    <ul>
+      <li>Sweep draft model sizes, speculation lengths</li>
+      <li>Summarize latency / throughput tradeoffs</li>
+      <li>Config presets in <code>spec_configs/</code></li>
+    </ul>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 13: vLLM Integration ==================== -->
+<div class="slide">
+  <h2>vLLM Serving Integration</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>V1 Engine Loop</h3>
+        <ul>
+          <li><code>v1_engine_loop.py</code> — polling-loop correctness</li>
+          <li><code>v1_engine_loop_common.py</code> — shared loop logic</li>
+          <li><code>v1_bucketed_decode_loop.py</code> — bucketed batching</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Decode Graphs</h3>
+        <ul>
+          <li>Baseline: standard decode path</li>
+          <li>Optimized: CUDA graph replay for decode</li>
+          <li>Eliminates per-step launch overhead</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Config Presets</h3>
+        <div class="kernel-block">
+<pre style="margin:0;background:none;border:none;padding:0;font-size:.85em;">
+<span style="color:var(--dim)">configs/qos.yaml</span>
+  QoS latency targets
+  Batch size limits
+  GPU memory budgets
+
+<span style="color:var(--dim)">workload_config.py</span>
+  Workload parameterization
+  Model / sequence presets
+</pre>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Validation</h3>
+        <p style="font-size:.88em;">Serving integration must show accuracy parity vs native FlexAttention path.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 14: Benchmark Targets ==================== -->
+<div class="slide">
+  <h2>Benchmark Targets</h2>
+  <table style="font-size:.88em;">
+    <tr>
+      <th>Target</th>
+      <th>Baseline File</th>
+      <th>Optimized File</th>
+      <th>Story</th>
+    </tr>
+    <tr>
+      <td><code>flexdecoding</code></td>
+      <td>baseline_flexdecoding.py</td>
+      <td>optimized_flexdecoding.py</td>
+      <td>Work reduction: slice KV window</td>
+    </tr>
+    <tr>
+      <td><code>tensor_cores</code></td>
+      <td>baseline_tensor_cores.py</td>
+      <td>optimized_tensor_cores.py</td>
+      <td>FP32 → FP16 tensor cores</td>
+    </tr>
+    <tr>
+      <td><code>rope_q_cache</code></td>
+      <td>baseline_rope_q_cache.py</td>
+      <td>optimized_rope_q_cache.py</td>
+      <td>Fuse RoPE + Q + cache write</td>
+    </tr>
+    <tr>
+      <td><code>paged_attn_backend</code></td>
+      <td>baseline_paged_attn_backend.py</td>
+      <td>optimized_paged_attn_backend.py</td>
+      <td>math → flash SDPA backend</td>
+    </tr>
+    <tr>
+      <td><code>paged_attn_layout</code></td>
+      <td>baseline_paged_attn_layout.py</td>
+      <td>optimized_paged_attn_layout.py</td>
+      <td>Dense mask → block-table sparse</td>
+    </tr>
+    <tr>
+      <td><code>tiny_gemm_fused</code></td>
+      <td>baseline_tiny_gemm_fused.py</td>
+      <td>optimized_tiny_gemm_fused.py</td>
+      <td>Fused small GEMM</td>
+    </tr>
+    <tr>
+      <td><code>vllm_v1_integration</code></td>
+      <td>baseline_vllm_v1_integration.py</td>
+      <td>optimized_vllm_v1_integration.py</td>
+      <td>Serving integration</td>
+    </tr>
+    <tr>
+      <td><code>vllm_decode_graphs</code></td>
+      <td>baseline_vllm_decode_graphs.py</td>
+      <td>optimized_vllm_decode_graphs.py</td>
+      <td>Graph replay for decode</td>
+    </tr>
+  </table>
+</div>
+
+<!-- ==================== SLIDE 15: Harness & Validation ==================== -->
+<div class="slide">
+  <h2>Harness & Validation</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>Run Commands</h3>
+        <pre style="font-size:.78em;">
+<span style="color:var(--dim)"># Quick compare</span>
+python -m ch18.compare
+
+<span style="color:var(--dim)"># List all targets</span>
+python -m cli.aisp bench list-targets \
+  --chapter ch18
+
+<span style="color:var(--dim)"># Full sweep</span>
+python -m cli.aisp bench run \
+  --targets ch18 --profile minimal
+
+<span style="color:var(--dim)"># Deep dive with Nsight</span>
+python -m cli.aisp bench run \
+  --targets ch18:flexdecoding \
+  --profile deep_dive --single-gpu</pre>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Validation Checklist</h3>
+        <ul>
+          <li><code>ch18.compare</code> — baseline/optimized sweep</li>
+          <li><code>vllm_v1_integration</code> — accuracy parity check</li>
+          <li><code>pytest ch18/test_flex_attention.py</code> — mask/score-mod helpers</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Expectation Baselines</h3>
+        <p style="font-size:.88em;">
+          <code>expectations_{hw}.json</code> per hardware key.<br>
+          Refresh with <code>--update-expectations</code>.<br>
+          Strict mode default; <code>--validity-profile portable</code> for compatibility.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 16: Key Takeaways ==================== -->
+<div class="slide">
+  <h2>Key Takeaways</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card" style="border-left:3px solid var(--accent);">
+        <h3>Work Reduction (moderate)</h3>
+        <p>FlexDecoding: slice KV to active window.</p>
+        <div class="metric" style="margin-top:.5em;">
+          <span class="val">~2×</span>
+          <span class="label">FLEXDECODING</span>
+        </div>
+      </div>
+      <div class="card" style="border-left:3px solid var(--accent3);">
+        <h3>Kernel-Level (big wins)</h3>
+        <p>Tensor cores + fused RoPE/Q/cache.</p>
+        <div style="margin-top:.5em;">
+          <div class="metric">
+            <span class="val">~16×</span>
+            <span class="label">TENSOR CORES</span>
+          </div>
+          <div class="metric">
+            <span class="val">~24×</span>
+            <span class="label">ROPE CACHE</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="border-left:3px solid var(--accent2);">
+        <h3>Serving Integration</h3>
+        <p>vLLM decode graphs eliminate per-step launch overhead. Paged attention manages KV memory at scale.</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--accent4);">
+        <h3>Lesson</h3>
+        <p style="font-size:1.05em;">
+          Don't average "moderate" and "big kernel" improvements together — they're <span class="highlight">different stories</span>.
+          Measure on your hardware before treating numbers as decision thresholds.
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 17: End ==================== -->
+<div class="slide">
+  <h1 style="font-size:3em;">Q & A</h1>
+  <p style="color:var(--dim); margin-top:1em; font-size:1.1em;">
+    Chapter 18 — Advanced Attention & Decoding
+  </p>
+  <div style="margin-top:2em; display:flex; gap:20px; flex-wrap:wrap; justify-content:center;">
+    <div class="metric">
+      <span class="val">1.97×</span>
+      <span class="label">FLEXDECODING</span>
+    </div>
+    <div class="metric">
+      <span class="val">15.65×</span>
+      <span class="label">TENSOR CORES</span>
+    </div>
+    <div class="metric">
+      <span class="val">23.53×</span>
+      <span class="label">ROPE CACHE</span>
+    </div>
+  </div>
+  <p style="color:var(--dim); margin-top:2em; font-size:.85em;">
+    repo: ai-performance-engineering/code/ch18
+  </p>
+</div>
+
+</div><!-- /deck -->
+
+<script>
+const slides = document.querySelectorAll('.slide');
+let cur = 0;
+
+function show(i) {
+  slides[cur].classList.remove('active');
+  cur = Math.max(0, Math.min(i, slides.length - 1));
+  slides[cur].classList.add('active');
+  document.getElementById('progress').style.width = ((cur + 1) / slides.length * 100) + '%';
+  document.getElementById('pageNum').textContent = (cur + 1) + ' / ' + slides.length;
+}
+
+function next() { show(cur + 1); }
+function prev() { show(cur - 1); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
+  if (e.key === 'Home') { e.preventDefault(); show(0); }
+  if (e.key === 'End') { e.preventDefault(); show(slides.length - 1); }
+});
+
+// Touch support
+let touchX = 0;
+document.addEventListener('touchstart', e => { touchX = e.touches[0].clientX; });
+document.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - touchX;
+  if (Math.abs(dx) > 50) { dx < 0 ? next() : prev(); }
+});
+
+show(0);
+</script>
+
+</body>
+</html>

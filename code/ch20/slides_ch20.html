@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch20 — AI-Assisted Performance Optimization & Case Studies</title>
+<style>
+  :root {
+    --bg: #0f172a; --fg: #e2e8f0; --accent: #38bdf8; --accent2: #a78bfa;
+    --green: #4ade80; --red: #f87171; --orange: #fb923c; --cyan: #22d3ee;
+    --card-bg: #1e293b; --dim: #94a3b8; --border: #334155;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--fg); font-family: 'Inter', 'Segoe UI', system-ui, sans-serif; }
+  .slide { display: none; width: 100vw; height: 100vh; padding: 60px 80px; flex-direction: column; justify-content: center; }
+  .slide.active { display: flex; }
+  h1 { font-size: 3rem; font-weight: 800; margin-bottom: 0.3em; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  h2 { font-size: 2.2rem; font-weight: 700; margin-bottom: 0.5em; color: var(--accent); }
+  h3 { font-size: 1.4rem; font-weight: 600; margin-bottom: 0.4em; color: var(--accent2); }
+  p, li { font-size: 1.25rem; line-height: 1.7; color: var(--fg); }
+  .subtitle { font-size: 1.5rem; color: var(--dim); margin-bottom: 1.5em; }
+  ul { padding-left: 1.5em; }
+  li { margin-bottom: 0.4em; }
+  li::marker { color: var(--accent); }
+  code { background: var(--card-bg); padding: 2px 8px; border-radius: 4px; font-family: 'Fira Code', 'Cascadia Code', monospace; font-size: 1.1rem; color: var(--cyan); }
+  pre { background: var(--card-bg); padding: 20px 28px; border-radius: 12px; overflow-x: auto; margin: 0.8em 0; border-left: 4px solid var(--accent); }
+  pre code { background: none; padding: 0; font-size: 1.05rem; color: var(--fg); }
+  .grid { display: grid; gap: 24px; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+  .card { background: var(--card-bg); border-radius: 16px; padding: 28px; border: 1px solid var(--border); }
+  .card h3 { margin-bottom: 0.6em; }
+  .badge { display: inline-block; padding: 4px 14px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; margin-right: 8px; }
+  .badge-blue { background: rgba(56,189,248,0.15); color: var(--accent); }
+  .badge-green { background: rgba(74,222,128,0.15); color: var(--green); }
+  .badge-red { background: rgba(248,113,113,0.15); color: var(--red); }
+  .badge-purple { background: rgba(167,139,250,0.15); color: var(--accent2); }
+  .badge-orange { background: rgba(251,146,60,0.15); color: var(--orange); }
+  table { width: 100%; border-collapse: collapse; margin: 0.8em 0; font-size: 1.1rem; }
+  th { background: var(--card-bg); color: var(--accent); text-align: left; padding: 12px 16px; border-bottom: 2px solid var(--accent); font-weight: 600; }
+  td { padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  tr:hover td { background: rgba(56,189,248,0.05); }
+  .num { text-align: right; font-family: 'Fira Code', monospace; }
+  .bar-container { display: flex; align-items: center; gap: 10px; }
+  .bar { height: 22px; border-radius: 4px; transition: width 0.6s ease; }
+  .bar-baseline { background: var(--red); }
+  .bar-optimized { background: var(--green); }
+  .highlight { color: var(--green); font-weight: 700; }
+  .warn { color: var(--orange); font-weight: 700; }
+  .dim-text { color: var(--dim); font-size: 1rem; }
+  .flow-box { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0.6em 0; }
+  .flow-step { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px 20px; font-size: 1.05rem; position: relative; }
+  .flow-step.active-step { border-color: var(--accent); box-shadow: 0 0 12px rgba(56,189,248,0.2); }
+  .flow-arrow { color: var(--accent); font-size: 1.4rem; }
+  .nav { position: fixed; bottom: 30px; right: 40px; display: flex; gap: 12px; z-index: 100; }
+  .nav button { background: var(--card-bg); border: 1px solid var(--border); color: var(--fg); padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 1rem; transition: all 0.2s; }
+  .nav button:hover { border-color: var(--accent); color: var(--accent); }
+  .slide-num { position: fixed; bottom: 34px; left: 40px; color: var(--dim); font-size: 0.95rem; z-index: 100; }
+  .icon { font-size: 2rem; margin-right: 12px; vertical-align: middle; }
+  .vs { display: flex; gap: 32px; align-items: stretch; }
+  .vs-col { flex: 1; }
+  .vs-col h3 { text-align: center; margin-bottom: 0.6em; }
+  .arrow-right { color: var(--green); font-size: 2.5rem; display: flex; align-items: center; }
+  .key-number { font-size: 3.5rem; font-weight: 800; line-height: 1.1; }
+  .key-unit { font-size: 1.2rem; color: var(--dim); }
+  .section-divider { font-size: 1.8rem; font-weight: 300; color: var(--dim); margin-bottom: 0.5em; letter-spacing: 0.05em; }
+  .checklist { list-style: none; padding-left: 0; }
+  .checklist li { padding-left: 1.8em; position: relative; }
+  .checklist li::before { content: '✓'; position: absolute; left: 0; color: var(--green); font-weight: 700; }
+</style>
+</head>
+<body>
+
+<!-- ====== SLIDE 1: Title ====== -->
+<div class="slide active" id="s1">
+  <p class="section-divider">CHAPTER 20</p>
+  <h1>AI-Assisted Performance<br>Optimization & Case Studies</h1>
+  <p class="subtitle">When isolated wins must survive contact with the full stack</p>
+  <div style="margin-top:2em;">
+    <span class="badge badge-blue">Kernel Generation</span>
+    <span class="badge badge-purple">Formal Verification</span>
+    <span class="badge badge-green">End-to-End Composition</span>
+    <span class="badge badge-orange">Case Studies</span>
+  </div>
+</div>
+
+<!-- ====== SLIDE 2: Problem Statement ====== -->
+<div class="slide" id="s2">
+  <h2>The Core Question</h2>
+  <div class="grid grid-2" style="margin-top:1em;">
+    <div class="card">
+      <h3>Isolated Wins</h3>
+      <p>Each optimization (memory, pipeline, KV-cache, precision) proves itself in isolation.</p>
+      <p style="margin-top:0.8em; color:var(--dim);">But do they <strong style="color:var(--orange);">compose cleanly</strong> once stacked together?</p>
+    </div>
+    <div class="card">
+      <h3>The Real Test</h3>
+      <p>Chapter 20 answers: <em>"Can we validate generated or staged optimizations once memory, pipeline, and inference changes are stacked in one end-to-end workload?"</em></p>
+    </div>
+  </div>
+  <div style="margin-top:2em;">
+    <div class="flow-box">
+      <div class="flow-step">Prototype Kernels</div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step">Verify Correctness</div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step active-step">Compose & Measure E2E</div>
+      <span class="flow-arrow">→</span>
+      <div class="flow-step">Validate Gains Survive</div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== SLIDE 3: Directory Layout ====== -->
+<div class="slide" id="s3">
+  <h2>Directory Layout — 33 Files</h2>
+  <div class="grid grid-2" style="margin-top:0.8em;">
+    <div class="card">
+      <h3>Benchmark Pairs (baseline ↔ optimized)</h3>
+      <table>
+        <tr><td><code>bf16_mlp</code></td><td class="dim-text">Precision policy</td></tr>
+        <tr><td><code>integrated_kv_cache</code></td><td class="dim-text">Paged KV-cache</td></tr>
+        <tr><td><code>nvfp4_mlp</code></td><td class="dim-text">NVFP4 quantization</td></tr>
+        <tr><td><code>pipeline_sequential</code></td><td class="dim-text">Microbatch pipeline</td></tr>
+        <tr><td><code>end_to_end_bandwidth</code></td><td class="dim-text">Bandwidth composition</td></tr>
+        <tr><td><code>memory_standard</code></td><td class="dim-text">Allocator changes</td></tr>
+        <tr><td><code>moe</code></td><td class="dim-text">Mixture-of-Experts</td></tr>
+        <tr><td><code>autotuning</code></td><td class="dim-text">Compile autotuning</td></tr>
+        <tr><td><code>training_single</code></td><td class="dim-text">Single-device training</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>AI & Verification Tools</h3>
+      <table>
+        <tr><td><code>ai_kernel_generator.py</code></td><td class="dim-text">FlexAttention demo</td></tr>
+        <tr><td><code>ai_kernel_workflow_tool.py</code></td><td class="dim-text">E2E gen+verify workflow</td></tr>
+        <tr><td><code>kernel_verification_tool.py</code></td><td class="dim-text">Manual verification</td></tr>
+        <tr><td><code>proofwright_verify_tool.py</code></td><td class="dim-text">Agentic formal verify</td></tr>
+      </table>
+      <h3 style="margin-top:1em;">Infrastructure</h3>
+      <table>
+        <tr><td><code>compare.py</code></td><td class="dim-text">Harness driver</td></tr>
+        <tr><td><code>arch_config.py</code></td><td class="dim-text">Architecture defaults</td></tr>
+        <tr><td><code>expectations_*.json</code></td><td class="dim-text">Hardware baselines</td></tr>
+        <tr><td><code>multiple_all_techniques.py</code></td><td class="dim-text">Combined techniques</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ====== SLIDE 4: Measured Results ====== -->
+<div class="slide" id="s4">
+  <h2>Validated End-to-End Results</h2>
+  <table style="font-size:1.2rem; margin-top:1em;">
+    <thead>
+      <tr><th>Target</th><th class="num">Baseline</th><th class="num">Optimized</th><th class="num">Speedup</th><th>What Changed</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>integrated_kv_cache</code></td>
+        <td class="num">986.8 ms</td>
+        <td class="num">139.7 ms</td>
+        <td class="num highlight">7.07×</td>
+        <td>Block-wise paged KV-cache across E2E loop</td>
+      </tr>
+      <tr>
+        <td><code>bf16_mlp</code></td>
+        <td class="num">0.616 ms</td>
+        <td class="num">0.234 ms</td>
+        <td class="num highlight">2.63×</td>
+        <td>BF16 precision policy on eager MLP graph</td>
+      </tr>
+    </tbody>
+  </table>
+  <div style="margin-top:2em;">
+    <h3>Visual Comparison</h3>
+    <div style="margin-top:0.8em;">
+      <p style="margin-bottom:0.3em;"><strong>integrated_kv_cache</strong></p>
+      <div class="bar-container">
+        <span style="width:60px; font-size:0.9rem;">Baseline</span>
+        <div class="bar bar-baseline" style="width:80%; max-width:600px;"></div>
+        <span class="num">986.8 ms</span>
+      </div>
+      <div class="bar-container" style="margin-top:6px;">
+        <span style="width:60px; font-size:0.9rem;">Opt</span>
+        <div class="bar bar-optimized" style="width:11.3%; max-width:600px;"></div>
+        <span class="num">139.7 ms</span>
+      </div>
+      <p style="margin-top:1em; margin-bottom:0.3em;"><strong>bf16_mlp</strong></p>
+      <div class="bar-container">
+        <span style="width:60px; font-size:0.9rem;">Baseline</span>
+        <div class="bar bar-baseline" style="width:80%; max-width:600px;"></div>
+        <span class="num">0.616 ms</span>
+      </div>
+      <div class="bar-container" style="margin-top:6px;">
+        <span style="width:60px; font-size:0.9rem;">Opt</span>
+        <div class="bar bar-optimized" style="width:30.5%; max-width:600px;"></div>
+        <span class="num">0.234 ms</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== SLIDE 5: KV Cache Deep Dive ====== -->
+<div class="slide" id="s5">
+  <h2>Case Study: Integrated KV Cache</h2>
+  <div class="vs" style="margin-top:1em;">
+    <div class="vs-col card">
+      <h3 style="color:var(--red);">Baseline: NaiveKVCache</h3>
+      <ul>
+        <li>Per-token allocation: <code>zeros(max_seq_len, ...)</code></li>
+        <li>Dict-based cache with <code>allocate → append → get → free</code></li>
+        <li>Token-by-token processing loop</li>
+        <li>No memory reuse between requests</li>
+        <li>High allocation overhead per token</li>
+      </ul>
+    </div>
+    <div class="arrow-right">→</div>
+    <div class="vs-col card">
+      <h3 style="color:var(--green);">Optimized: PagedKVCache</h3>
+      <ul>
+        <li>Page-size slab allocation with buffer pool</li>
+        <li><code>append_block()</code> — batch writes per block</li>
+        <li>Block-wise processing (<code>block_size=8</code>)</li>
+        <li>Buffer reuse via <code>_release_buffer</code></li>
+        <li>Auto-grow with <code>_ensure_capacity</code></li>
+      </ul>
+    </div>
+  </div>
+  <div class="card" style="margin-top:1em; text-align:center;">
+    <p><strong>Key Insight:</strong> The 7× speedup comes from eliminating per-token allocation and switching to block-wise processing with buffer pool reuse.</p>
+  </div>
+</div>
+
+<!-- ====== SLIDE 6: BF16 MLP Deep Dive ====== -->
+<div class="slide" id="s6">
+  <h2>Case Study: BF16 MLP Precision Policy</h2>
+  <div class="vs" style="margin-top:1em;">
+    <div class="vs-col card">
+      <h3 style="color:var(--red);">Baseline: FP32 Eager</h3>
+      <ul>
+        <li><code>torch.float32</code> — no tensor cores</li>
+        <li>Separate <code>relu()</code> kernels (not fused)</li>
+        <li>Redundant normalization per forward</li>
+        <li>Synchronous execution</li>
+      </ul>
+    </div>
+    <div class="arrow-right">→</div>
+    <div class="vs-col card">
+      <h3 style="color:var(--green);">Optimized: BF16 Eager</h3>
+      <ul>
+        <li><code>torch.bfloat16</code> — tensor core acceleration</li>
+        <li>Same eager op graph (truthful comparison)</li>
+        <li>No fused kernel — pure precision policy win</li>
+        <li>2.63× speedup from dtype alone</li>
+      </ul>
+    </div>
+  </div>
+  <pre><code># Baseline: FP32 model
+self.model = UnoptimizedModel().to(device).float().eval()
+
+# Optimized: BF16 model (same graph, different precision)
+model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+self.model = OptimizedModel().to(device, dtype=model_dtype).eval()</code></pre>
+</div>
+
+<!-- ====== SLIDE 7: MoE Benchmark ====== -->
+<div class="slide" id="s7">
+  <h2>Case Study: Mixture-of-Experts (MoE)</h2>
+  <div class="grid grid-2" style="margin-top:1em;">
+    <div class="card">
+      <h3>Architecture</h3>
+      <pre><code>class ToyMoe(nn.Module):
+    def __init__(self, hidden_dim=1024):
+        self.gate = nn.Linear(hidden_dim, 2)
+        self.expert0 = FFN(GELU)  # Expert 0
+        self.expert1 = FFN(ReLU)  # Expert 1
+
+    def forward(self, x):
+        scores = softmax(self.gate(x))
+        top_expert = argmax(scores)
+        # Both experts computed, masked routing
+        return out0 * mask0 + out1 * mask1</code></pre>
+    </div>
+    <div class="card">
+      <h3>Baseline vs Optimized</h3>
+      <ul>
+        <li><span class="badge badge-red">Baseline</span> Eager-mode forward pass</li>
+        <li><span class="badge badge-green">Optimized</span> <code>torch.compile</code> to reduce overhead</li>
+      </ul>
+      <h3 style="margin-top:1em;">Config</h3>
+      <table>
+        <tr><td>Batch size</td><td class="num">32</td></tr>
+        <tr><td>Hidden dim</td><td class="num">1024</td></tr>
+        <tr><td>Experts</td><td class="num">2 (top-1)</td></tr>
+        <tr><td>Precision</td><td class="num">FP16</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ====== SLIDE 8: AI Kernel Generator ====== -->
+<div class="slide" id="s8">
+  <h2>AI Kernel Generator — FlexAttention</h2>
+  <div class="grid grid-2" style="margin-top:1em;">
+    <div class="card">
+      <h3>What It Does</h3>
+      <ul>
+        <li>PyTorch <code>flex_attention</code> with custom score mods</li>
+        <li>Relative position encoding: <code>score + (q_idx - kv_idx) * 1.4427</code></li>
+        <li>Causal masking via <code>create_block_mask</code></li>
+        <li>Compiled with <code>torch.compile(fullgraph=True)</code></li>
+        <li>Targeting Blackwell SM10x via Triton ≥ 3.5</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Verification</h3>
+      <pre><code># Compare fused vs reference attention
+out_fused = flex_attention(q, k, v,
+    score_mod=relative_position_score,
+    block_mask=causal_mask)
+
+out_ref = reference_attention(q, k, v,
+    scale, causal=True)
+
+max_err = (out_fused - out_ref).abs().max()
+# Typical: ~1e-3 for BF16</code></pre>
+    </div>
+  </div>
+  <pre><code># Default config: B=1, H=16, Q=8192, D=128, dtype=bf16
+python -m cli.aisp tools ch20-ai-kernel-generator -- --device cuda --seqlen 8192</code></pre>
+</div>
+
+<!-- ====== SLIDE 9: Kernel Workflow Tool ====== -->
+<div class="slide" id="s9">
+  <h2>AI Kernel Workflow — End-to-End Pipeline</h2>
+  <div class="flow-box" style="margin-top:1em; margin-bottom:1.5em;">
+    <div class="flow-step active-step">1. Generate Kernel</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step active-step">2. Manual Verify</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step active-step">3. ProofWright Verify</div>
+    <span class="flow-arrow">→</span>
+    <div class="flow-step active-step">4. JSON Report</div>
+  </div>
+  <div class="grid grid-3">
+    <div class="card">
+      <h3>Step 1: Candidate</h3>
+      <p>Run FlexAttention with relative position score mod, measure max error vs reference and latency.</p>
+    </div>
+    <div class="card">
+      <h3>Step 2: Manual</h3>
+      <ul class="checklist">
+        <li>Random input tests (5×)</li>
+        <li>Edge case tests (zeros, inf, nan)</li>
+        <li>Boundary shape tests</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Step 3: ProofWright</h3>
+      <ul class="checklist">
+        <li>Memory safety proof</li>
+        <li>Thread safety proof</li>
+        <li>Semantic correctness</li>
+        <li>Auto edge-case discovery</li>
+      </ul>
+    </div>
+  </div>
+  <pre><code>python -m cli.aisp tools ch20-ai-kernel-workflow -- --device cpu --seqlen 512 --output-json workflow.json</code></pre>
+</div>
+
+<!-- ====== SLIDE 10: Manual vs Formal Verification ====== -->
+<div class="slide" id="s10">
+  <h2>Verification: Manual vs ProofWright</h2>
+  <table style="margin-top:1em; font-size:1.15rem;">
+    <thead>
+      <tr><th>Capability</th><th>Manual (kernel_verification_tool)</th><th>ProofWright (proofwright_verify_tool)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Coverage</td><td class="warn">Random sampling, incomplete</td><td class="highlight">Symbolic + concrete, proven</td></tr>
+      <tr><td>Memory Safety</td><td class="warn">No formal guarantee</td><td class="highlight">SMT-proven bounds</td></tr>
+      <tr><td>Thread Safety</td><td class="warn">Not verified</td><td class="highlight">Interference graph analysis</td></tr>
+      <tr><td>Edge Cases</td><td class="warn">Human-identified (error-prone)</td><td class="highlight">LLM auto-discovered</td></tr>
+      <tr><td>Scalability</td><td class="warn">Exponential test growth</td><td class="highlight">Scales with kernel complexity</td></tr>
+      <tr><td>Output</td><td>Pass/fail per test category</td><td>Formal proof steps + report</td></tr>
+    </tbody>
+  </table>
+  <div class="card" style="margin-top:1.5em; text-align:center;">
+    <p><strong>ProofWright (Nov 2025):</strong> LLM-based agent that generates formal specs from kernel source, translates to verification conditions, and dispatches to SMT solvers (Z3, Dafny).</p>
+  </div>
+</div>
+
+<!-- ====== SLIDE 11: Pipeline & Bandwidth ====== -->
+<div class="slide" id="s11">
+  <h2>Pipeline & Bandwidth Case Studies</h2>
+  <div class="grid grid-2" style="margin-top:1em;">
+    <div class="card">
+      <h3>Pipeline Sequential</h3>
+      <ul>
+        <li>4-stage pipeline, 8 microbatches</li>
+        <li><code>SimpleStage</code>: FFN + LayerNorm + residual</li>
+        <li>Baseline: sequential microbatch processing</li>
+        <li>Optimized: overlap opportunities</li>
+        <li>Hidden dim 1536, batch 512, FP16</li>
+      </ul>
+      <pre><code># Sequential: each microbatch through all stages
+for microbatch in microbatches:
+    x = microbatch
+    for stage in stages:
+        x = stage(x)
+    outputs.append(x)</code></pre>
+    </div>
+    <div class="card">
+      <h3>End-to-End Bandwidth</h3>
+      <ul>
+        <li>Tests whether optimizations compose</li>
+        <li>Memory + pipeline + KV-cache stacked</li>
+        <li>Baseline: independent subsystems, no coordination</li>
+        <li>Optimized: staged pipeline with cross-stage overlap</li>
+      </ul>
+      <h3 style="margin-top:1em;">Memory Standard</h3>
+      <ul>
+        <li>Allocator changes at system level</li>
+        <li>Harness-verified allocation patterns</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ====== SLIDE 12: NVFP4 & Autotuning ====== -->
+<div class="slide" id="s12">
+  <h2>NVFP4 MLP & Autotuning</h2>
+  <div class="grid grid-2" style="margin-top:1em;">
+    <div class="card">
+      <h3>NVFP4 Quantization</h3>
+      <table>
+        <tr><td>Batch</td><td class="num">512</td></tr>
+        <tr><td>d_model</td><td class="num">8192</td></tr>
+        <tr><td>d_ff</td><td class="num">32768</td></tr>
+        <tr><td>Layers</td><td class="num">2</td></tr>
+        <tr><td>Precision</td><td class="num">BF16 → NVFP4</td></tr>
+      </table>
+      <pre><code># Baseline: BF16 MLP
+NVFP4MLPBenchmark(config, use_nvfp4=False)
+
+# Optimized: NVFP4 quantized
+NVFP4MLPBenchmark(config, use_nvfp4=True)</code></pre>
+    </div>
+    <div class="card">
+      <h3>Autotuning</h3>
+      <ul>
+        <li>Baseline: default compiler settings</li>
+        <li>Optimized: autotuned compilation flags</li>
+        <li>Inductor cudagraph guard integration</li>
+      </ul>
+      <h3 style="margin-top:1em;">Inductor Guard</h3>
+      <pre><code># core/optimization/inductor_guard.py
+# Gates Inductor cudagraph features
+# for compiled end-to-end paths</code></pre>
+      <h3 style="margin-top:1em;">Training Single</h3>
+      <ul>
+        <li>Single-device training case study</li>
+        <li>CUDA kernels in <code>test.cu</code></li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ====== SLIDE 13: Harness Integration ====== -->
+<div class="slide" id="s13">
+  <h2>Harness Integration & Reproducibility</h2>
+  <div class="grid grid-2" style="margin-top:1em;">
+    <div class="card">
+      <h3>Benchmark Contract</h3>
+      <ul class="checklist">
+        <li><code>BaseBenchmark</code> with <code>setup() → benchmark_fn() → teardown()</code></li>
+        <li><code>VerificationPayloadMixin</code> for post-timing verification</li>
+        <li><code>BenchmarkConfig</code> with iterations, warmup, profiling</li>
+        <li><code>WorkloadMetadata</code> for tokens/requests tracking</li>
+        <li><code>expectations_{hardware}.json</code> baselines</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Repro Commands</h3>
+      <pre><code># Run all ch20 benchmarks
+python -m cli.aisp bench run \
+  --targets ch20 --profile minimal
+
+# Deep-dive profiling
+python -m cli.aisp bench run \
+  --targets ch20:integrated_kv_cache \
+  --profile deep_dive
+
+# Compare baseline vs optimized
+python -m ch20.compare
+
+# List available targets
+python -m cli.aisp bench list-targets \
+  --chapter ch20</code></pre>
+    </div>
+  </div>
+  <div class="card" style="margin-top:1em;">
+    <h3>Validity Profile</h3>
+    <p>Default: <span class="badge badge-green">strict</span> — fail-fast, no implicit downgrades. Use <code>--validity-profile portable</code> for hardware-limited environments.</p>
+  </div>
+</div>
+
+<!-- ====== SLIDE 14: Learning Goals ====== -->
+<div class="slide" id="s14">
+  <h2>Learning Goals</h2>
+  <div class="grid grid-2" style="margin-top:1em;">
+    <div class="card">
+      <h3>Composition</h3>
+      <ul>
+        <li>Chain memory, pipeline, and KV-cache optimizations to see cumulative impact</li>
+        <li>Generate automatic reports comparing baseline vs tuned end-to-end runs</li>
+        <li>Validate that wins compose instead of fighting each other</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>AI-Assisted Workflow</h3>
+      <ul>
+        <li>Prototype new kernels via AI kernel generator</li>
+        <li>Slot generated kernels into the harness</li>
+        <li>Verify with both manual and formal methods</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card" style="margin-top:1.5em;">
+    <h3>Key Takeaways</h3>
+    <div class="grid grid-3" style="margin-top:0.8em;">
+      <div style="text-align:center;">
+        <div class="key-number" style="color:var(--green);">7.07×</div>
+        <p class="key-unit">KV Cache speedup</p>
+        <p class="dim-text">Paged block-wise cache</p>
+      </div>
+      <div style="text-align:center;">
+        <div class="key-number" style="color:var(--accent);">2.63×</div>
+        <p class="key-unit">BF16 MLP speedup</p>
+        <p class="dim-text">Precision policy alone</p>
+      </div>
+      <div style="text-align:center;">
+        <div class="key-number" style="color:var(--accent2);">3</div>
+        <p class="key-unit">Proof properties</p>
+        <p class="dim-text">Memory + Thread + Semantic</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== SLIDE 15: Summary ====== -->
+<div class="slide" id="s15">
+  <h2>Chapter 20 Summary</h2>
+  <div class="card" style="margin-top:1em;">
+    <table>
+      <thead>
+        <tr><th>Thread</th><th>What It Covers</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Kernel Generation</td><td>FlexAttention with custom score mods, Triton targeting Blackwell</td><td><span class="badge badge-green">Working</span></td></tr>
+        <tr><td>Manual Verification</td><td>Random, edge-case, boundary testing with known limitations</td><td><span class="badge badge-orange">Incomplete</span></td></tr>
+        <tr><td>Formal Verification</td><td>ProofWright-style LLM agent: memory + thread + semantic proofs</td><td><span class="badge badge-green">Proven</span></td></tr>
+        <tr><td>KV Cache E2E</td><td>Naive → Paged block-wise with buffer pool reuse</td><td><span class="badge badge-green">7.07×</span></td></tr>
+        <tr><td>BF16 MLP</td><td>FP32 → BF16 precision policy on eager graph</td><td><span class="badge badge-green">2.63×</span></td></tr>
+        <tr><td>Pipeline / Bandwidth</td><td>Sequential → overlap-enabled microbatch pipeline</td><td><span class="badge badge-blue">Informational</span></td></tr>
+        <tr><td>MoE / NVFP4 / Autotuning</td><td>Compile optimization, quantization, expert routing</td><td><span class="badge badge-blue">Case Studies</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div style="margin-top:2em; text-align:center;">
+    <p class="subtitle"><em>"The useful question is not only 'did one optimization help in isolation?' but 'can we validate generated or staged optimizations once they are composed into a full workload?'"</em></p>
+    <p class="dim-text">— Chapter 20 Problem Statement</p>
+  </div>
+</div>
+
+<!-- Navigation -->
+<div class="nav">
+  <button onclick="prev()">← Prev</button>
+  <button onclick="next()">Next →</button>
+</div>
+<div class="slide-num" id="slideNum">1 / 15</div>
+
+<script>
+let cur = 0;
+const slides = document.querySelectorAll('.slide');
+const total = slides.length;
+const numEl = document.getElementById('slideNum');
+
+function show(i) {
+  slides.forEach(s => s.classList.remove('active'));
+  slides[i].classList.add('active');
+  numEl.textContent = (i+1) + ' / ' + total;
+}
+function next() { cur = (cur + 1) % total; show(cur); }
+function prev() { cur = (cur - 1 + total) % total; show(cur); }
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prev(); }
+  if (e.key === 'Home') { cur = 0; show(cur); }
+  if (e.key === 'End') { cur = total - 1; show(cur); }
+});
+show(0);
+</script>
+</body>
+</html>

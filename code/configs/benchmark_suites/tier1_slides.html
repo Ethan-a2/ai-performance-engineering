@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Performance Engineering - Benchmark Suite Visualization</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        .presentation {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 60px;
+            opacity: 0;
+            transform: translateX(100%);
+            transition: all 0.5s ease-in-out;
+        }
+
+        .slide.active {
+            opacity: 1;
+            transform: translateX(0);
+        }
+
+        .slide-title {
+            font-size: 3rem;
+            font-weight: 700;
+            margin-bottom: 30px;
+            background: linear-gradient(90deg, #00d4ff, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+        }
+
+        .slide-subtitle {
+            font-size: 1.5rem;
+            color: #94a3b8;
+            margin-bottom: 40px;
+            text-align: center;
+            max-width: 800px;
+        }
+
+        .card-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            max-width: 1200px;
+            width: 100%;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 25px;
+            backdrop-filter: blur(10px);
+            transition: all 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            border-color: #00d4ff;
+            box-shadow: 0 10px 30px rgba(0, 212, 255, 0.2);
+        }
+
+        .card-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #00d4ff;
+        }
+
+        .card-content {
+            color: #cbd5e1;
+            line-height: 1.6;
+        }
+
+        .category-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+
+        .category-gemm {
+            background: rgba(124, 58, 237, 0.2);
+            border: 1px solid #7c3aed;
+            color: #a78bfa;
+        }
+
+        .category-attention {
+            background: rgba(236, 72, 153, 0.2);
+            border: 1px solid #ec4899;
+            color: #f472b6;
+        }
+
+        .category-decode {
+            background: rgba(34, 197, 94, 0.2);
+            border: 1px solid #22c55e;
+            color: #86efac;
+        }
+
+        .category-kv_memory {
+            background: rgba(251, 146, 60, 0.2);
+            border: 1px solid #fb923c;
+            color: #fdba74;
+        }
+
+        .category-communication {
+            background: rgba(14, 165, 233, 0.2);
+            border: 1px solid #0ea5e9;
+            color: #7dd3fc;
+        }
+
+        .category-end_to_end {
+            background: rgba(234, 179, 8, 0.2);
+            border: 1px solid #eab308;
+            color: #fde047;
+        }
+
+        .architecture-diagram {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 1000px;
+            width: 100%;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .arch-row {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 15px 0;
+            gap: 15px;
+        }
+
+        .arch-box {
+            background: rgba(0, 212, 255, 0.1);
+            border: 2px solid #00d4ff;
+            border-radius: 10px;
+            padding: 15px 25px;
+            text-align: center;
+            min-width: 120px;
+        }
+
+        .arch-box.highlight {
+            background: rgba(124, 58, 237, 0.2);
+            border-color: #7c3aed;
+        }
+
+        .arch-arrow {
+            color: #00d4ff;
+            font-size: 2rem;
+        }
+
+        .stats-container {
+            display: flex;
+            gap: 40px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .stat-item {
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 3rem;
+            font-weight: 700;
+            color: #00d4ff;
+        }
+
+        .stat-label {
+            font-size: 1rem;
+            color: #94a3b8;
+        }
+
+        .tree-container {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 15px;
+            padding: 30px;
+            max-width: 600px;
+            width: 100%;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .tree-item {
+            padding: 8px 0;
+            padding-left: 20px;
+            border-left: 2px solid rgba(255, 255, 255, 0.1);
+            color: #cbd5e1;
+        }
+
+        .tree-item.parent {
+            color: #00d4ff;
+            font-weight: 600;
+            padding-left: 0;
+            border-left: none;
+        }
+
+        .navigation {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 100;
+        }
+
+        .nav-btn {
+            background: rgba(0, 212, 255, 0.2);
+            border: 1px solid #00d4ff;
+            color: #00d4ff;
+            padding: 10px 25px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .nav-btn:hover {
+            background: #00d4ff;
+            color: #1a1a2e;
+        }
+
+        .slide-counter {
+            position: fixed;
+            bottom: 30px;
+            right: 40px;
+            color: #94a3b8;
+            font-size: 1.1rem;
+            z-index: 100;
+        }
+
+        .target-path {
+            font-family: 'Consolas', 'Courier New', monospace;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 8px 15px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            color: #86efac;
+            display: inline-block;
+            margin-top: 10px;
+        }
+
+        .rationale-text {
+            font-style: italic;
+            color: #94a3b8;
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .code-block {
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 10px;
+            padding: 20px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 0.9rem;
+            color: #e2e8f0;
+            max-width: 800px;
+            width: 100%;
+            overflow-x: auto;
+            line-height: 1.5;
+        }
+
+        .code-comment {
+            color: #6b7280;
+        }
+
+        .code-key {
+            color: #00d4ff;
+        }
+
+        .code-string {
+            color: #86efac;
+        }
+
+        .list-container {
+            max-width: 800px;
+            width: 100%;
+        }
+
+        .list-item {
+            display: flex;
+            align-items: flex-start;
+            gap: 15px;
+            padding: 15px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .list-item:last-child {
+            border-bottom: none;
+        }
+
+        .list-icon {
+            width: 40px;
+            height: 40px;
+            background: rgba(0, 212, 255, 0.2);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            flex-shrink: 0;
+        }
+
+        .list-content h3 {
+            color: #fff;
+            margin-bottom: 5px;
+        }
+
+        .list-content p {
+            color: #94a3b8;
+            font-size: 0.95rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="presentation">
+        <!-- Slide 1: Title -->
+        <div class="slide active" id="slide1">
+            <h1 class="slide-title">AI Performance Engineering</h1>
+            <p class="slide-subtitle">Tier 1 Benchmark Suite - 高性能基准测试套件架构可视化</p>
+            <div class="stats-container">
+                <div class="stat-item">
+                    <div class="stat-value">20</div>
+                    <div class="stat-label">Chapters</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">6</div>
+                    <div class="stat-label">Benchmark Targets</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value">6</div>
+                    <div class="stat-label">Categories</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 2: Project Structure -->
+        <div class="slide" id="slide2">
+            <h1 class="slide-title">项目结构</h1>
+            <p class="slide-subtitle">多章节渐进式学习架构</p>
+            <div class="tree-container">
+                <div class="tree-item parent">📁 ai-performance-engineering/code</div>
+                <div class="tree-item">📂 ch01/ - ch20/ (20个章节)</div>
+                <div class="tree-item">📂 labs/ (实验项目)</div>
+                <div class="tree-item">📂 configs/ (配置文件)</div>
+                <div class="tree-item parent">└── 📄 benchmark_suites/tier1.yaml</div>
+                <div class="tree-item">📂 core/ (核心模块)</div>
+                <div class="tree-item">📂 scripts/ (脚本工具)</div>
+                <div class="tree-item">📂 tests/ (测试套件)</div>
+                <div class="tree-item">📂 dashboard/ (仪表盘)</div>
+                <div class="tree-item">📂 monitoring/ (监控系统)</div>
+            </div>
+        </div>
+
+        <!-- Slide 3: Tier 1 Suite Overview -->
+        <div class="slide" id="slide3">
+            <h1 class="slide-title">Tier 1 Suite 概览</h1>
+            <p class="slide-subtitle">覆盖6大核心领域的高信号基准测试</p>
+            <div class="code-block">
+                <span class="code-key">suite_name:</span> <span class="code-string">tier1</span><br>
+                <span class="code-key">version:</span> 1<br>
+                <span class="code-key">description:</span> <span class="code-string">High-signal canonical benchmark suite</span><br>
+                <span class="code-key">default_profile:</span> <span class="code-string">minimal</span><br>
+                <span class="code-key">targets:</span> <span class="code-comment"># 6个目标</span>
+            </div>
+            <div class="list-container" style="margin-top: 30px;">
+                <div class="list-item">
+                    <div class="list-icon">⚡</div>
+                    <div class="list-content">
+                        <h3>GEMM</h3>
+                        <p>矩阵乘法性能基准</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">🧠</div>
+                    <div class="list-content">
+                        <h3>Attention</h3>
+                        <p>注意力机制优化</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">🚀</div>
+                    <div class="list-content">
+                        <h3>Decode</h3>
+                        <p>解码性能优化</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">💾</div>
+                    <div class="list-content">
+                        <h3>KV Memory</h3>
+                        <p>KV缓存内存管理</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">🔗</div>
+                    <div class="list-content">
+                        <h3>Communication</h3>
+                        <p>分布式通信优化</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">🎯</div>
+                    <div class="list-content">
+                        <h3>End-to-End</h3>
+                        <p>端到端模型测试</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 4: Target 1 - Block Scaling -->
+        <div class="slide" id="slide4">
+            <h1 class="slide-title">Target 1: Block Scaling</h1>
+            <p class="slide-subtitle">Blackwell块缩放GEMM基准</p>
+            <div class="card-container">
+                <div class="card">
+                    <span class="category-badge category-gemm">GEMM</span>
+                    <div class="card-title">Block Scaling</div>
+                    <div class="card-content">
+                        <p>Blackwell架构的块缩放矩阵乘法实现</p>
+                        <div class="target-path">labs/block_scaling:block_scaling</div>
+                        <div class="rationale-text">
+                            "Blackwell block-scaled GEMM with explicit baseline/optimized verification."
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">关键特性</div>
+                    <div class="card-content">
+                        <ul style="list-style: none; padding: 0;">
+                            <li style="padding: 8px 0;">✓ 显式基线/优化验证</li>
+                            <li style="padding: 8px 0;">✓ Blackwell架构支持</li>
+                            <li style="padding: 8px 0;">✓ 块缩放技术</li>
+                            <li style="padding: 8px 0;">✓ 性能对比基准</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 5: Target 2 - FlashAttention4 -->
+        <div class="slide" id="slide5">
+            <h1 class="slide-title">Target 2: FlashAttention4</h1>
+            <p class="slide-subtitle">融合注意力机制基准</p>
+            <div class="card-container">
+                <div class="card">
+                    <span class="category-badge category-attention">Attention</span>
+                    <div class="card-title">FlashAttention4 ALiBi</div>
+                    <div class="card-content">
+                        <p>融合注意力路径，包含非平凡的分数修改器</p>
+                        <div class="target-path">labs/flashattention4:flashattention4_alibi</div>
+                        <div class="rationale-text">
+                            "Fused attention path with a non-trivial score modifier and profiler support."
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">关键特性</div>
+                    <div class="card-content">
+                        <ul style="list-style: none; padding: 0;">
+                            <li style="padding: 8px 0;">✓ ALiBi位置编码</li>
+                            <li style="padding: 8px 0;">✓ 融合注意力计算</li>
+                            <li style="padding: 8px 0;">✓ Profiler集成</li>
+                            <li style="padding: 8px 0;">✓ 非平凡分数修改</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 6: Target 3 - Persistent Decode -->
+        <div class="slide" id="slide6">
+            <h1 class="slide-title">Target 3: Persistent Decode</h1>
+            <p class="slide-subtitle">持久化解码服务路径</p>
+            <div class="card-container">
+                <div class="card">
+                    <span class="category-badge category-decode">Decode</span>
+                    <div class="card-title">Persistent Decode</div>
+                    <div class="card-content">
+                        <p>持久化解码服务路径，具有显著的启动开销节省</p>
+                        <div class="target-path">labs/persistent_decode:persistent_decode</div>
+                        <div class="rationale-text">
+                            "Persistent decode serving path with strong launch-overhead savings."
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">关键特性</div>
+                    <div class="card-content">
+                        <ul style="list-style: none; padding: 0;">
+                            <li style="padding: 8px 0;">✓ 持久化执行</li>
+                            <li style="padding: 8px 0;">✓ 低启动开销</li>
+                            <li style="padding: 8px 0;">✓ 服务化路径</li>
+                            <li style="padding: 8px 0;">✓ 性能优化</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 7: Target 4 - KV Standard -->
+        <div class="slide" id="slide7">
+            <h1 class="slide-title">Target 4: KV Standard</h1>
+            <p class="slide-subtitle">KV缓存内存优化基准</p>
+            <div class="card-container">
+                <div class="card">
+                    <span class="category-badge category-kv_memory">KV Memory</span>
+                    <div class="card-title">KV Standard</div>
+                    <div class="card-content">
+                        <p>KV缓存基线与优化内存路径对比</p>
+                        <div class="target-path">labs/kv_optimization:kv_standard</div>
+                        <div class="rationale-text">
+                            "KV-cache baseline vs optimized memory path."
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">关键特性</div>
+                    <div class="card-content">
+                        <ul style="list-style: none; padding: 0;">
+                            <li style="padding: 8px 0;">✓ KV缓存管理</li>
+                            <li style="padding: 8px 0;">✓ 内存路径优化</li>
+                            <li style="padding: 8px 0;">✓ 基线对比</li>
+                            <li style="padding: 8px 0;">✓ 内存效率</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 8: Target 5 - Gradient Fusion -->
+        <div class="slide" id="slide8">
+            <h1 class="slide-title">Target 5: Gradient Fusion</h1>
+            <p class="slide-subtitle">分布式通信/计算重叠</p>
+            <div class="card-container">
+                <div class="card">
+                    <span class="category-badge category-communication">Communication</span>
+                    <div class="card-title">Gradient Fusion</div>
+                    <div class="card-content">
+                        <p>分布式训练的通信/计算重叠基准</p>
+                        <div class="target-path">ch04:gradient_fusion</div>
+                        <div class="rationale-text">
+                            "Communication/computation overlap sanity target for distributed training."
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">关键特性</div>
+                    <div class="card-content">
+                        <ul style="list-style: none; padding: 0;">
+                            <li style="padding: 8px 0;">✓ 梯度融合</li>
+                            <li style="padding: 8px 0;">✓ 通信重叠</li>
+                            <li style="padding: 8px 0;">✓ 分布式训练</li>
+                            <li style="padding: 8px 0;">✓ 计算优化</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 9: Target 6 - LLaMA 3.1 8B -->
+        <div class="slide" id="slide9">
+            <h1 class="slide-title">Target 6: LLaMA 3.1 8B</h1>
+            <p class="slide-subtitle">真实模型端到端测试</p>
+            <div class="card-container">
+                <div class="card">
+                    <span class="category-badge category-end_to_end">End-to-End</span>
+                    <div class="card-title">LLaMA 3.1 8B</div>
+                    <div class="card-content">
+                        <p>真实模型吞吐量路径，防止过拟合微基准</p>
+                        <div class="target-path">labs/real_world_models:llama_3_1_8b</div>
+                        <div class="rationale-text">
+                            "Real-model throughput path that prevents overfitting to microbenchmarks."
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">关键特性</div>
+                    <div class="card-content">
+                        <ul style="list-style: none; padding: 0;">
+                            <li style="padding: 8px 0;">✓ LLaMA 3.1 8B模型</li>
+                            <li style="padding: 8px 0;">✓ 真实场景测试</li>
+                            <li style="padding: 8px 0;">✓ 吞吐量基准</li>
+                            <li style="padding: 8px 0;">✓ 防止过拟合</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 10: Architecture Overview -->
+        <div class="slide" id="slide10">
+            <h1 class="slide-title">架构概览</h1>
+            <p class="slide-subtitle">Tier 1基准测试套件架构</p>
+            <div class="architecture-diagram">
+                <div class="arch-row">
+                    <div class="arch-box highlight">Tier 1 Suite</div>
+                </div>
+                <div class="arch-row">
+                    <span class="arch-arrow">↓</span>
+                </div>
+                <div class="arch-row">
+                    <div class="arch-box">GEMM</div>
+                    <div class="arch-box">Attention</div>
+                    <div class="arch-box">Decode</div>
+                </div>
+                <div class="arch-row">
+                    <span class="arch-arrow">+</span>
+                </div>
+                <div class="arch-row">
+                    <div class="arch-box">KV Memory</div>
+                    <div class="arch-box">Communication</div>
+                    <div class="arch-box">End-to-End</div>
+                </div>
+                <div class="arch-row" style="margin-top: 30px;">
+                    <span class="arch-arrow">↓</span>
+                </div>
+                <div class="arch-row">
+                    <div class="arch-box highlight">Performance Analysis</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 11: Category Breakdown -->
+        <div class="slide" id="slide11">
+            <h1 class="slide-title">分类详情</h1>
+            <p class="slide-subtitle">6大测试类别详解</p>
+            <div class="card-container">
+                <div class="card">
+                    <span class="category-badge category-gemm">GEMM</span>
+                    <div class="card-title">矩阵乘法</div>
+                    <div class="card-content">块缩放GEMM性能基准测试</div>
+                </div>
+                <div class="card">
+                    <span class="category-badge category-attention">Attention</span>
+                    <div class="card-title">注意力机制</div>
+                    <div class="card-content">FlashAttention4融合注意力</div>
+                </div>
+                <div class="card">
+                    <span class="category-badge category-decode">Decode</span>
+                    <div class="card-title">解码优化</div>
+                    <div class="card-content">持久化解码服务路径</div>
+                </div>
+                <div class="card">
+                    <span class="category-badge category-kv_memory">KV Memory</span>
+                    <div class="card-title">内存管理</div>
+                    <div class="card-content">KV缓存内存优化</div>
+                </div>
+                <div class="card">
+                    <span class="category-badge category-communication">Communication</span>
+                    <div class="card-title">分布式通信</div>
+                    <div class="card-content">梯度融合与通信重叠</div>
+                </div>
+                <div class="card">
+                    <span class="category-badge category-end_to_end">End-to-End</span>
+                    <div class="card-title">端到端测试</div>
+                    <div class="card-content">LLaMA 3.1 8B真实模型</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 12: Configuration Details -->
+        <div class="slide" id="slide12">
+            <h1 class="slide-title">配置详情</h1>
+            <p class="slide-subtitle">tier1.yaml 配置结构</p>
+            <div class="code-block">
+                <span class="code-key">suite_name:</span> <span class="code-string">tier1</span><br>
+                <span class="code-key">version:</span> 1<br>
+                <span class="code-key">description:</span> ><br>
+                &nbsp;&nbsp;<span class="code-string">High-signal canonical benchmark suite</span><br>
+                &nbsp;&nbsp;<span class="code-string">covering GEMM, attention, decode,</span><br>
+                &nbsp;&nbsp;<span class="code-string">KV-memory, distributed communication,</span><br>
+                &nbsp;&nbsp;<span class="code-string">and an end-to-end model path.</span><br>
+                <span class="code-key">history_root:</span> <span class="code-string">artifacts/history/tier1</span><br>
+                <span class="code-key">default_profile:</span> <span class="code-string">minimal</span><br>
+                <span class="code-key">default_output_format:</span> <span class="code-string">both</span>
+            </div>
+        </div>
+
+        <!-- Slide 13: Target Mapping -->
+        <div class="slide" id="slide13">
+            <h1 class="slide-title">目标映射</h1>
+            <p class="slide-subtitle">Key → Category → Target 路径</p>
+            <div class="list-container">
+                <div class="list-item">
+                    <div class="list-icon">1</div>
+                    <div class="list-content">
+                        <h3>block_scaling</h3>
+                        <p>GEMM → labs/block_scaling:block_scaling</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">2</div>
+                    <div class="list-content">
+                        <h3>flashattention4_alibi</h3>
+                        <p>Attention → labs/flashattention4:flashattention4_alibi</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">3</div>
+                    <div class="list-content">
+                        <h3>persistent_decode</h3>
+                        <p>Decode → labs/persistent_decode:persistent_decode</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">4</div>
+                    <div class="list-content">
+                        <h3>kv_standard</h3>
+                        <p>KV Memory → labs/kv_optimization:kv_standard</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">5</div>
+                    <div class="list-content">
+                        <h3>gradient_fusion</h3>
+                        <p>Communication → ch04:gradient_fusion</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">6</div>
+                    <div class="list-content">
+                        <h3>llama_3_1_8b</h3>
+                        <p>End-to-End → labs/real_world_models:llama_3_1_8b</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 14: Rationale -->
+        <div class="slide" id="slide14">
+            <h1 class="slide-title">设计理由</h1>
+            <p class="slide-subtitle">每个基准测试的选择依据</p>
+            <div class="card-container">
+                <div class="card">
+                    <div class="card-title">Block Scaling</div>
+                    <div class="card-content">
+                        <em>"Blackwell block-scaled GEMM with explicit baseline/optimized verification."</em>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">FlashAttention4</div>
+                    <div class="card-content">
+                        <em>"Fused attention path with a non-trivial score modifier and profiler support."</em>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Persistent Decode</div>
+                    <div class="card-content">
+                        <em>"Persistent decode serving path with strong launch-overhead savings."</em>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">KV Standard</div>
+                    <div class="card-content">
+                        <em>"KV-cache baseline vs optimized memory path."</em>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Gradient Fusion</div>
+                    <div class="card-content">
+                        <em>"Communication/computation overlap sanity target for distributed training."</em>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">LLaMA 3.1 8B</div>
+                    <div class="card-content">
+                        <em>"Real-model throughput path that prevents overfitting to microbenchmarks."</em>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 15: History & Artifacts -->
+        <div class="slide" id="slide15">
+            <h1 class="slide-title">历史与产物</h1>
+            <p class="slide-subtitle">基准测试历史记录管理</p>
+            <div class="card-container">
+                <div class="card">
+                    <div class="card-title">History Root</div>
+                    <div class="card-content">
+                        <div class="target-path">artifacts/history/tier1</div>
+                        <p style="margin-top: 15px;">所有基准测试历史记录的根目录</p>
+                    </div>
+                </div>
+                <div class="card">
+                    <div class="card-title">默认配置</div>
+                    <div class="card-content">
+                        <ul style="list-style: none; padding: 0;">
+                            <li style="padding: 8px 0;">Profile: <strong>minimal</strong></li>
+                            <li style="padding: 8px 0;">Output: <strong>both</strong></li>
+                            <li style="padding: 8px 0;">Version: <strong>1</strong></li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 16: Summary -->
+        <div class="slide" id="slide16">
+            <h1 class="slide-title">总结</h1>
+            <p class="slide-subtitle">Tier 1 Benchmark Suite 核心价值</p>
+            <div class="list-container">
+                <div class="list-item">
+                    <div class="list-icon">✅</div>
+                    <div class="list-content">
+                        <h3>全面覆盖</h3>
+                        <p>涵盖GEMM、注意力、解码、内存、通信、端到端6大领域</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">✅</div>
+                    <div class="list-content">
+                        <h3>高信号设计</h3>
+                        <p>选择最具代表性的基准测试目标</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">✅</div>
+                    <div class="list-content">
+                        <h3>真实场景</h3>
+                        <p>包含LLaMA 3.1 8B等真实模型测试</p>
+                    </div>
+                </div>
+                <div class="list-item">
+                    <div class="list-icon">✅</div>
+                    <div class="list-content">
+                        <h3>可扩展性</h3>
+                        <p>支持历史记录和多种输出格式</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Navigation -->
+        <div class="navigation">
+            <button class="nav-btn" onclick="prevSlide()">← Previous</button>
+            <button class="nav-btn" onclick="nextSlide()">Next →</button>
+        </div>
+        <div class="slide-counter">
+            <span id="currentSlide">1</span> / <span id="totalSlides">16</span>
+        </div>
+    </div>
+
+    <script>
+        let currentSlide = 1;
+        const totalSlides = 16;
+
+        function showSlide(n) {
+            const slides = document.querySelectorAll('.slide');
+            slides.forEach(slide => slide.classList.remove('active'));
+            
+            if (n > totalSlides) currentSlide = 1;
+            if (n < 1) currentSlide = totalSlides;
+            
+            document.getElementById(`slide${currentSlide}`).classList.add('active');
+            document.getElementById('currentSlide').textContent = currentSlide;
+        }
+
+        function nextSlide() {
+            currentSlide++;
+            showSlide(currentSlide);
+        }
+
+        function prevSlide() {
+            currentSlide--;
+            showSlide(currentSlide);
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowRight' || e.key === ' ') {
+                nextSlide();
+            } else if (e.key === 'ArrowLeft') {
+                prevSlide();
+            }
+        });
+
+        // Touch support
+        let touchStartX = 0;
+        let touchEndX = 0;
+
+        document.addEventListener('touchstart', function(e) {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+
+        document.addEventListener('touchend', function(e) {
+            touchEndX = e.changedTouches[0].screenX;
+            if (touchStartX - touchEndX > 50) {
+                nextSlide();
+            } else if (touchEndX - touchStartX > 50) {
+                prevSlide();
+            }
+        });
+    </script>
+</body>
+</html>

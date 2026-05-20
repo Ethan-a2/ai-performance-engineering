@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Performance Engineering — Core Architecture</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d2e;
+    --accent: #6c63ff;
+    --accent2: #00d2ff;
+    --accent3: #ff6b6b;
+    --accent4: #ffd93d;
+    --text: #e8e8e8;
+    --muted: #8b8fa3;
+    --border: #2a2d3e;
+    --green: #4ade80;
+    --orange: #fb923c;
+    --pink: #f472b6;
+    --cyan: #22d3ee;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; overflow:hidden; font-family:'Segoe UI','PingFang SC','Microsoft YaHei',system-ui,sans-serif; background:var(--bg); color:var(--text); }
+
+  /* Slide container */
+  .deck { position:relative; width:100vw; height:100vh; }
+  .slide { position:absolute; inset:0; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:48px 64px; opacity:0; pointer-events:none; transition:opacity .45s ease, transform .45s ease; transform:translateX(60px); }
+  .slide.active { opacity:1; pointer-events:auto; transform:translateX(0); }
+  .slide.prev { transform:translateX(-60px); }
+
+  /* Typography */
+  h1 { font-size:3rem; font-weight:800; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:16px; line-height:1.15; }
+  h2 { font-size:2rem; font-weight:700; color:var(--accent2); margin-bottom:12px; }
+  h3 { font-size:1.25rem; font-weight:600; color:var(--accent); margin-bottom:8px; }
+  p, li { font-size:1.05rem; line-height:1.65; color:var(--muted); }
+  .subtitle { font-size:1.3rem; color:var(--muted); margin-bottom:32px; }
+
+  /* Layout helpers */
+  .full { width:100%; }
+  .cols { display:flex; gap:28px; width:100%; flex:1; min-height:0; }
+  .col { flex:1; display:flex; flex-direction:column; gap:12px; min-width:0; }
+  .center-text { text-align:center; }
+
+  /* Cards */
+  .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:20px 24px; }
+  .card h3 { margin-bottom:6px; }
+  .card ul { list-style:none; padding:0; }
+  .card li { position:relative; padding-left:18px; margin-bottom:4px; font-size:.95rem; }
+  .card li::before { content:'▸'; position:absolute; left:0; color:var(--accent); }
+
+  /* Badge */
+  .badge { display:inline-block; padding:3px 10px; border-radius:20px; font-size:.78rem; font-weight:600; margin-right:6px; }
+  .badge-purple { background:rgba(108,99,255,.18); color:var(--accent); }
+  .badge-cyan { background:rgba(0,210,255,.15); color:var(--accent2); }
+  .badge-green { background:rgba(74,222,128,.15); color:var(--green); }
+  .badge-orange { background:rgba(251,146,60,.15); color:var(--orange); }
+  .badge-pink { background:rgba(244,114,182,.15); color:var(--pink); }
+  .badge-red { background:rgba(255,107,107,.15); color:var(--accent3); }
+
+  /* Diagram box */
+  .diagram { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:24px; font-family:'Fira Code','Cascadia Code',monospace; font-size:.82rem; line-height:1.55; overflow:auto; white-space:pre; color:var(--muted); width:100%; flex:1; min-height:0; }
+
+  /* Table */
+  table { width:100%; border-collapse:collapse; font-size:.92rem; }
+  th { background:rgba(108,99,255,.12); color:var(--accent); text-align:left; padding:10px 14px; font-weight:600; border-bottom:2px solid var(--border); }
+  td { padding:9px 14px; border-bottom:1px solid var(--border); color:var(--muted); }
+  tr:hover td { background:rgba(255,255,255,.03); }
+
+  /* Big number */
+  .big-num { font-size:3.5rem; font-weight:800; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+
+  /* Flow arrow */
+  .arrow { color:var(--accent); font-size:1.4rem; text-align:center; padding:4px 0; }
+
+  /* Pill row */
+  .pills { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0; }
+
+  /* Progress bar */
+  .nav { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); display:flex; gap:10px; z-index:100; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--border); cursor:pointer; transition:background .3s, transform .3s; }
+  .dot.active { background:var(--accent); transform:scale(1.3); }
+  .dot:hover { background:var(--accent2); }
+
+  /* Page counter */
+  .counter { position:fixed; bottom:28px; right:36px; font-size:.85rem; color:var(--muted); z-index:100; }
+
+  /* Scrollable slide content */
+  .scroll-content { overflow-y:auto; max-height:calc(100vh - 96px); width:100%; padding-right:8px; }
+  .scroll-content::-webkit-scrollbar { width:4px; }
+  .scroll-content::-webkit-scrollbar-thumb { background:var(--border); border-radius:4px; }
+
+  /* Highlight box */
+  .highlight { border-left:3px solid var(--accent); padding:12px 18px; background:rgba(108,99,255,.06); border-radius:0 10px 10px 0; margin:8px 0; }
+  .highlight p { color:var(--text); font-size:.95rem; }
+
+  /* Icon circle */
+  .icon-circle { width:48px; height:48px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:1.4rem; flex-shrink:0; }
+  .icon-purple { background:rgba(108,99,255,.18); }
+  .icon-cyan { background:rgba(0,210,255,.15); }
+  .icon-green { background:rgba(74,222,128,.15); }
+  .icon-orange { background:rgba(251,146,60,.15); }
+  .icon-pink { background:rgba(244,114,182,.15); }
+
+  /* Flex row with icon */
+  .icon-row { display:flex; align-items:flex-start; gap:14px; margin-bottom:10px; }
+  .icon-row .text { flex:1; }
+  .icon-row .text h3 { margin-bottom:2px; }
+  .icon-row .text p { font-size:.9rem; }
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+<!-- ==================== SLIDE 0: Title ==================== -->
+<div class="slide active" data-idx="0">
+  <div class="center-text">
+    <p style="font-size:1rem;letter-spacing:4px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;">AI Systems Performance Engineering</p>
+    <h1>Core 模块架构全景</h1>
+    <p class="subtitle">40+ 模块 · 10 大领域 · 统一引擎 · 端到端性能工程</p>
+    <div style="margin-top:40px;display:flex;gap:24px;justify-content:center;">
+      <div class="card" style="text-align:center;min-width:140px;">
+        <div class="big-num">40+</div>
+        <p style="font-size:.85rem;">顶层模块</p>
+      </div>
+      <div class="card" style="text-align:center;min-width:140px;">
+        <div class="big-num">10</div>
+        <p style="font-size:.85rem;">引擎领域</p>
+      </div>
+      <div class="card" style="text-align:center;min-width:140px;">
+        <div class="big-num">95</div>
+        <p style="font-size:.85rem;">有效性保护</p>
+      </div>
+      <div class="card" style="text-align:center;min-width:140px;">
+        <div class="big-num">50+</div>
+        <p style="font-size:.85rem;">API 路由</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 1: High-Level Architecture ==================== -->
+<div class="slide" data-idx="1">
+  <h2 class="full" style="margin-bottom:16px;">分层架构总览</h2>
+  <div class="diagram full">
+┌─────────────────────────────────────────────────────────────────────┐
+│                         <span style="color:var(--accent2)">INTERFACES  接口层</span>                          │
+│   ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────┐      │
+│   │ <span style="color:var(--green)">CLI aisp</span> │  │ <span style="color:var(--cyan)">MCP Tools</span>│  │ <span style="color:var(--orange)">Dashboard</span>│  │ <span style="color:var(--pink)">Python API</span> │      │
+│   └────┬─────┘  └────┬─────┘  └────┬─────┘  └──────┬───────┘      │
+│        └──────────────┴──────┬──────┴───────────────┘              │
+│                    ┌─────────▼──────────┐                          │
+│                    │  <span style="color:var(--accent)">engine.py</span>           │  <span style="color:var(--accent3)">PerformanceEngine</span>      │
+│                    │  <span style="color:var(--accent)">10 domains 单例</span>    │                          │
+│                    └─────────┬──────────┘                          │
+│              ┌───────────────┼───────────────┐                     │
+│     ┌────────▼──────┐ ┌─────▼─────┐ ┌───────▼───────┐            │
+│     │ <span style="color:var(--green)">perf_core</span>    │ │ <span style="color:var(--pink)">llm.py</span>    │ │ <span style="color:var(--orange)">analysis/</span>   │            │
+│     │ <span style="color:var(--green)">数据采集层</span>   │ │ <span style="color:var(--pink)">LLM AI</span>    │ │ <span style="color:var(--orange)">瓶颈分析</span>   │            │
+│     └────────┬──────┘ └───────────┘ └───────────────┘            │
+│  ┌───────────┼───────────┬──────────────┬──────────────┐          │
+│  ▼           ▼           ▼              ▼              ▼          │
+│ <span style="color:var(--accent)">benchmark/</span> <span style="color:var(--accent2)">harness/</span>   <span style="color:var(--orange)">profiling/</span>  <span style="color:var(--green)">discovery/</span>  <span style="color:var(--pink)">env/</span>         │
+│ 基准框架    执行引擎    性能分析     基准发现     环境配置      │
+└─────────────────────────────────────────────────────────────────────┘</div>
+</div>
+
+<!-- ==================== SLIDE 2: Engine 10 Domains ==================== -->
+<div class="slide" data-idx="2">
+  <h2 class="full" style="margin-bottom:16px;">engine.py — 10 大领域统一门面</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-purple">🖥️</div><div class="text"><h3>GPUDomain</h3><p>GPU 信息、拓扑、功耗、带宽、NVLink</p></div></div>
+      </div>
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-cyan">⚙️</div><div class="text"><h3>SystemDomain</h3><p>软件栈、依赖、能力检测、环境上下文</p></div></div>
+      </div>
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-green">📊</div><div class="text"><h3>ProfileDomain</h3><p>nsys / ncu / torch / HTA / flame graph / roofline</p></div></div>
+      </div>
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-orange">🔍</div><div class="text"><h3>AnalyzeDomain</h3><p>瓶颈检测、Pareto、扩展性、What-if、ROI</p></div></div>
+      </div>
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-pink">🚀</div><div class="text"><h3>OptimizeDomain</h3><p>推荐引擎、技术栈、ROI、复合优化、Playbook</p></div></div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-purple">🌐</div><div class="text"><h3>DistributedDomain</h3><p>并行策略、NCCL、FSDD、TP、PP、Slurm</p></div></div>
+      </div>
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-cyan">🤖</div><div class="text"><h3>InferenceDomain</h3><p>vLLM 配置、量化、部署、估算</p></div></div>
+      </div>
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-green">⏱️</div><div class="text"><h3>BenchmarkDomain</h3><p>运行、目标管理、历史、数据、对比</p></div></div>
+      </div>
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-orange">🧠</div><div class="text"><h3>AIDomain</h3><p>ask / explain / analyze_kernel / troubleshoot</p></div></div>
+      </div>
+      <div class="card">
+        <div class="icon-row"><div class="icon-circle icon-pink">📤</div><div class="text"><h3>ExportDomain</h3><p>CSV / PDF / HTML / 完整报告导出</p></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 3: Benchmark Framework ==================== -->
+<div class="slide" data-idx="3">
+  <h2 class="full" style="margin-bottom:16px;">benchmark/ — 基准测试框架 (35+ 文件)</h2>
+  <div class="cols">
+    <div class="col" style="flex:1.2;">
+      <div class="card">
+        <h3>核心模型</h3>
+        <ul>
+          <li><span class="badge badge-purple">contract.py</span> AST 级合约验证 (911 行)</li>
+          <li><span class="badge badge-cyan">verification.py</span> InputSignature / ToleranceSpec (1327 行)</li>
+          <li><span class="badge badge-green">verify_runner.py</span> Golden Output / Fresh-Input / Jitter (1918 行)</li>
+          <li><span class="badge badge-orange">registry.py</span> @export_benchmark 装饰器 (422 行)</li>
+          <li><span class="badge badge-pink">models.py</span> Pydantic 数据模型 (457 行)</li>
+          <li><span class="badge badge-red">expectations.py</span> 硬件基线 + 回归检测 (1160 行)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>执行 & 对比</h3>
+        <ul>
+          <li><span class="badge badge-purple">bench_commands.py</span> CLI 入口 (3403 行)</li>
+          <li><span class="badge badge-cyan">comparison.py</span> baseline vs optimized 对比</li>
+          <li><span class="badge badge-green">run_manifest.py</span> 完整环境快照 (782 行)</li>
+          <li><span class="badge badge-orange">quarantine.py</span> 不合规基准隔离</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="flex:1;">
+        <h3>验证三重检查</h3>
+        <div class="highlight"><p>🛡️ <strong>Golden Output</strong><br>缓存首次正确输出作为参考</p></div>
+        <div class="highlight"><p>🔄 <strong>Fresh Input</strong><br>新随机输入检测过拟合</p></div>
+        <div class="highlight"><p>📳 <strong>Jitter Check</strong><br>扰动输入验证输出变化</p></div>
+      </div>
+      <div class="card">
+        <h3>特殊基准类</h3>
+        <ul>
+          <li>CudaBinaryBenchmark — CUDA C++ 编译基准</li>
+          <li>VerificationPayloadMixin — 混入验证载荷</li>
+          <li>Blackwell 优化内核目录</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 4: Harness ==================== -->
+<div class="slide" data-idx="4">
+  <h2 class="full" style="margin-bottom:16px;">harness/ — 基准执行引擎 (16 文件)</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>🏗️ benchmark_harness.py (5963 行)</h3>
+        <p style="margin-bottom:8px;">核心执行引擎 — <strong>BaseBenchmark</strong> 基类</p>
+        <ul>
+          <li>CUDA Events 精确计时</li>
+          <li>全设备同步 + L2 缓存清理</li>
+          <li>GPU 时钟锁定 (persistence mode)</li>
+          <li>自适应迭代次数</li>
+          <li>CUDA Graph 模式支持</li>
+          <li>Triton do_bench / PyTorch Timer 集成</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🎯 run_benchmarks.py (12289 行)</h3>
+        <p>编排器 — 发现所有 baseline/optimized 对，运行、采集指标、生成报告</p>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>🛡️ 95 项有效性保护</h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
+          <div class="highlight"><p><strong>时序</strong><br>流同步 · 异步等待 · 事件精度</p></div>
+          <div class="highlight"><p><strong>输出</strong><br>常量检测 · 缓存新鲜 · NaN/Inf</p></div>
+          <div class="highlight"><p><strong>工作量</strong><br>精度匹配 · 批次完整 · 序列长度</p></div>
+          <div class="highlight"><p><strong>环境</strong><br>时钟锁定 · 热节流 · NUMA</p></div>
+          <div class="highlight"><p><strong>CUDA</strong><br>上下文固定 · 驱动开销 · Graph</p></div>
+          <div class="highlight"><p><strong>统计</strong><br>去樱桃 · 离群值 · 充分采样</p></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>关键子模块</h3>
+        <ul>
+          <li><span class="badge badge-purple">validity_checks.py</span> StreamAuditor · MemoryTracker</li>
+          <li><span class="badge badge-cyan">isolated_runner.py</span> 子进程隔离运行</li>
+          <li><span class="badge badge-green">hardware_capabilities.py</span> GPU 特性检测</li>
+          <li><span class="badge badge-orange">validity_profile.py</span> strict / portable 模式</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 5: Profiling ==================== -->
+<div class="slide" data-idx="5">
+  <h2 class="full" style="margin-bottom:16px;">profiling/ — GPU 性能分析 (30+ 文件)</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>🔬 核心分析器</h3>
+        <ul>
+          <li><span class="badge badge-purple">profiler.py</span> UnifiedProfiler — 统一入口</li>
+          <li><span class="badge badge-cyan">memory.py</span> MemoryProfiler — 内存追踪</li>
+          <li><span class="badge badge-green">flame_graph.py</span> 火焰图生成</li>
+          <li><span class="badge badge-orange">timeline.py</span> CPU/GPU 时间线</li>
+          <li><span class="badge badge-pink">occupancy.py</span> 占用率分析</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>📊 工具集成</h3>
+        <ul>
+          <li>nsys (Nsight Systems) 摘要提取</li>
+          <li>ncu (Nsight Compute) 深度分析</li>
+          <li>torch.profiler 自动化</li>
+          <li>HTA (Holistic Trace Analysis)</li>
+          <li>CUTLASS Profiler 集成</li>
+          <li>Proton 分析器集成</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="flex:1;">
+        <h3>分析流水线</h3>
+        <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
+          <div class="highlight"><p><strong>1. 捕获</strong> — nsys/ncu/torch.profiler 采集 trace</p></div>
+          <div class="arrow">↓</div>
+          <div class="highlight"><p><strong>2. 提取</strong> — ncu_summary / nsys_summary 解析指标</p></div>
+          <div class="arrow">↓</div>
+          <div class="highlight"><p><strong>3. 分析</strong> — GPU 遥测 · 内存日志 · 流分析</p></div>
+          <div class="arrow">↓</div>
+          <div class="highlight"><p><strong>4. 可视化</strong> — 火焰图 · 时间线 · Roofline</p></div>
+          <div class="arrow">↓</div>
+          <div class="highlight"><p><strong>5. 洞察</strong> — profile_insights.py (2391 行) 自动归因</p></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 6: Analysis ==================== -->
+<div class="slide" data-idx="6">
+  <h2 class="full" style="margin-bottom:16px;">analysis/ — 性能分析引擎 (40+ 文件)</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>🎯 瓶颈诊断</h3>
+        <ul>
+          <li><span class="badge badge-purple">gpu_bottleneck_analyzer</span> 瓶颈分类 · Stall 归因</li>
+          <li><span class="badge badge-cyan">kernel_fingerprint</span> 内核模式识别 · 优化清单</li>
+          <li><span class="badge badge-green">memory_analyzer</span> 内存访问模式分析</li>
+          <li><span class="badge badge-orange">power_efficiency</span> 功耗效率分析</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>📈 趋势 & 回归</h3>
+        <ul>
+          <li>detect_regressions — 自动回归检测</li>
+          <li>trends — 性能趋势分析</li>
+          <li>history_index — 历史运行索引</li>
+          <li>compare_benchmark_pairs — 配对对比</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>📊 可视化</h3>
+        <ul>
+          <li>dual_roofline — 双 Roofline 图</li>
+          <li>roofline_automation — 自动化 Roofline</li>
+          <li>report_generator — 报告生成</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card" style="flex:1;">
+        <h3>🧠 LLM 驱动分析</h3>
+        <div class="highlight"><p><strong>llm_advisor.py</strong> (803 行)<br>基于知识库的优化建议 · 支持 OpenAI/Anthropic/Ollama</p></div>
+        <div class="highlight"><p><strong>llm_patch_applier.py</strong><br>LLM 生成补丁的自动应用</p></div>
+        <div class="highlight"><p><strong>llm_patch_promotion.py</strong><br>最佳补丁晋升逻辑</p></div>
+        <div class="highlight"><p><strong>llm_profile_analyzer.py</strong><br>LLM 驱动的 Profile 分析</p></div>
+        <div class="highlight"><p><strong>tool_router.py</strong><br>LLM 工具推荐路由</p></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 7: Optimization ==================== -->
+<div class="slide" data-idx="7">
+  <h2 class="full" style="margin-bottom:16px;">optimization/ — 优化规划器</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>🌐 parallelism_planner/ (30 文件)</h3>
+        <p style="margin-bottom:8px;">完整并行策略规划系统</p>
+        <div class="pills">
+          <span class="badge badge-purple">拓扑检测</span>
+          <span class="badge badge-cyan">分片策略</span>
+          <span class="badge badge-green">分布式训练</span>
+          <span class="badge badge-orange">推理优化</span>
+          <span class="badge badge-pink">vLLM</span>
+        </div>
+        <ul>
+          <li>model_analyzer — 模型结构分析</li>
+          <li>bottleneck_analysis — 并行瓶颈</li>
+          <li>pareto_analysis — Pareto 前沿</li>
+          <li>strategy_optimizer — 策略搜索</li>
+          <li>auto_tuning — 自动调优</li>
+          <li>rl_optimization — 强化学习优化</li>
+          <li>launch_commands — 启动命令生成</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>🔧 auto/ — 自动优化</h3>
+        <ul>
+          <li>optimizer.py — 优化器核心</li>
+          <li>config.py — 配置管理</li>
+          <li>input_adapters.py — 输入适配</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🔍 search/ — 搜索优化</h3>
+        <ul>
+          <li>mcts_optimizer.py — 蒙特卡洛树搜索</li>
+          <li>llm_oracle.py — LLM 引导搜索</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>⚡ 专项优化</h3>
+        <ul>
+          <li>paged_attention.py — 分页注意力</li>
+          <li>moe_inference.py — MoE 推理</li>
+          <li>quantization_utils.py — 量化工具</li>
+          <li>symmetric_memory_patch.py — 对称内存 (Hopper+)</li>
+          <li>allocator_tuning.py — CUDA 分配器调优</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 8: LLM Integration ==================== -->
+<div class="slide" data-idx="8">
+  <h2 class="full" style="margin-bottom:16px;">LLM 集成架构</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card" style="flex:1;">
+        <h3>🔌 llm.py — 统一 LLM 客户端 (520 行)</h3>
+        <p style="margin:8px 0;">自动检测后端，统一 API</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px;">
+          <div class="highlight"><p><strong>OpenAI</strong><br>GPT-4o<br><code>OPENAI_API_KEY</code></p></div>
+          <div class="highlight"><p><strong>Anthropic</strong><br>Claude Sonnet<br><code>ANTHROPIC_API_KEY</code></p></div>
+          <div class="highlight"><p><strong>Ollama</strong><br>本地模型<br><code>OLLAMA_HOST</code></p></div>
+          <div class="highlight"><p><strong>vLLM</strong><br>自托管<br><code>VLLM_API_BASE</code></p></div>
+        </div>
+        <div style="margin-top:12px;">
+          <p><code>llm_call(prompt, system)</code> — 核心调用</p>
+          <p><code>get_llm_status()</code> — 可用性检查</p>
+          <p><code>PERF_EXPERT_SYSTEM</code> — GPU 专家系统提示</p>
+        </div>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>🧠 AI 能力矩阵</h3>
+        <table>
+          <tr><th>模块</th><th>功能</th></tr>
+          <tr><td>llm_engine.py</td><td>结构化 Prompt → 分析</td></tr>
+          <tr><td>llm_advisor</td><td>知识库 + 优化建议</td></tr>
+          <tr><td>llm_patch_applier</td><td>自动应用 LLM 补丁</td></tr>
+          <tr><td>llm_patch_promotion</td><td>最佳补丁晋升</td></tr>
+          <tr><td>llm_profile_analyzer</td><td>Profile 智能分析</td></tr>
+          <tr><td>tool_router</td><td>工具推荐路由</td></tr>
+          <tr><td>llm_oracle</td><td>MCTS 搜索引导</td></tr>
+          <tr><td>AIDomain</td><td>ask / explain / troubleshoot</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 9: Benchmark Lifecycle ==================== -->
+<div class="slide" data-idx="9">
+  <h2 class="full" style="margin-bottom:16px;">基准测试生命周期 (11 阶段)</h2>
+  <div class="full" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;">
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">1</div>
+      <h3>发现</h3>
+      <p>discovery/ 通过 AST 扫描章节</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">2</div>
+      <h3>注册</h3>
+      <p>registry.py 验证合约合规</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">3</div>
+      <h3>合约检查</h3>
+      <p>contract.py AST 验证必要方法</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">4</div>
+      <h3>初始化</h3>
+      <p>BaseBenchmark.setup()</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">5</div>
+      <h3>预热</h3>
+      <p>隔离预热 + 缓存隔离</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">6</div>
+      <h3>计时</h3>
+      <p>CUDA Events + 自适应迭代</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">7</div>
+      <h3>验证</h3>
+      <p>Golden / Fresh / Jitter 三重检查</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">8</div>
+      <h3>分析</h3>
+      <p>nsys / ncu / torch.profiler</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">9</div>
+      <h3>对比</h3>
+      <p>baseline vs optimized 回归检测</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">10</div>
+      <h3>期望追踪</h3>
+      <p>per-hardware 基线 + 漂移检测</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="big-num" style="font-size:2rem;">11</div>
+      <h3>报告</h3>
+      <p>HTML / CSV / PDF 导出</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 10: Supporting Modules ==================== -->
+<div class="slide" data-idx="10">
+  <h2 class="full" style="margin-bottom:16px;">支撑模块一览</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>📦 common/ — 共享助手</h3>
+        <ul>
+          <li>async_input_pipeline — 异步数据管线</li>
+          <li>moe_parallelism_plan — MoE 并行规划</li>
+          <li>device_utils — 设备工具</li>
+          <li>tcgen05/ — Blackwell TC gen05</li>
+          <li>headers/ — 共享 C/C++ 头文件</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🔌 plugins/ — 插件系统</h3>
+        <p>通过 Python entry points (<code>aipe.plugins</code>) 发现 Typer 子应用，自动注册能力</p>
+      </div>
+      <div class="card">
+        <h3>✅ verification/ — 硬件验证 (25+ 文件)</h3>
+        <p>NVLink · TMA · CUTLASS · ECC/MIG · GDS · HBM · Triton Blackwell 等硬件特性验证</p>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>🌐 api/ — HTTP API 层</h3>
+        <ul>
+          <li>registry.py — 50+ 路由注册</li>
+          <li>handlers.py — 引擎委托处理</li>
+          <li>response.py — 统一响应信封</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🏢 cluster/ — 集群评估</h3>
+        <ul>
+          <li>多节点评估套件</li>
+          <li>规范包构建</li>
+          <li>Field Report 验证</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🛠️ 顶层工具模块</h3>
+        <table>
+          <tr><td>hot_path_checks</td><td>964 行 · AST 热路径反模式</td></tr>
+          <tr><td>profile_insights</td><td>2391 行 · 自动归因</td></tr>
+          <tr><td>book.py</td><td>377 行 · 书籍引用系统</td></tr>
+          <tr><td>costs.py</td><td>GPU 成本计算器</td></tr>
+          <tr><td>whatif.py</td><td>What-if 场景分析</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 11: Data Flow ==================== -->
+<div class="slide" data-idx="11">
+  <h2 class="full" style="margin-bottom:16px;">数据流 & API 路由</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="diagram" style="flex:1;">
+<span style="color:var(--accent2)">HTTP 请求</span>
+    │
+    ▼
+<span style="color:var(--accent)">api/registry.py</span>  ──路由匹配──▶  <span style="color:var(--green)">api/handlers.py</span>
+                                       │
+                                       ▼
+                              <span style="color:var(--orange)">engine.py</span> (10 domains)
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    ▼                  ▼                  ▼
+            <span style="color:var(--pink)">perf_core.py</span>      <span style="color:var(--cyan)">llm.py</span>         <span style="color:var(--accent3)">analysis/</span>
+            (数据采集)        (LLM 调用)       (瓶颈分析)
+                    │
+        ┌───────────┼───────────┬──────────┐
+        ▼           ▼           ▼          ▼
+   <span style="color:var(--accent)">benchmark/</span>  <span style="color:var(--accent2)">harness/</span>  <span style="color:var(--orange)">profiling/</span>  <span style="color:var(--green)">discovery/</span></div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>典型 API 调用链示例</h3>
+        <div class="highlight"><p><strong>GPU 信息查询</strong><br><code>GET /api/gpu/info</code><br>→ handlers → engine.gpu.info()<br>→ PerfCore.get_gpu_info()</p></div>
+        <div class="highlight"><p><strong>运行基准测试</strong><br><code>POST /api/benchmark/run</code><br>→ handlers → engine.benchmark.run()<br>→ harness.run_benchmarks()</p></div>
+        <div class="highlight"><p><strong>AI 分析</strong><br><code>POST /api/ai/ask</code><br>→ handlers → engine.ai.ask()<br>→ llm.py → LLM Provider</p></div>
+        <div class="highlight"><p><strong>Profile 分析</strong><br><code>POST /api/profile/compare</code><br>→ handlers → engine.profile.compare()<br>→ profiling/ + analysis/</p></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 12: CLI Entry Points ==================== -->
+<div class="slide" data-idx="12">
+  <h2 class="full" style="margin-bottom:16px;">CLI 入口 & 命令组</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>📟 主命令: <code>aisp</code></h3>
+        <table>
+          <tr><th>命令组</th><th>说明</th></tr>
+          <tr><td><code>aisp bench</code></td><td>run / list / compare / audit / history</td></tr>
+          <tr><td><code>aisp demos</code></td><td>20+ 章节伴侣示例</td></tr>
+          <tr><td><code>aisp tools</code></td><td>15+ 非对比工具</td></tr>
+          <tr><td><code>aisp gpu</code></td><td>GPU 信息 & 拓扑</td></tr>
+          <tr><td><code>aisp profile</code></td><td>nsys / ncu / torch 分析</td></tr>
+          <tr><td><code>aisp analyze</code></td><td>瓶颈 / What-if / ROI</td></tr>
+          <tr><td><code>aisp optimize</code></td><td>推荐 / 策略 / Playbook</td></tr>
+          <tr><td><code>aisp export</code></td><td>CSV / PDF / HTML</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>🎯 demos/ (370 行)</h3>
+        <p><code>DemoSpec</code> 数据类: name, script, description, launch_mode</p>
+        <div class="pills" style="margin-top:8px;">
+          <span class="badge badge-purple">python</span>
+          <span class="badge badge-cyan">torchrun</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>🔧 tools/ (276 行)</h3>
+        <p><code>ToolSpec</code> 数据类</p>
+        <div class="pills" style="margin-top:8px;">
+          <span class="badge badge-green">kv-cache 计算器</span>
+          <span class="badge badge-orange">cost/token</span>
+          <span class="badge badge-pink">precision 对比</span>
+          <span class="badge badge-purple">CUTLASS 检测</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>📋 scripts/ (50+ 文件)</h3>
+        <ul>
+          <li>audit_verification_compliance</li>
+          <li>validate_benchmark_pairs</li>
+          <li>benchmark_coverage</li>
+          <li>generate_mcp_docs</li>
+          <li>CI / Linting / Setup 子目录</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 13: Key Metrics ==================== -->
+<div class="slide" data-idx="13">
+  <h2 class="full" style="margin-bottom:16px;">关键设计模式 & 数据</h2>
+  <div class="cols">
+    <div class="col">
+      <div class="card">
+        <h3>🏗️ 架构模式</h3>
+        <table>
+          <tr><th>模式</th><th>应用</th></tr>
+          <tr><td>单例门面</td><td>engine.py (get_engine)</td></tr>
+          <tr><td>懒加载</td><td>10 个 Domain 按需初始化</td></tr>
+          <tr><td>AST 验证</td><td>contract.py 无导入检查</td></tr>
+          <tr><td>装饰器注册</td><td>@export_benchmark</td></tr>
+          <tr><td>子进程隔离</td><td>isolated_runner.py</td></tr>
+          <tr><td>混合注入</td><td>VerificationPayloadMixin</td></tr>
+          <tr><td>能力注册</td><td>capabilities.py 插件发现</td></tr>
+          <tr><td>安全调用</td><td>_safe_call() 错误信封</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>📏 代码规模</h3>
+        <table>
+          <tr><th>模块</th><th>行数</th></tr>
+          <tr><td>run_benchmarks.py</td><td>12,289</td></tr>
+          <tr><td>benchmark_harness.py</td><td>5,963</td></tr>
+          <tr><td>engine.py</td><td>1,428</td></tr>
+          <tr><td>perf_core_base.py</td><td>2,797</td></tr>
+          <tr><td>profile_insights.py</td><td>2,391</td></tr>
+          <tr><td>validity_checks.py</td><td>2,407</td></tr>
+          <tr><td>verify_runner.py</td><td>1,918</td></tr>
+          <tr><td>verification.py</td><td>1,327</td></tr>
+          <tr><td>expectations.py</td><td>1,160</td></tr>
+          <tr><td>bench_commands.py</td><td>3,403</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h3>🎯 核心原则</h3>
+        <ul>
+          <li><strong>Fail-Fast</strong> — 无回退、无自动推断</li>
+          <li><strong>显式优于隐式</strong> — 标志 > 环境变量</li>
+          <li><strong>验证后计时</strong> — 后计时验证架构</li>
+          <li><strong>确定性种子</strong> — 默认 seed=42</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 14: Summary ==================== -->
+<div class="slide" data-idx="14">
+  <div class="center-text">
+    <h1>总结</h1>
+    <p class="subtitle">一个统一引擎，覆盖 AI 性能工程全生命周期</p>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-top:32px;max-width:900px;">
+      <div class="card" style="text-align:center;">
+        <div style="font-size:2rem;margin-bottom:8px;">🔬</div>
+        <h3>分析</h3>
+        <p>瓶颈诊断 · Kernel 指纹 · Roofline · LLM 驱动</p>
+      </div>
+      <div class="card" style="text-align:center;">
+        <div style="font-size:2rem;margin-bottom:8px;">⏱️</div>
+        <h3>基准</h3>
+        <p>95 项保护 · 三重验证 · 自动回归 · 期望追踪</p>
+      </div>
+      <div class="card" style="text-align:center;">
+        <div style="font-size:2rem;margin-bottom:8px;">🚀</div>
+        <h3>优化</h3>
+        <p>并行规划 · MCTS 搜索 · 自动调优 · Playbook</p>
+      </div>
+      <div class="card" style="text-align:center;">
+        <div style="font-size:2rem;margin-bottom:8px;">🌐</div>
+        <h3>部署</h3>
+        <p>CLI · MCP · Dashboard · API · 插件生态</p>
+      </div>
+    </div>
+    <p style="margin-top:40px;color:var(--muted);font-size:.95rem;">AI Performance Engineering Core — 让每一次优化都可测量、可验证、可复现</p>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<!-- Navigation dots -->
+<div class="nav" id="nav"></div>
+<div class="counter" id="counter"></div>
+
+<script>
+(function(){
+  const slides = document.querySelectorAll('.slide');
+  const nav = document.getElementById('nav');
+  const counter = document.getElementById('counter');
+  let cur = 0;
+
+  // Build dots
+  slides.forEach((_,i)=>{
+    const d = document.createElement('div');
+    d.className = 'dot' + (i===0?' active':'');
+    d.onclick = ()=>go(i);
+    nav.appendChild(d);
+  });
+
+  function go(n){
+    if(n<0||n>=slides.length) return;
+    slides[cur].classList.remove('active');
+    slides[cur].classList.add(n>cur?'prev':'');
+    setTimeout(()=>slides[cur===n?cur:cur].classList.remove('prev'),500);
+    cur = n;
+    slides[cur].classList.add('active');
+    nav.querySelectorAll('.dot').forEach((d,i)=>d.classList.toggle('active',i===cur));
+    counter.textContent = (cur+1)+' / '+slides.length;
+  }
+
+  document.addEventListener('keydown',e=>{
+    if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown') go(cur+1);
+    if(e.key==='ArrowLeft'||e.key==='PageUp') go(cur-1);
+    if(e.key==='Home') go(0);
+    if(e.key==='End') go(slides.length-1);
+  });
+
+  // Touch swipe
+  let tx=0;
+  document.addEventListener('touchstart',e=>{tx=e.touches[0].clientX;});
+  document.addEventListener('touchend',e=>{
+    const dx = e.changedTouches[0].clientX - tx;
+    if(Math.abs(dx)>50) go(cur + (dx<0?1:-1));
+  });
+
+  counter.textContent = '1 / '+slides.length;
+})();
+</script>
+</body>
+</html>

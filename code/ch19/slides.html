@@ -1,0 +1,1246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 19 - Dynamic & Adaptive Inference Precision/Memory Systems</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface2: #1a1a26;
+    --border: #2a2a3a;
+    --text: #e8e8f0;
+    --text-dim: #8888a0;
+    --accent: #6366f1;
+    --accent2: #8b5cf6;
+    --green: #22c55e;
+    --red: #ef4444;
+    --orange: #f59e0b;
+    --cyan: #06b6d4;
+    --pink: #ec4899;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    overflow: hidden;
+  }
+
+  .deck {
+    width: 100vw; height: 100vh;
+    position: relative;
+  }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    justify-content: center;
+    padding: 60px 80px;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+  }
+
+  .slide.active {
+    display: flex;
+    opacity: 1;
+  }
+
+  .slide::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse at 20% 50%, rgba(99,102,241,0.06) 0%, transparent 60%),
+                radial-gradient(ellipse at 80% 20%, rgba(139,92,246,0.04) 0%, transparent 50%);
+    pointer-events: none;
+  }
+
+  h1 {
+    font-size: 3.2rem;
+    font-weight: 800;
+    line-height: 1.1;
+    background: linear-gradient(135deg, var(--accent), var(--accent2), var(--pink));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 20px;
+  }
+
+  h2 {
+    font-size: 2.4rem;
+    font-weight: 700;
+    color: var(--text);
+    margin-bottom: 24px;
+    position: relative;
+  }
+
+  h2::after {
+    content: '';
+    display: block;
+    width: 60px;
+    height: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    margin-top: 12px;
+    border-radius: 2px;
+  }
+
+  h3 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    color: var(--accent);
+    margin-bottom: 12px;
+  }
+
+  p, li {
+    font-size: 1.15rem;
+    line-height: 1.7;
+    color: var(--text-dim);
+  }
+
+  .subtitle {
+    font-size: 1.4rem;
+    color: var(--text-dim);
+    font-weight: 400;
+    margin-bottom: 30px;
+  }
+
+  .tag {
+    display: inline-block;
+    padding: 4px 14px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin: 4px 4px 4px 0;
+  }
+  .tag-green { background: rgba(34,197,94,0.15); color: var(--green); }
+  .tag-red { background: rgba(239,68,68,0.15); color: var(--red); }
+  .tag-blue { background: rgba(99,102,241,0.15); color: var(--accent); }
+  .tag-orange { background: rgba(245,158,11,0.15); color: var(--orange); }
+  .tag-cyan { background: rgba(6,182,212,0.15); color: var(--cyan); }
+
+  code, pre {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  pre {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    font-size: 0.92rem;
+    line-height: 1.6;
+    overflow-x: auto;
+    margin: 12px 0;
+  }
+
+  code {
+    background: var(--surface2);
+    padding: 2px 8px;
+    border-radius: 6px;
+    font-size: 0.95em;
+    color: var(--cyan);
+  }
+
+  pre code {
+    background: none;
+    padding: 0;
+  }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 30px;
+    margin-top: 16px;
+  }
+
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 24px;
+    margin-top: 16px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 16px 16px 0 0;
+  }
+
+  .card h3 { margin-bottom: 10px; }
+
+  .metric {
+    font-size: 2.8rem;
+    font-weight: 800;
+    line-height: 1;
+    margin: 8px 0;
+  }
+  .metric-green { color: var(--green); }
+  .metric-orange { color: var(--orange); }
+  .metric-cyan { color: var(--cyan); }
+  .metric-pink { color: var(--pink); }
+
+  .metric-label {
+    font-size: 0.9rem;
+    color: var(--text-dim);
+    font-weight: 500;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 1rem;
+  }
+
+  th {
+    text-align: left;
+    padding: 12px 16px;
+    background: var(--surface2);
+    color: var(--accent);
+    font-weight: 600;
+    border-bottom: 2px solid var(--border);
+  }
+
+  td {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+
+  tr:hover td { background: rgba(99,102,241,0.04); }
+
+  .file-tree {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.88rem;
+    line-height: 1.8;
+    color: var(--text-dim);
+  }
+
+  .file-tree .dir { color: var(--accent); font-weight: 600; }
+  .file-tree .file { color: var(--text-dim); }
+  .file-tree .cu { color: var(--orange); }
+  .file-tree .py { color: var(--green); }
+  .file-tree .highlight { color: var(--pink); font-weight: 600; }
+
+  .flow {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 16px 0;
+    flex-wrap: wrap;
+  }
+
+  .flow-step {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 22px;
+    font-size: 0.95rem;
+    font-weight: 500;
+    color: var(--text);
+    text-align: center;
+    min-width: 120px;
+  }
+
+  .flow-arrow {
+    color: var(--accent);
+    font-size: 1.4rem;
+    font-weight: 700;
+  }
+
+  .vs-badge {
+    display: inline-block;
+    padding: 6px 16px;
+    border-radius: 8px;
+    font-weight: 700;
+    font-size: 0.85rem;
+    margin-bottom: 12px;
+  }
+  .vs-baseline { background: rgba(239,68,68,0.2); color: var(--red); }
+  .vs-optimized { background: rgba(34,197,94,0.2); color: var(--green); }
+
+  ul { list-style: none; padding-left: 0; }
+  ul li::before {
+    content: '▸';
+    color: var(--accent);
+    margin-right: 10px;
+    font-weight: 700;
+  }
+
+  .progress-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width 0.3s ease;
+    z-index: 100;
+  }
+
+  .slide-counter {
+    position: fixed;
+    bottom: 20px;
+    right: 30px;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    font-weight: 500;
+    z-index: 100;
+  }
+
+  .key-combo {
+    position: fixed;
+    bottom: 20px;
+    left: 30px;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    opacity: 0.5;
+    z-index: 100;
+  }
+
+  .icon {
+    font-size: 2rem;
+    margin-bottom: 12px;
+    display: block;
+  }
+
+  .comparison-header {
+    display: flex;
+    gap: 40px;
+    margin-bottom: 20px;
+  }
+
+  .comparison-header > div { flex: 1; }
+
+  .speedup-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 20px;
+    border-radius: 12px;
+    font-size: 1.1rem;
+    font-weight: 700;
+    background: rgba(34,197,94,0.12);
+    color: var(--green);
+    border: 1px solid rgba(34,197,94,0.3);
+  }
+
+  .bar-chart {
+    display: flex;
+    align-items: flex-end;
+    gap: 24px;
+    height: 200px;
+    margin: 20px 0;
+    padding: 0 20px;
+  }
+
+  .bar-group {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+  }
+
+  .bar {
+    width: 60px;
+    border-radius: 8px 8px 0 0;
+    position: relative;
+    min-height: 10px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 8px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: white;
+  }
+
+  .bar-baseline {
+    background: linear-gradient(180deg, var(--red), #b91c1c);
+  }
+  .bar-optimized {
+    background: linear-gradient(180deg, var(--green), #15803d);
+  }
+
+  .bar-label {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    text-align: center;
+    font-weight: 500;
+  }
+
+  .two-col-code {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+
+  .two-col-code pre {
+    margin: 0;
+    font-size: 0.82rem;
+  }
+
+  .note-box {
+    background: rgba(99,102,241,0.08);
+    border-left: 4px solid var(--accent);
+    border-radius: 0 12px 12px 0;
+    padding: 16px 20px;
+    margin: 16px 0;
+    font-size: 1rem;
+    color: var(--text-dim);
+  }
+
+  .warn-box {
+    background: rgba(245,158,11,0.08);
+    border-left: 4px solid var(--orange);
+    border-radius: 0 12px 12px 0;
+    padding: 16px 20px;
+    margin: 16px 0;
+    font-size: 1rem;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+<!-- ==================== Slide 1: Title ==================== -->
+<div class="slide active" id="s1">
+  <div>
+    <p style="font-size:1rem; color:var(--accent); font-weight:600; letter-spacing:2px; margin-bottom:16px;">CHAPTER 19</p>
+    <h1>Dynamic &amp; Adaptive Inference<br>Precision / Memory Systems</h1>
+    <p class="subtitle">动态精度 · 量化缓存 · 双缓冲 · 自适应分配器 · MoE 低精度路径</p>
+    <div style="margin-top:30px;">
+      <span class="tag tag-blue">FP4 / FP6 / FP8</span>
+      <span class="tag tag-green">KV Cache Quantization</span>
+      <span class="tag tag-orange">Memory Double Buffering</span>
+      <span class="tag tag-cyan">MXFP8 MoE</span>
+      <span class="tag tag-red">Adaptive Parallelism</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== Slide 2: Problem Statement ==================== -->
+<div class="slide" id="s2">
+  <h2>核心问题</h2>
+  <p class="subtitle" style="margin-bottom:30px;">低精度不仅仅是 dtype 选择 — 它是一个系统级决策</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3>🎯 关键问题</h3>
+      <p style="font-size:1.05rem; line-height:1.8;">
+        "哪些运行时精度和内存管理变更，能在真实工作负载上带来足够大的收益，以证明所增加的复杂度是值得的？"
+      </p>
+    </div>
+    <div class="card">
+      <h3>📐 设计原则</h3>
+      <ul>
+        <li>某些收益来自 <strong style="color:var(--green)">计算成本降低</strong></li>
+        <li>某些收益来自 <strong style="color:var(--cyan)">内存带宽节省</strong></li>
+        <li>某些收益来自 <strong style="color:var(--orange)">重叠/流水线行为</strong></li>
+        <li>所有收益必须通过 <strong style="color:var(--pink)">同一 harness 验证</strong></li>
+      </ul>
+    </div>
+  </div>
+  <div class="note-box" style="margin-top:24px;">
+    💡 低精度应被理解为一个 <strong>systems decision</strong>，而非单纯的 dtype 选择。部分收益来自计算减少，部分来自内存流量降低或更好的重叠行为。
+  </div>
+</div>
+
+<!-- ==================== Slide 3: Architecture Overview ==================== -->
+<div class="slide" id="s3">
+  <h2>架构总览</h2>
+  <div class="flow" style="margin:20px 0 30px;">
+    <div class="flow-step" style="border-color:var(--red);">Baseline Path<br><span style="font-size:0.8rem;color:var(--text-dim)">高开销 · 简单分配</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--accent);">Precision Switch<br><span style="font-size:0.8rem;color:var(--text-dim)">FP4/FP6/FP8 动态</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--orange);">Memory Overlap<br><span style="font-size:0.8rem;color:var(--text-dim)">双缓冲 · 预取</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--green);">Optimized Path<br><span style="font-size:0.8rem;color:var(--text-dim)">量化缓存 · 适配器</span></div>
+  </div>
+  <div class="grid-3">
+    <div class="card">
+      <h3 style="color:var(--red)">Baseline</h3>
+      <ul>
+        <li>高成本缓存/精度/内存路径</li>
+        <li>简单分配器和缓冲行为</li>
+        <li>更清晰的参考实现</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--accent)">Transition</h3>
+      <ul>
+        <li>置信度驱动的精度切换</li>
+        <li>自适应位宽量化</li>
+        <li>异步预取管线</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--green)">Optimized</h3>
+      <ul>
+        <li>量化缓存 + 低精度推理</li>
+        <li>显式缓冲改进</li>
+        <li>自适应分配器/重叠逻辑</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== Slide 4: Benchmark Results ==================== -->
+<div class="slide" id="s4">
+  <h2>实测性能对比</h2>
+  <p class="subtitle">三大关键 benchmark 的 baseline vs optimized 实测结果</p>
+  <div class="grid-3" style="margin-top:20px;">
+    <div class="card" style="text-align:center;">
+      <span class="icon">📦</span>
+      <h3>Dynamic Quantized Cache</h3>
+      <div class="metric metric-green">1.13×</div>
+      <p class="metric-label">1.710ms → 1.517ms</p>
+      <p style="font-size:0.85rem; margin-top:8px;">自适应位宽量化刷新<br>GPU 峰值内存 404→269 MB</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <span class="icon">🔄</span>
+      <h3>Memory Double Buffering</h3>
+      <div class="metric metric-orange">1.97×</div>
+      <p class="metric-label">5.536ms → 2.809ms</p>
+      <p style="font-size:0.85rem; margin-top:8px;">双缓冲内存路径<br>H2D + 计算重叠</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <span class="icon">⚡</span>
+      <h3>MXFP8 MoE</h3>
+      <div class="metric metric-cyan">7.71×</div>
+      <p class="metric-label">16.037ms → 2.080ms</p>
+      <p style="font-size:0.85rem; margin-top:8px;">低精度 MoE 路径<br>显著改善执行行为</p>
+    </div>
+  </div>
+  <div class="note-box" style="margin-top:24px;">
+    ⚠️ <code>dynamic_quantized_cache</code> 使用 2026-03-17 引入的公平稳态全量刷新模型。优化路径 GPU 峰值内存从 ~765 MB 降至 ~269 MB，低于 baseline 的 ~404 MB。
+  </div>
+</div>
+
+<!-- ==================== Slide 5: Directory Layout ==================== -->
+<div class="slide" id="s5">
+  <h2>目录结构</h2>
+  <div class="grid-2">
+    <div>
+      <h3>🔧 训练与量化</h3>
+      <div class="file-tree">
+        <span class="py">baseline_nvfp4_training.py</span><br>
+        <span class="py">optimized_nvfp4_training.py</span><br>
+        <span class="py">native_fp4_quantization.py</span><br>
+        <span class="py">native_fp6_quantization.py</span><br>
+        <span class="py">native_fp8_training.py</span>
+      </div>
+      <h3 style="margin-top:20px;">💾 内存管理</h3>
+      <div class="file-tree">
+        <span class="py">baseline_memory_double_buffering.py</span><br>
+        <span class="py">optimized_memory_double_buffering.py</span><br>
+        <span class="py">memory_allocator_with_monitoring.py</span><br>
+        <span class="py">dynamic_memory_allocator.py</span><br>
+        <span class="py">_allocator_worker.py</span>
+      </div>
+    </div>
+    <div>
+      <h3>⚡ CUDA 内核</h3>
+      <div class="file-tree">
+        <span class="cu">baseline_fp4_hardware_kernel.cu</span><br>
+        <span class="cu">optimized_fp4_hardware_kernel.cu</span><br>
+        <span class="cu">fp8_hardware_kernel.cu</span><br>
+        <span class="cu">baseline_kv_prefetch_overlap.cu</span><br>
+        <span class="cu">optimized_kv_prefetch_overlap.cu</span>
+      </div>
+      <h3 style="margin-top:20px;">🧩 动态精度 &amp; 缓存</h3>
+      <div class="file-tree">
+        <span class="py">baseline_dynamic_precision.py</span><br>
+        <span class="py">optimized_dynamic_precision.py</span><br>
+        <span class="py">baseline_dynamic_quantized_cache.py</span><br>
+        <span class="py">optimized_dynamic_quantized_cache.py</span><br>
+        <span class="py">baseline_mxfp8_moe.py</span><br>
+        <span class="py">optimized_mxfp8_moe.py</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== Slide 6: FP4 Hardware Kernel ==================== -->
+<div class="slide" id="s6">
+  <h2>FP4 硬件内核：手动 GEMM vs cuBLASLt</h2>
+  <div class="comparison-header">
+    <div>
+      <span class="vs-badge vs-baseline">BASELINE</span>
+      <h3 style="color:var(--red)">手动 NVFP4 GEMM</h3>
+      <ul>
+        <li>逐元素解包 FP4 → FP32</li>
+        <li>标量累加 <code>sum += a * b</code></li>
+        <li>朴素 16×16 线程块</li>
+        <li>无 Tensor Core 利用</li>
+      </ul>
+    </div>
+    <div>
+      <span class="vs-badge vs-optimized">OPTIMIZED</span>
+      <h3 style="color:var(--green)">cuBLASLt NVFP4 Tensor Core</h3>
+      <ul>
+        <li>原生 NVFP4 (E2M1) 硬件支持</li>
+        <li>Block-scaled FP8 量化因子</li>
+        <li>Tensor Core 矩阵乘法</li>
+        <li>cuBLASLt 自动调优</li>
+      </ul>
+    </div>
+  </div>
+  <pre><code>// Baseline: 逐元素 FP4 解包 + FP32 标量累加
+<span style="color:var(--red)">for (int k = 0; k &lt; K; ++k) {
+    __nv_fp4_storage_t a_raw = ...;  // 解包低4位/高4位
+    float a_val = fp4_to_float(a_raw) * a_scale;
+    float b_val = fp4_to_float(b_raw) * b_scale;
+    sum += a_val * b_val;            // 标量 FMA
+}</span>
+
+// Optimized: cuBLASLt NVFP4 Tensor Core GEMM
+<span style="color:var(--green)">cublasLtMatmul(..., CUBLAS_COMPUTE_16F, ...);
+// 硬件直接处理 NVFP4 block-scaled 矩阵乘</span></code></pre>
+</div>
+
+<!-- ==================== Slide 7: FP4 Quantization Pipeline ==================== -->
+<div class="slide" id="s7">
+  <h2>NVFP4 量化管线</h2>
+  <div class="flow" style="margin:24px 0;">
+    <div class="flow-step">FP32 输入</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--orange)">Block Scale<br><span style="font-size:0.75rem">max_abs / 6.0</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--accent)">FP4 E2M1 量化<br><span style="font-size:0.75rem">2值/byte</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--cyan)">FP8 E4M3 Scale<br><span style="font-size:0.75rem">block_size=16</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--green)">Tensor Core GEMM</div>
+  </div>
+  <pre><code><span style="color:var(--text-dim)">// 每个 block (16 元素) 一个 scale</span>
+<span style="color:var(--orange)">float max_abs = 0.0f;
+for (int i = 0; i &lt; FP4_BLOCK_SIZE; ++i)
+    max_abs = max(max_abs, abs(input[r * cols + block_start + i]));
+float scale = (max_abs > 0) ? (max_abs / 6.0f) : 1.0f;
+scales[r * num_scale_cols + block] = __nv_fp8_e4m3(scale);</span>
+
+<span style="color:var(--text-dim)">// 打包：每 byte 存储 2 个 FP4 值</span>
+<span style="color:var(--accent)">__nv_fp4_storage_t fp4_0 = __nv_cvt_float_to_fp4(v0 / scale, __NV_E2M1, cudaRoundNearest);
+__nv_fp4_storage_t fp4_1 = __nv_cvt_float_to_fp4(v1 / scale, __NV_E2M1, cudaRoundNearest);
+output_packed[idx] = ((fp4_1 & 0x0F) &lt;&lt; 4) | (fp4_0 & 0x0F);</span></code></pre>
+  <div class="note-box">
+    💡 NVFP4 使用 E2M1 格式（1位符号 + 2位指数 + 1位尾数），配合 FP8 E4M3 的 block scale，实现 4-bit 量化的同时保持足够的动态范围。
+  </div>
+</div>
+
+<!-- ==================== Slide 8: Dynamic Quantized Cache ==================== -->
+<div class="slide" id="s8">
+  <h2>动态量化 KV 缓存</h2>
+  <p class="subtitle">自适应位宽 (8/6/4-bit) 缓存刷新 vs 全精度 FP32 刷新</p>
+  <div class="grid-2">
+    <div>
+      <span class="vs-badge vs-baseline">BASELINE: FP32</span>
+      <pre><code><span style="color:var(--red)">def _non_adaptive_cache_update(self):
+    # 每步全量 FP32 刷新 — 最大化内存流量
+    self._fp32_active.copy_(self._reference_cache)
+    self.output = self._fp32_active</span></code></pre>
+      <p style="font-size:0.95rem; margin-top:8px;">每次迭代完整复制 64×1024×512 的 FP32 缓存<br>内存带宽: <strong style="color:var(--red)">32 bits × 全量</strong></p>
+    </div>
+    <div>
+      <span class="vs-badge vs-optimized">OPTIMIZED: 自适应位宽</span>
+      <pre><code><span style="color:var(--green)">def _adaptive_cache_update(self, bits):
+    if bits == 8:
+        self._packed.copy_(self._int8_src)
+    elif bits == 6:
+        self._packed[..., :6].copy_(self._int6_src)
+    elif bits == 4:
+        self._packed[..., :4].copy_(self._int4_src)</span></code></pre>
+      <p style="font-size:0.95rem; margin-top:8px;">按调度表动态切换 8/6/4-bit<br>内存带宽: <strong style="color:var(--green)">4~8 bits × 全量</strong></p>
+    </div>
+  </div>
+  <div class="grid-3" style="margin-top:20px;">
+    <div class="card" style="text-align:center;">
+      <div class="metric" style="font-size:1.8rem; color:var(--accent);">INT8</div>
+      <p class="metric-label">127 范围 · 1:1 逐行 scale</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="metric" style="font-size:1.8rem; color:var(--orange);">INT6</div>
+      <p class="metric-label">31 范围 · 4值→3字节打包</p>
+    </div>
+    <div class="card" style="text-align:center;">
+      <div class="metric" style="font-size:1.8rem; color:var(--pink);">INT4</div>
+      <p class="metric-label">7 范围 · 2值→1字节打包</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== Slide 9: INT4/INT6 Packing ==================== -->
+<div class="slide" id="s9">
+  <h2>INT4 / INT6 打包算法</h2>
+  <div class="two-col-code">
+    <div>
+      <h3 style="color:var(--pink);">INT4 打包 — 2 值/byte</h3>
+      <pre><code><span style="color:var(--pink)">def _pack_int4(values, out):
+    """[-8, 7] → uint8, 每byte存2个值"""
+    unsigned = (values & 0x0F).to(torch.uint8)
+    pairs = unsigned.view(-1, 2)
+    out.copy_((pairs[...,0] << 4) | pairs[...,1])
+
+def _unpack_int4_to_float(packed, scale, out):
+    high = packed >> 4          # 低4位
+    low  = packed & 0x0F        # 高4位
+    # 减去偏移 → 乘以 scale → 还原浮点</span></code></pre>
+      <p style="font-size:0.85rem; color:var(--text-dim); margin-top:8px;">
+        存储开销: 512 dim → 256 bytes + 4 bytes scale<br>
+        压缩比: <strong>8×</strong> vs FP32
+      </p>
+    </div>
+    <div>
+      <h3 style="color:var(--orange);">INT6 打包 — 4 值→3 bytes</h3>
+      <pre><code><span style="color:var(--orange)">def _pack_int6(values, out):
+    """[-32, 31] → 3 bytes per 4 values"""
+    unsigned = (values + 32).to(torch.uint8)
+    groups = unsigned.view(-1, 4)
+    # 4×6bit = 24bit = 3×8bit
+    out[...,0] = g[0] | ((g[1]&0x03)<<6)
+    out[...,1] = ((g[1]>>2)&0x0F)|((g[2]&0x0F)<<4)
+    out[...,2] = ((g[2]>>4)&0x03) | (g[3]<<2)</span></code></pre>
+      <p style="font-size:0.85rem; color:var(--text-dim); margin-top:8px;">
+        存储开销: 512 dim → 384 bytes + 4 bytes scale<br>
+        压缩比: <strong>~5.3×</strong> vs FP32
+      </p>
+    </div>
+  </div>
+  <div class="warn-box" style="margin-top:16px;">
+    ⚠️ 打包/解包使用 bit 操作在 GPU 上执行，确保量化因子 (scale) 保持 FP32 精度以避免精度漂移。
+  </div>
+</div>
+
+<!-- ==================== Slide 10: Memory Double Buffering ==================== -->
+<div class="slide" id="s10">
+  <h2>内存双缓冲</h2>
+  <p class="subtitle">H2D 拷贝与 GPU 计算的重叠 — 1.97× 加速</p>
+  <div class="grid-2">
+    <div>
+      <span class="vs-badge vs-baseline">BASELINE: 单流</span>
+      <pre><code><span style="color:var(--red)">for host_batch in self.host_batches:
+    # ❶ 同步拷贝（阻塞等待）
+    self.buffer.copy_(host_batch, non_blocking=False)
+    # ❷ 计算（等拷贝完成后才开始）
+    with torch.cuda.stream(self.stream):
+        self.output = self.model(self.buffer)
+    # ❸ 同步等待
+    current_stream.wait_stream(self.stream)</span></code></pre>
+      <p style="font-size:0.85rem; color:var(--text-dim);">
+        每步: <strong>H2D → Compute → Sync</strong>（串行）
+      </p>
+    </div>
+    <div>
+      <span class="vs-badge vs-optimized">OPTIMIZED: 双缓冲</span>
+      <pre><code><span style="color:var(--green)">for i, host_batch in enumerate(self.host_batches):
+    buf = self.buffers[i % 2]  # 交替缓冲
+    # ❶ 异步拷贝到非活跃缓冲
+    buf.copy_(host_batch, non_blocking=True)
+    with torch.cuda.stream(self.stream):
+        # ❷ 同时在另一个缓冲上计算
+        self.output = self.model(self.buffers[(i+1)%2])
+    current_stream.wait_stream(self.stream)</span></code></pre>
+      <p style="font-size:0.85rem; color:var(--text-dim);">
+        每步: <strong>H2D[i] ⊕ Compute[i-1]</strong>（重叠）
+      </p>
+    </div>
+  </div>
+  <div class="flow" style="margin-top:24px; justify-content:center;">
+    <div class="flow-step" style="background:rgba(239,68,68,0.1); border-color:var(--red);">Buffer A<br>拷贝</div>
+    <div class="flow-arrow">⇉</div>
+    <div class="flow-step" style="background:rgba(34,197,94,0.1); border-color:var(--green);">Buffer B<br>计算</div>
+    <div class="flow-arrow">⇉</div>
+    <div class="flow-step" style="background:rgba(239,68,68,0.1); border-color:var(--red);">Buffer B<br>拷贝</div>
+    <div class="flow-arrow">⇉</div>
+    <div class="flow-step" style="background:rgba(34,197,94,0.1); border-color:var(--green);">Buffer A<br>计算</div>
+  </div>
+</div>
+
+<!-- ==================== Slide 11: KV Prefetch Overlap (CUDA) ==================== -->
+<div class="slide" id="s11">
+  <h2>KV Prefetch 重叠 (CUDA)</h2>
+  <p class="subtitle">量化 KV 预取与计算的流式重叠 — <code>cp.async</code> 管线</p>
+  <div class="comparison-header">
+    <div>
+      <span class="vs-badge vs-baseline">BASELINE</span>
+      <pre><code><span style="color:var(--red)">for (int it = 0; it &lt; iterations; ++it) {
+    // 同步 H2D — 阻塞
+    cudaMemcpy(d_slot, src, KV_BYTES,
+               cudaMemcpyHostToDevice);
+    // 计算
+    forward_kernel<<<...>>>(d_slot, elems);
+    // 同步 D2H — 阻塞
+    cudaMemcpy(dst, d_slot, KV_BYTES,
+               cudaMemcpyDeviceToHost);
+}</span></code></pre>
+    </div>
+    <div>
+      <span class="vs-badge vs-optimized">OPTIMIZED</span>
+      <pre><code><span style="color:var(--green)">for (int it = 0; it &lt; iterations; ++it) {
+    // 异步 H2D 到下一个 slot
+    cudaMemcpyAsync(d_slots[next], src,
+        KV_BYTES, cudaMemcpyHostToDevice,
+        h2d_stream);
+    // 在当前 slot 上并行计算
+    forward_kernel<<<..., compute_stream>>>(
+        d_slots[cur], elems);
+    // 异步 D2H
+    cudaMemcpyAsync(dst, d_slots[cur],
+        KV_BYTES, cudaMemcpyDeviceToHost,
+        d2h_stream);
+}</span></code></pre>
+    </div>
+  </div>
+  <div class="note-box">
+    💡 使用多个 device slot + 独立 CUDA stream 实现 H2D / Compute / D2H 三路流水线。在 SM121 (Grace Blackwell) 上编译验证。
+  </div>
+</div>
+
+<!-- ==================== Slide 12: MXFP8 MoE ==================== -->
+<div class="slide" id="s12">
+  <h2>MXFP8 MoE — 7.71× 加速</h2>
+  <p class="subtitle">Microscaling FP8 (MXFP8) 专家混合路由</p>
+  <div class="grid-2">
+    <div>
+      <span class="vs-badge vs-baseline">BASELINE: 朴素 Python 量化</span>
+      <pre><code><span style="color:var(--red)">class _NaiveMXFP8Matmul:
+    def __call__(self, expert_input, idx):
+        # 每次调用重新量化
+        q_act, s = block_quantize_mxfp8(input)
+        q_wt, s = block_quantize_mxfp8(weight)
+        # 解量化后做 FP16 矩阵乘
+        act = block_dequantize_mxfp8(q_act, ...)
+        wt  = block_dequantize_mxfp8(q_wt, ...)
+        return act @ wt.T  # FP16 GEMM</span></code></pre>
+    </div>
+    <div>
+      <span class="vs-badge vs-optimized">OPTIMIZED: 融合路径</span>
+      <pre><code><span style="color:var(--green)"># 预量化权重 + 融合 GEMM
+# MXFP8 block size = 32
+# [E, N, K] 权重矩阵预量化
+# Expert bucket 路由:
+#   1. balanced_assignments()
+#   2. bucket_by_expert()
+#   3. 融合 MXFP8 GEMM per expert
+#   4. restore_bucketed()</span></code></pre>
+      <h3 style="margin-top:16px;">MoE 路由流程</h3>
+      <div class="flow">
+        <div class="flow-step" style="padding:8px 14px;">Token<br>路由</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step" style="padding:8px 14px;">Expert<br>分桶</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step" style="padding:8px 14px;">MXFP8<br>GEMM</div>
+        <div class="flow-arrow">→</div>
+        <div class="flow-step" style="padding:8px 14px;">结果<br>还原</div>
+      </div>
+    </div>
+  </div>
+  <div class="grid-3" style="margin-top:16px;">
+    <div class="card" style="text-align:center; padding:16px;">
+      <div class="metric" style="font-size:1.6rem; color:var(--accent);">4096</div>
+      <p class="metric-label">Tokens / iteration</p>
+    </div>
+    <div class="card" style="text-align:center; padding:16px;">
+      <div class="metric" style="font-size:1.6rem; color:var(--orange);">8</div>
+      <p class="metric-label">Experts</p>
+    </div>
+    <div class="card" style="text-align:center; padding:16px;">
+      <div class="metric" style="font-size:1.6rem; color:var(--pink);">14336</div>
+      <p class="metric-label">FFN Dim</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== Slide 13: Dynamic Precision Switching ==================== -->
+<div class="slide" id="s13">
+  <h2>动态精度切换</h2>
+  <p class="subtitle">置信度驱动的 decode 精度模式切换</p>
+  <div class="flow" style="margin:24px 0;">
+    <div class="flow-step" style="border-color:var(--green);">BF16<br>高置信度</div>
+    <div class="flow-arrow">⇄</div>
+    <div class="flow-step" style="border-color:var(--orange);">FP8<br>中置信度</div>
+    <div class="flow-arrow">⇄</div>
+    <div class="flow-step" style="border-color:var(--red);">FP4<br>低精度模式</div>
+  </div>
+  <div class="grid-2">
+    <div class="card">
+      <h3>🎯 精度策略</h3>
+      <ul>
+        <li>同一 prompt 流上的 token 等价验证</li>
+        <li>置信度阈值驱动精度升降</li>
+        <li>避免输出漂移的安全边界</li>
+        <li>decode 阶段动态切换模式</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>📊 精度-性能权衡</h3>
+      <table>
+        <tr><th>模式</th><th>精度</th><th>速度</th><th>场景</th></tr>
+        <tr><td>BF16</td><td>最高</td><td>最慢</td><td>关键 token</td></tr>
+        <tr><td>FP8</td><td>高</td><td>快</td><td>常规 decode</td></tr>
+        <tr><td>FP4</td><td>可接受</td><td>最快</td><td>大批量推理</td></tr>
+      </table>
+    </div>
+  </div>
+  <pre><code><span style="color:var(--accent)"># token_precision_switching.py — 按 token 置信度切换精度
+confidence = compute_confidence(logits)
+if confidence > threshold_high:
+    precision = "bf16"   # 高置信度 → 保持高精度
+elif confidence > threshold_low:
+    precision = "fp8"    # 中等 → 适度量化
+else:
+    precision = "fp4"    # 低置信度 → 最大量化（批处理友好）</span></code></pre>
+</div>
+
+<!-- ==================== Slide 14: Adaptive Parallelism ==================== -->
+<div class="slide" id="s14">
+  <h2>自适应并行策略</h2>
+  <p class="subtitle">Tensor / Pipeline / Hybrid / Data 并行的动态选择</p>
+  <div class="grid-2">
+    <div class="card">
+      <h3>🔀 并行策略路由</h3>
+      <pre><code><span style="color:var(--accent)">class AdaptiveParallelismStrategy:
+    def select(self, request):
+        # 基于请求特征选择策略
+        if request.seq_len > threshold:
+            return "pipeline"   # 长序列
+        elif request.batch > threshold:
+            return "data"       # 大批量
+        elif request.model_size > threshold:
+            return "tensor"     # 大模型
+        else:
+            return "hybrid"     # 混合</span></code></pre>
+    </div>
+    <div class="card">
+      <h3>🏊 Worker Pool 管理</h3>
+      <pre><code><span style="color:var(--green)">class AdaptiveParallelismWorkerPool:
+    def __init__(self, num_workers):
+        self.pools = {
+            "tensor": TensorPool(num_workers),
+            "pipeline": PipelinePool(num_workers),
+            "hybrid": HybridPool(num_workers),
+            "data": DataPool(num_workers),
+        }
+
+    def dispatch(self, request):
+        strategy = self.strategy.select(request)
+        return self.pools[strategy].submit(request)</span></code></pre>
+    </div>
+  </div>
+  <div class="note-box" style="margin-top:16px;">
+    💡 在同一合成请求流上，baseline Python 路由循环与优化的向量化路由路径保持输出等价。<code>ch19:adaptive_parallelism</code> benchmark 验证这一等价性。
+  </div>
+</div>
+
+<!-- ==================== Slide 15: Architecture Config ==================== -->
+<div class="slide" id="s15">
+  <h2>架构配置 &amp; Blackwell 默认值</h2>
+  <pre><code><span style="color:var(--text-dim)"># arch_config.py — Blackwell 默认配置</span>
+
+<span style="color:var(--green)">PREFER_BFLOAT16</span>: bool = True        <span style="color:var(--text-dim)"># BF16 优先于 FP16</span>
+<span style="color:var(--green)">USE_TE_FP8</span>: bool = True             <span style="color:var(--text-dim)"># Transformer Engine FP8</span>
+<span style="color:var(--green)">USE_TE_FP4</span>: bool = True             <span style="color:var(--text-dim)"># Transformer Engine NVFP4</span>
+
+<span style="color:var(--accent)">TORCH_COMPILE_KW</span> = {
+    <span style="color:var(--orange)">"mode"</span>: <span style="color:var(--pink)">"reduce-overhead"</span>,     <span style="color:var(--text-dim)"># 稳态 decode 图优化</span>
+    <span style="color:var(--orange)">"fullgraph"</span>: True,
+    <span style="color:var(--orange)">"dynamic"</span>: False,
+}
+
+<span style="color:var(--text-dim)"># TF32 启用（用于 FP32 回退路径的 matmul 启发式）</span>
+<span style="color:var(--cyan)">enable_tf32</span>()
+
+<span style="color:var(--text-dim)"># 流式分配器是 Blackwell 上的默认最佳实践</span>
+os.environ.setdefault(<span style="color:var(--orange)">"PYTORCH_ALLOC_CONF"</span>, <span style="color:var(--pink)">"backend:cudaMallocAsync"</span>)</code></pre>
+  <div class="grid-2" style="margin-top:20px;">
+    <div class="card">
+      <h3>🏗️ 支持的 GPU 架构</h3>
+      <table>
+        <tr><th>Target</th><th>架构</th><th>说明</th></tr>
+        <tr><td><code>b200</code></td><td>sm_100</td><td>Blackwell B200</td></tr>
+        <tr><td><code>gb10</code></td><td>sm_121</td><td>Grace Blackwell</td></tr>
+        <tr><td><code>b300</code></td><td>sm_103</td><td>Blackwell B300</td></tr>
+        <tr><td><code>gb300</code></td><td>sm_103</td><td>Grace Blackwell B300</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>⚙️ Harness 配置</h3>
+      <ul>
+        <li>迭代次数: <code>10-20</code> (FP8/FP4 路径较慢)</li>
+        <li>预热: <code>5</code> 轮</li>
+        <li>默认 <code>strict</code> 验证模式</li>
+        <li>虚拟化环境: <code>--validity-profile portable</code></li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== Slide 16: Allocator & Monitoring ==================== -->
+<div class="slide" id="s16">
+  <h2>内存分配器 &amp; 监控</h2>
+  <div class="grid-2">
+    <div class="card">
+      <h3>📊 带监控的内存分配器</h3>
+      <pre><code><span style="color:var(--accent)">class MemoryAllocatorWithMonitoring:
+    def allocate(self, size):
+        ptr = self.backend.alloc(size)
+        self.track(ptr, size)  # 追踪
+        self.check_fragmentation()
+        return ptr
+
+    def check_fragmentation(self):
+        frag = self.compute_fragmentation()
+        if frag > threshold:
+            self.defragment()  # 碎片整理</span></code></pre>
+    </div>
+    <div class="card">
+      <h3>🔄 动态内存分配器</h3>
+      <pre><code><span style="color:var(--green)">class DynamicMemoryAllocator:
+    """自适应内存池管理"""
+    def __init__(self, pool_size):
+        self.pool = CUDAMallocAsync(pool_size)
+        self.worker = AllocatorWorker()
+
+    def rebalance(self, workload):
+        # 基于工作负载动态调整
+        new_size = self.predict(workload)
+        self.pool.resize(new_size)</span></code></pre>
+    </div>
+  </div>
+  <div class="grid-3" style="margin-top:16px;">
+    <div class="card" style="text-align:center; padding:16px;">
+      <span class="icon">🔍</span>
+      <h3>碎片检测</h3>
+      <p style="font-size:0.9rem;">实时追踪分配/释放模式</p>
+    </div>
+    <div class="card" style="text-align:center; padding:16px;">
+      <span class="icon">📈</span>
+      <h3>峰值追踪</h3>
+      <p style="font-size:0.9rem;">GPU 显存峰值监控</p>
+    </div>
+    <div class="card" style="text-align:center; padding:16px;">
+      <span class="icon">⚡</span>
+      <h3>Worker Pool</h3>
+      <p style="font-size:0.9rem;">后台异步重平衡</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== Slide 17: FP8 Training ==================== -->
+<div class="slide" id="s17">
+  <h2>FP8 训练 &amp; NVFP4 训练</h2>
+  <p class="subtitle">BF16 参考 vs NVFP4/Transformer Engine 路径</p>
+  <div class="grid-2">
+    <div>
+      <span class="vs-badge vs-baseline">BASELINE: BF16 训练</span>
+      <pre><code><span style="color:var(--red)">class _BF16Trainer(nn.Module):
+    def __init__(self, hidden_dim, ffn_dim, layers):
+        # LayerNorm → Linear → GELU → Linear
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+# 训练循环
+with torch.autocast("cuda", dtype=torch.bfloat16):
+    out = model(inp)
+    loss = F.mse_loss(out, target)
+loss.backward()
+optimizer.step()</span></code></pre>
+    </div>
+    <div>
+      <span class="vs-badge vs-optimized">OPTIMIZED: NVFP4 训练</span>
+      <pre><code><span style="color:var(--green)"># Transformer Engine NVFP4 路径
+# - 前向: NVFP4 权重 + BF16 激活
+# - 反向: BF16 梯度
+# - 优化器: FP32 主权重
+
+# 模型规模 (用于性能测试)
+hidden_dim      = 4096
+intermediate_dim = 16384  # 4×
+num_layers      = 8
+batch_size      = 32
+seq_len         = 1024
+micro_batches   = 4</span></code></pre>
+    </div>
+  </div>
+  <div class="note-box" style="margin-top:16px;">
+    💡 NVFP4 训练使用 Transformer Engine 的自动校准和精度切换。验证通过同一输入的训练后模型输出比较完成，tolerance 设为 <code>(0.5, 5.0)</code>。
+  </div>
+</div>
+
+<!-- ==================== Slide 18: Harness & Verification ==================== -->
+<div class="slide" id="s18">
+  <h2>验证框架 &amp; Benchmark Harness</h2>
+  <div class="flow" style="margin:20px 0;">
+    <div class="flow-step" style="border-color:var(--accent);">Setup<br><span style="font-size:0.75rem">seed=42 · 模型初始化</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--orange);">Warmup<br><span style="font-size:0.75rem">5 轮预热</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--green);">Benchmark<br><span style="font-size:0.75rem">10-20 轮计时</span></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step" style="border-color:var(--pink);">Verify<br><span style="font-size:0.75rem">输出等价检查</span></div>
+  </div>
+  <pre><code><span style="color:var(--text-dim)"># 使用 harness 运行 benchmark</span>
+<span style="color:var(--accent)">python -m ch19.compare</span>                                          <span style="color:var(--text-dim)"># 全章对比</span>
+<span style="color:var(--accent)">python -m cli.aisp bench run --targets ch19 --profile minimal</span>    <span style="color:var(--text-dim)"># 最小配置</span>
+<span style="color:var(--accent)">python -m cli.aisp bench run --targets ch19:mxfp8_moe --profile deep_dive</span>  <span style="color:var(--text-dim)"># 深入分析</span>
+
+<span style="color:var(--text-dim)"># 验证 checklist</span>
+<span style="color:var(--green)">✓ ch19:dynamic_precision</span>       <span style="color:var(--text-dim)">— 固定/动态精度 token 等价</span>
+<span style="color:var(--green)">✓ ch19:dynamic_quantized_cache</span> <span style="color:var(--text-dim)">— 量化刷新 vs FP32 有界误差</span>
+<span style="color:var(--green)">✓ ch19:adaptive_parallelism</span>    <span style="color:var(--text-dim)">— 路由路径输出等价</span>
+<span style="color:var(--green)">✓ ch19:memory_double_buffering</span> <span style="color:var(--text-dim)">— 双缓冲结果一致</span></code></pre>
+</div>
+
+<!-- ==================== Slide 19: CUDA Build ==================== -->
+<div class="slide" id="s19">
+  <h2>CUDA 构建 &amp; 性能分析</h2>
+  <pre><code><span style="color:var(--text-dim)"># 自动构建所有 *.cu 文件</span>
+<span style="color:var(--accent)">make</span>                    <span style="color:var(--text-dim)"># 构建当前架构</span>
+<span style="color:var(--accent)">make b200</span>               <span style="color:var(--text-dim)"># sm_100 (Blackwell B200)</span>
+<span style="color:var(--accent)">make gb10</span>               <span style="color:var(--text-dim)"># sm_121 (Grace Blackwell)</span>
+
+<span style="color:var(--text-dim)"># 性能分析</span>
+<span style="color:var(--accent)">make profile-nsys</span>       <span style="color:var(--text-dim)"># Nsight Systems 追踪</span>
+<span style="color:var(--accent)">make profile-ncu</span>        <span style="color:var(--text-dim)"># Nsight Compute 内核分析</span>
+<span style="color:var(--accent)">make profile-hta</span>        <span style="color:var(--text-dim)"># Heat Transfer Analysis</span>
+<span style="color:var(--accent)">make profile-all</span>        <span style="color:var(--text-dim)"># 全部分析工具</span>
+
+<span style="color:var(--text-dim)"># FP4 内核需要额外的 cublasLt 链接</span>
+<span style="color:var(--orange)">optimized_fp4_hardware_kernel</span>: NVCC_FLAGS += -lcublasLt -lcublas</code></pre>
+  <div class="grid-2" style="margin-top:20px;">
+    <div class="card">
+      <h3>📁 Makefile 自动发现</h3>
+      <ul>
+        <li>自动检测 <code>*.cu</code> 源文件</li>
+        <li>自动推导目标二进制名</li>
+        <li>支持 <code>_verify</code> 变体 (<code>-DVERIFY=1</code>)</li>
+        <li>架构后缀自动追加</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>🔧 依赖的共享模块</h3>
+      <ul>
+        <li><code>cuda_verify.cuh</code> — 校验和输出</li>
+        <li><code>nvtx_utils.cuh</code> — NVTX 标注</li>
+        <li><code>cuda_arch.mk</code> — 架构标志</li>
+        <li><code>verification_mixin</code> — Python 验证混入</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== Slide 20: Learning Goals & Summary ==================== -->
+<div class="slide" id="s20">
+  <h2>学习目标 &amp; 本章总结</h2>
+  <div class="grid-2">
+    <div class="card">
+      <h3>🎯 学习目标</h3>
+      <ul>
+        <li>使用校准和验证钩子进行 <strong>FP4/FP6/FP8</strong> 训练基准测试</li>
+        <li>在精度约束下将 <strong>KV-cache 预取与计算重叠</strong></li>
+        <li>实现运行时无漂移的 <strong>动态量化缓存</strong></li>
+        <li>设计监控和重平衡碎片化内存池的 <strong>分配器辅助工具</strong></li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>🔑 核心洞察</h3>
+      <ul>
+        <li>低精度是 <strong style="color:var(--green)">系统决策</strong>，不仅是 dtype 选择</li>
+        <li>收益来源多样化: 计算 · 带宽 · 重叠</li>
+        <li>所有优化必须通过 <strong style="color:var(--pink)">同一 harness 验证</strong></li>
+        <li><code>arch_config.py</code> 提供可切换的精度开关</li>
+      </ul>
+    </div>
+  </div>
+  <div class="grid-3" style="margin-top:20px;">
+    <div class="card" style="text-align:center; border-top:3px solid var(--green);">
+      <div class="metric metric-green">1.13×</div>
+      <p class="metric-label">量化缓存</p>
+      <p style="font-size:0.8rem; color:var(--text-dim);">内存 -34%</p>
+    </div>
+    <div class="card" style="text-align:center; border-top:3px solid var(--orange);">
+      <div class="metric metric-orange">1.97×</div>
+      <p class="metric-label">双缓冲</p>
+      <p style="font-size:0.8rem; color:var(--text-dim);">H2D+Compute 重叠</p>
+    </div>
+    <div class="card" style="text-align:center; border-top:3px solid var(--cyan);">
+      <div class="metric metric-cyan">7.71×</div>
+      <p class="metric-label">MXFP8 MoE</p>
+      <p style="font-size:0.8rem; color:var(--text-dim);">低精度 MoE 路径</p>
+    </div>
+  </div>
+  <div class="note-box" style="margin-top:16px;">
+    📖 <strong>关键命令:</strong> <code>python -m ch19.compare</code> · <code>python -m cli.aisp bench run --targets ch19 --profile minimal</code>
+  </div>
+</div>
+
+</div><!-- end .deck -->
+
+<!-- Progress bar -->
+<div class="progress-bar" id="progress"></div>
+<div class="slide-counter" id="counter">1 / 20</div>
+<div class="key-combo">← → 或 点击翻页 · Esc 总览</div>
+
+<script>
+(function() {
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length;
+  let current = 0;
+
+  function show(n) {
+    slides[current].classList.remove('active');
+    current = (n + total) % total;
+    slides[current].classList.add('active');
+    document.getElementById('counter').textContent = (current + 1) + ' / ' + total;
+    document.getElementById('progress').style.width = ((current + 1) / total * 100) + '%';
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); show(current + 1); }
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); show(current - 1); }
+    if (e.key === 'Home') { e.preventDefault(); show(0); }
+    if (e.key === 'End') { e.preventDefault(); show(total - 1); }
+  });
+
+  document.addEventListener('click', e => {
+    if (e.clientX > window.innerWidth / 2) show(current + 1);
+    else show(current - 1);
+  });
+
+  // Touch support
+  let touchStartX = 0;
+  document.addEventListener('touchstart', e => { touchStartX = e.touches[0].clientX; });
+  document.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    if (Math.abs(dx) > 50) { dx < 0 ? show(current + 1) : show(current - 1); }
+  });
+
+  show(0);
+})();
+</script>
+</body>
+</html>
