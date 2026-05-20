@@ -1,0 +1,1223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AISP Dashboard - Architecture Visualization</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap');
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: rgba(255,255,255,0.04);
+    --surface-hover: rgba(255,255,255,0.08);
+    --border: rgba(255,255,255,0.08);
+    --text: #e2e8f0;
+    --text-dim: rgba(255,255,255,0.5);
+    --accent: #6366f1;
+    --accent2: #8b5cf6;
+    --green: #22c55e;
+    --yellow: #eab308;
+    --red: #ef4444;
+    --cyan: #06b6d4;
+    --orange: #f97316;
+    --pink: #ec4899;
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { font-size:16px; scroll-behavior:smooth; }
+  body {
+    font-family:'Space Grotesk',system-ui,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+    overflow-x:hidden;
+  }
+  code, .mono { font-family:'JetBrains Mono',monospace; }
+
+  /* ---- Slide System ---- */
+  .slide {
+    min-height:100vh;
+    display:flex;
+    flex-direction:column;
+    justify-content:center;
+    align-items:center;
+    padding:60px 80px;
+    position:relative;
+    opacity:0;
+    transform:translateY(40px);
+    transition:opacity .8s ease, transform .8s ease;
+  }
+  .slide.visible {
+    opacity:1;
+    transform:translateY(0);
+  }
+  .slide-inner {
+    max-width:1200px;
+    width:100%;
+  }
+
+  /* ---- Background Effects ---- */
+  .slide::before {
+    content:'';
+    position:absolute;
+    inset:0;
+    background:radial-gradient(ellipse at 30% 20%, rgba(99,102,241,.06) 0%, transparent 60%),
+               radial-gradient(ellipse at 70% 80%, rgba(139,92,246,.04) 0%, transparent 60%);
+    pointer-events:none;
+  }
+
+  /* ---- Typography ---- */
+  h1 { font-size:3rem; font-weight:700; letter-spacing:-.02em; line-height:1.1; }
+  h2 { font-size:2rem; font-weight:600; letter-spacing:-.01em; margin-bottom:1rem; }
+  h3 { font-size:1.25rem; font-weight:600; margin-bottom:.5rem; }
+  .subtitle { font-size:1.15rem; color:var(--text-dim); margin-top:.75rem; line-height:1.6; }
+  .tag {
+    display:inline-block;
+    padding:4px 14px;
+    border-radius:999px;
+    font-size:.75rem;
+    font-weight:500;
+    border:1px solid var(--border);
+    background:var(--surface);
+    color:var(--text-dim);
+    margin:4px;
+  }
+  .tag-accent { border-color:rgba(99,102,241,.3); color:var(--accent); background:rgba(99,102,241,.08); }
+  .tag-green  { border-color:rgba(34,197,94,.3); color:var(--green); background:rgba(34,197,94,.08); }
+  .tag-yellow { border-color:rgba(234,179,8,.3); color:var(--yellow); background:rgba(234,179,8,.08); }
+  .tag-cyan   { border-color:rgba(6,182,212,.3); color:var(--cyan); background:rgba(6,182,212,.08); }
+  .tag-pink   { border-color:rgba(236,72,153,.3); color:var(--pink); background:rgba(236,72,153,.08); }
+  .tag-orange { border-color:rgba(249,115,22,.3); color:var(--orange); background:rgba(249,115,22,.08); }
+
+  /* ---- Cards ---- */
+  .card {
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:16px;
+    padding:28px;
+    backdrop-filter:blur(12px);
+    transition:all .3s ease;
+  }
+  .card:hover {
+    background:var(--surface-hover);
+    border-color:rgba(255,255,255,0.12);
+    transform:translateY(-2px);
+    box-shadow:0 8px 32px rgba(0,0,0,.3);
+  }
+
+  /* ---- Grid Layouts ---- */
+  .grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:24px; }
+  .grid-3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:24px; }
+  .grid-4 { display:grid; grid-template-columns:repeat(4,1fr); gap:20px; }
+  .grid-2-1 { display:grid; grid-template-columns:2fr 1fr; gap:24px; }
+
+  /* ---- Stat Card ---- */
+  .stat-card {
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:14px;
+    padding:24px;
+    position:relative;
+    overflow:hidden;
+  }
+  .stat-card::after {
+    content:'';
+    position:absolute;
+    top:0; left:0; right:0;
+    height:3px;
+    background:linear-gradient(90deg,var(--accent),var(--accent2));
+    opacity:0;
+    transition:opacity .3s;
+  }
+  .stat-card:hover::after { opacity:1; }
+  .stat-label { font-size:.8rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:.05em; }
+  .stat-value { font-size:2.2rem; font-weight:700; margin:8px 0 4px; font-family:'JetBrains Mono',monospace; }
+  .stat-sub { font-size:.8rem; color:var(--text-dim); }
+
+  /* ---- Code Block ---- */
+  .code-block {
+    background:rgba(0,0,0,.4);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:20px 24px;
+    font-family:'JetBrains Mono',monospace;
+    font-size:.82rem;
+    line-height:1.7;
+    overflow-x:auto;
+    color:#c4b5fd;
+  }
+  .code-block .kw { color:#c084fc; }
+  .code-block .fn { color:#60a5fa; }
+  .code-block .str { color:#86efac; }
+  .code-block .cmt { color:rgba(255,255,255,.25); font-style:italic; }
+  .code-block .type { color:#fbbf24; }
+  .code-block .num { color:#f97316; }
+
+  /* ---- Flow Diagram ---- */
+  .flow {
+    display:flex;
+    align-items:center;
+    gap:0;
+    flex-wrap:wrap;
+    justify-content:center;
+  }
+  .flow-node {
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:16px 24px;
+    text-align:center;
+    min-width:140px;
+    position:relative;
+  }
+  .flow-node.highlight {
+    border-color:rgba(99,102,241,.4);
+    background:rgba(99,102,241,.08);
+  }
+  .flow-arrow {
+    font-size:1.5rem;
+    color:var(--accent);
+    padding:0 8px;
+    opacity:.6;
+  }
+  .flow-node-label { font-size:.7rem; color:var(--text-dim); text-transform:uppercase; letter-spacing:.04em; }
+  .flow-node-name { font-size:1rem; font-weight:600; margin-top:4px; }
+
+  /* ---- Table ---- */
+  .slide-table {
+    width:100%;
+    border-collapse:collapse;
+    font-size:.88rem;
+  }
+  .slide-table th {
+    text-align:left;
+    padding:12px 16px;
+    border-bottom:2px solid rgba(99,102,241,.2);
+    color:var(--accent);
+    font-weight:600;
+    font-size:.75rem;
+    text-transform:uppercase;
+    letter-spacing:.05em;
+  }
+  .slide-table td {
+    padding:12px 16px;
+    border-bottom:1px solid var(--border);
+    color:var(--text);
+  }
+  .slide-table tr:hover td { background:var(--surface); }
+
+  /* ---- File Tree ---- */
+  .file-tree {
+    font-family:'JetBrains Mono',monospace;
+    font-size:.82rem;
+    line-height:2;
+    color:var(--text-dim);
+  }
+  .file-tree .dir { color:var(--cyan); font-weight:600; }
+  .file-tree .file { color:var(--text); }
+  .file-tree .ext-ts { color:#3b82f6; }
+  .file-tree .ext-py { color:#22c55e; }
+  .file-tree .ext-json { color:#eab308; }
+  .file-tree .ext-css { color:#ec4899; }
+
+  /* ---- Progress Bar ---- */
+  .progress-bar {
+    height:8px;
+    background:rgba(255,255,255,.06);
+    border-radius:999px;
+    overflow:hidden;
+    margin-top:8px;
+  }
+  .progress-fill {
+    height:100%;
+    border-radius:999px;
+    transition:width 1.5s ease;
+    background:linear-gradient(90deg,var(--accent),var(--accent2));
+  }
+
+  /* ---- Architecture Box ---- */
+  .arch-layer {
+    border:1px solid var(--border);
+    border-radius:14px;
+    padding:24px;
+    margin-bottom:16px;
+    position:relative;
+    background:var(--surface);
+  }
+  .arch-layer-label {
+    position:absolute;
+    top:-12px;
+    left:24px;
+    background:var(--bg);
+    padding:2px 12px;
+    font-size:.75rem;
+    font-weight:600;
+    text-transform:uppercase;
+    letter-spacing:.06em;
+    border-radius:6px;
+    border:1px solid var(--border);
+  }
+
+  /* ---- Nav Dots ---- */
+  .nav-dots {
+    position:fixed;
+    right:24px;
+    top:50%;
+    transform:translateY(-50%);
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+    z-index:100;
+  }
+  .nav-dot {
+    width:10px;
+    height:10px;
+    border-radius:50%;
+    background:rgba(255,255,255,.15);
+    cursor:pointer;
+    transition:all .3s;
+    border:none;
+  }
+  .nav-dot.active {
+    background:var(--accent);
+    box-shadow:0 0 12px rgba(99,102,241,.4);
+    transform:scale(1.3);
+  }
+  .nav-dot:hover { background:rgba(255,255,255,.3); }
+
+  /* ---- Animations ---- */
+  @keyframes float {
+    0%,100% { transform:translateY(0); }
+    50% { transform:translateY(-8px); }
+  }
+  @keyframes pulse-glow {
+    0%,100% { box-shadow:0 0 20px rgba(99,102,241,.1); }
+    50% { box-shadow:0 0 40px rgba(99,102,241,.2); }
+  }
+  .float { animation:float 4s ease-in-out infinite; }
+  .glow { animation:pulse-glow 3s ease-in-out infinite; }
+
+  /* ---- Slide Counter ---- */
+  .slide-counter {
+    position:fixed;
+    bottom:24px;
+    right:24px;
+    font-family:'JetBrains Mono',monospace;
+    font-size:.8rem;
+    color:var(--text-dim);
+    z-index:100;
+  }
+
+  /* ---- Badge ---- */
+  .badge {
+    display:inline-flex;
+    align-items:center;
+    gap:6px;
+    padding:6px 14px;
+    border-radius:8px;
+    font-size:.78rem;
+    font-weight:500;
+  }
+  .badge-green  { background:rgba(34,197,94,.1); color:var(--green); border:1px solid rgba(34,197,94,.2); }
+  .badge-red    { background:rgba(239,68,68,.1); color:var(--red); border:1px solid rgba(239,68,68,.2); }
+  .badge-yellow { background:rgba(234,179,8,.1); color:var(--yellow); border:1px solid rgba(234,179,8,.2); }
+  .badge-cyan   { background:rgba(6,182,212,.1); color:var(--cyan); border:1px solid rgba(6,182,212,.2); }
+
+  /* ---- Responsive ---- */
+  @media (max-width:900px) {
+    .slide { padding:40px 24px; }
+    h1 { font-size:2rem; }
+    .grid-2, .grid-3, .grid-4 { grid-template-columns:1fr; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Navigation Dots -->
+<div class="nav-dots" id="navDots"></div>
+<div class="slide-counter" id="slideCounter"></div>
+
+<!-- ==================== SLIDE 1: Title ==================== -->
+<div class="slide" id="slide-0">
+  <div class="slide-inner" style="text-align:center;">
+    <div style="margin-bottom:32px;">
+      <span class="tag tag-accent">AI Performance Engineering</span>
+      <span class="tag tag-cyan">Dashboard</span>
+      <span class="tag tag-green">v1.0</span>
+    </div>
+    <h1 style="background:linear-gradient(135deg,#e2e8f0,#6366f1,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">
+      AISP Dashboard
+    </h1>
+    <p class="subtitle" style="max-width:700px;margin:16px auto 0;">
+      GPU 优化基准测试仪表盘<br>
+      <span style="color:var(--accent);">FastAPI + Next.js 14 + Recharts + TailwindCSS</span>
+    </p>
+    <div style="margin-top:48px;display:flex;justify-content:center;gap:16px;flex-wrap:wrap;">
+      <div class="badge badge-green">11 Navigation Tabs</div>
+      <div class="badge badge-cyan">SSE GPU Streaming</div>
+      <div class="badge badge-yellow">MCP Tool Integration</div>
+    </div>
+    <div style="margin-top:60px;color:var(--text-dim);font-size:.85rem;">
+      <code>code/dashboard/</code> &mdash; Full-Stack Architecture Visualization
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 2: Project Overview ==================== -->
+<div class="slide" id="slide-1">
+  <div class="slide-inner">
+    <h2>Project Overview</h2>
+    <p class="subtitle" style="margin-bottom:32px;">
+      A full-stack dashboard for monitoring GPU benchmark performance, comparing runs, and integrating AI-powered analysis.
+    </p>
+    <div class="grid-4">
+      <div class="stat-card">
+        <div class="stat-label">Backend</div>
+        <div class="stat-value" style="color:var(--green);">FastAPI</div>
+        <div class="stat-sub">Python 3 &bull; Uvicorn &bull; SSE</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Frontend</div>
+        <div class="stat-value" style="color:var(--cyan);">Next.js</div>
+        <div class="stat-sub">React 18 &bull; TypeScript &bull; App Router</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Styling</div>
+        <div class="stat-value" style="color:var(--pink);">Tailwind</div>
+        <div class="stat-sub">CSS &bull; PostCSS &bull; Custom Theme</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Charts</div>
+        <div class="stat-value" style="color:var(--orange);">Recharts</div>
+        <div class="stat-sub">Bar &bull; Line &bull; Responsive</div>
+      </div>
+    </div>
+    <div style="margin-top:32px;">
+      <div class="grid-2">
+        <div class="card">
+          <h3>Key Dependencies</h3>
+          <table class="slide-table">
+            <tr><td><code>swr</code></td><td>数据请求 & 缓存</td></tr>
+            <tr><td><code>recharts</code></td><td>图表可视化</td></tr>
+            <tr><td><code>lucide-react</code></td><td>图标系统</td></tr>
+            <tr><td><code>prism-react-renderer</code></td><td>代码高亮</td></tr>
+            <tr><td><code>react-diff-viewer</code></td><td>代码 Diff 对比</td></tr>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Dev Dependencies</h3>
+          <table class="slide-table">
+            <tr><td><code>jest</code></td><td>单元测试框架</td></tr>
+            <tr><td><code>@testing-library/react</code></td><td>React 测试工具</td></tr>
+            <tr><td><code>eslint</code></td><td>代码规范检查</td></tr>
+            <tr><td><code>typescript</code></td><td>类型系统</td></tr>
+            <tr><td><code>tailwindcss</code></td><td>原子化 CSS</td></tr>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 3: Directory Structure ==================== -->
+<div class="slide" id="slide-2">
+  <div class="slide-inner">
+    <h2>Directory Structure</h2>
+    <p class="subtitle" style="margin-bottom:28px;">Monorepo layout: Python API backend + Next.js frontend</p>
+    <div class="grid-2">
+      <div class="card">
+        <h3 style="color:var(--green);">Backend: <code>api/</code></h3>
+        <div class="file-tree">
+          <div><span class="dir">dashboard/</span></div>
+          <div>&nbsp;&nbsp;├── <span class="file">__init__.py</span></div>
+          <div>&nbsp;&nbsp;├── <span class="dir">api/</span></div>
+          <div>&nbsp;&nbsp;│&nbsp;&nbsp;&nbsp;└── <span class="ext-py">server.py</span> <span style="color:var(--text-dim);font-size:.7rem;">FastAPI 主入口</span></div>
+          <div>&nbsp;&nbsp;└── <span class="dir">web/</span></div>
+        </div>
+        <div style="margin-top:16px;padding:12px;background:rgba(34,197,94,.06);border-radius:8px;border:1px solid rgba(34,197,94,.15);">
+          <div style="font-size:.78rem;color:var(--green);font-weight:600;">server.py (270 lines)</div>
+          <div style="font-size:.75rem;color:var(--text-dim);margin-top:4px;">
+            FastAPI app &bull; CORS &bull; Route registry &bull; SSE stream &bull; CLI (Typer)
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--cyan);">Frontend: <code>web/</code></h3>
+        <div class="file-tree">
+          <div><span class="dir">web/</span></div>
+          <div>&nbsp;&nbsp;├── <span class="ext-json">package.json</span></div>
+          <div>&nbsp;&nbsp;├── <span class="ext-ts">next.config.js</span></div>
+          <div>&nbsp;&nbsp;├── <span class="ext-ts">tailwind.config.ts</span></div>
+          <div>&nbsp;&nbsp;├── <span class="ext-ts">tsconfig.json</span></div>
+          <div>&nbsp;&nbsp;├── <span class="dir">public/</span></div>
+          <div>&nbsp;&nbsp;└── <span class="dir">src/</span></div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── <span class="dir">app/</span> <span style="color:var(--text-dim);font-size:.7rem;">11 pages</span></div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── <span class="dir">components/</span> <span style="color:var(--text-dim);font-size:.7rem;">12 widgets</span></div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── <span class="dir">lib/</span> <span style="color:var(--text-dim);font-size:.7rem;">API + hooks</span></div>
+          <div>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── <span class="dir">types/</span> <span style="color:var(--text-dim);font-size:.7rem;">755 lines</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 4: Architecture Diagram ==================== -->
+<div class="slide" id="slide-3">
+  <div class="slide-inner">
+    <h2>System Architecture</h2>
+    <p class="subtitle" style="margin-bottom:32px;">Full-stack data flow: Browser → Next.js → FastAPI → Core Engine → GPU</p>
+
+    <div class="arch-layer" style="border-color:rgba(6,182,212,.2);">
+      <div class="arch-layer-label" style="color:var(--cyan);">Frontend (Next.js 14)</div>
+      <div class="flow" style="gap:12px;flex-wrap:wrap;">
+        <div class="flow-node">
+          <div class="flow-node-label">Page</div>
+          <div class="flow-node-name">Overview</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Page</div>
+          <div class="flow-node-name">Compare</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Page</div>
+          <div class="flow-node-name">Profiler</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Page</div>
+          <div class="flow-node-name">Memory</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Page</div>
+          <div class="flow-node-name">Multi-GPU</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Page</div>
+          <div class="flow-node-name">Cluster</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="text-align:center;font-size:1.5rem;color:var(--accent);opacity:.5;margin:8px 0;">&#x25BC;</div>
+
+    <div class="arch-layer" style="border-color:rgba(99,102,241,.2);">
+      <div class="arch-layer-label" style="color:var(--accent);">API Layer</div>
+      <div class="flow" style="gap:16px;flex-wrap:wrap;">
+        <div class="flow-node highlight">
+          <div class="flow-node-label">Hook</div>
+          <div class="flow-node-name">fetchAPI()</div>
+        </div>
+        <div class="flow-arrow">&#x2192;</div>
+        <div class="flow-node highlight">
+          <div class="flow-node-label">Hook</div>
+          <div class="flow-node-name">useGpuStream()</div>
+        </div>
+        <div class="flow-arrow">&#x2192;</div>
+        <div class="flow-node highlight">
+          <div class="flow-node-label">Client</div>
+          <div class="flow-node-name">SWR Cache</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="text-align:center;font-size:1.5rem;color:var(--accent);opacity:.5;margin:8px 0;">&#x25BC; HTTP / SSE</div>
+
+    <div class="arch-layer" style="border-color:rgba(34,197,94,.2);">
+      <div class="arch-layer-label" style="color:var(--green);">Backend (FastAPI)</div>
+      <div class="flow" style="gap:16px;flex-wrap:wrap;">
+        <div class="flow-node">
+          <div class="flow-node-label">Router</div>
+          <div class="flow-node-name">/api/benchmark/*</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Router</div>
+          <div class="flow-node-name">/api/gpu/*</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Router</div>
+          <div class="flow-node-name">/api/profile/*</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Router</div>
+          <div class="flow-node-name">/api/cluster/*</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Router</div>
+          <div class="flow-node-name">/api/ai/*</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="text-align:center;font-size:1.5rem;color:var(--accent);opacity:.5;margin:8px 0;">&#x25BC;</div>
+
+    <div class="arch-layer" style="border-color:rgba(236,72,153,.2);">
+      <div class="arch-layer-label" style="color:var(--pink);">Core Engine</div>
+      <div class="flow" style="gap:16px;flex-wrap:wrap;">
+        <div class="flow-node">
+          <div class="flow-node-label">Registry</div>
+          <div class="flow-node-name">ApiRoute</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Analyzer</div>
+          <div class="flow-node-name">PerformanceAnalyzer</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">Handler</div>
+          <div class="flow-node-name">perf_core</div>
+        </div>
+        <div class="flow-node">
+          <div class="flow-node-label">GPU</div>
+          <div class="flow-node-name">nvidia-smi</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 5: Navigation Tabs ==================== -->
+<div class="slide" id="slide-4">
+  <div class="slide-inner">
+    <h2>11 Navigation Tabs</h2>
+    <p class="subtitle" style="margin-bottom:28px;">Keyboard shortcuts 1-9, 0, C for rapid navigation</p>
+    <div class="grid-3">
+      <div class="card" style="border-left:3px solid var(--accent);">
+        <h3><span style="color:var(--accent);">1</span> Overview</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">主页仪表盘：GPU 卡片、StatsCard、SpeedupChart、StatusChart、BenchmarkTable、AI Assistant</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--cyan);">
+        <h3><span style="color:var(--cyan);">2</span> Compare</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">两次 benchmark 运行的 diff 对比，支持 regressions/improvements 筛选</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--green);">
+        <h3><span style="color:var(--green);">3</span> Profiler</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">Nsight Compute/Systems 分析、kernel 级性能数据、compile analysis</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--orange);">
+        <h3><span style="color:var(--orange);">4</span> Memory</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">GPU 显存使用分析、memory timeline、OOM 检测</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--pink);">
+        <h3><span style="color:var(--pink);">5</span> Multi-GPU</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">多 GPU 并行分析、NVLink 拓扑、通信开销</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--yellow);">
+        <h3><span style="color:var(--yellow);">6</span> History</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">Benchmark 历史趋势、speedup 变化曲线、regression 检测</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--red);">
+        <h3><span style="color:var(--red);">7</span> E2E</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">端到端运行状态、stage 追踪、issue groups、watcher 状态</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--accent2);">
+        <h3><span style="color:var(--accent2);">8</span> Tier-1</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">核心 benchmark suite、geomean speedup、regression 追踪</p>
+      </div>
+      <div class="card" style="border-left:3px solid var(--cyan);">
+        <h3><span style="color:var(--cyan);">9</span> System</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">软件栈信息、clock lock 检查、依赖版本</p>
+      </div>
+    </div>
+    <div style="margin-top:24px;display:flex;gap:24px;">
+      <div class="card" style="flex:1;border-left:3px solid var(--green);">
+        <h3><span style="color:var(--green);">0</span> Cluster</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">集群评估套件、field report 生成、canonical package 构建、promote run</p>
+      </div>
+      <div class="card" style="flex:1;border-left:3px solid var(--orange);">
+        <h3><span style="color:var(--orange);">C</span> Contracts</h3>
+        <p style="font-size:.85rem;color:var(--text-dim);">Benchmark 合约管理、YAML schema、run generator、interface 对齐</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 6: API Endpoints ==================== -->
+<div class="slide" id="slide-5">
+  <div class="slide-inner">
+    <h2>API Endpoints</h2>
+    <p class="subtitle" style="margin-bottom:28px;">MCP-aligned route registry with dynamic endpoint generation</p>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3 style="color:var(--green);">Core Data Routes</h3>
+        <table class="slide-table">
+          <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><span class="badge badge-green">GET</span></td><td class="mono" style="font-size:.75rem;">/api/benchmark/data</td><td>Benchmark 分页数据</td></tr>
+            <tr><td><span class="badge badge-green">GET</span></td><td class="mono" style="font-size:.75rem;">/api/benchmark/overview</td><td>总览统计</td></tr>
+            <tr><td><span class="badge badge-green">GET</span></td><td class="mono" style="font-size:.75rem;">/api/benchmark/history</td><td>运行历史</td></tr>
+            <tr><td><span class="badge badge-green">GET</span></td><td class="mono" style="font-size:.75rem;">/api/benchmark/trends</td><td>趋势分析</td></tr>
+            <tr><td><span class="badge badge-green">GET</span></td><td class="mono" style="font-size:.75rem;">/api/benchmark/compare</td><td>运行对比</td></tr>
+            <tr><td><span class="badge badge-green">GET</span></td><td class="mono" style="font-size:.75rem;">/api/gpu/info</td><td>GPU 信息</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--cyan);">Advanced Routes</h3>
+        <table class="slide-table">
+          <thead><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><span class="badge badge-cyan">SSE</span></td><td class="mono" style="font-size:.75rem;">/api/gpu/stream</td><td>GPU 实时流</td></tr>
+            <tr><td><span class="badge badge-green">GET</span></td><td class="mono" style="font-size:.75rem;">/api/profile/list</td><td>Profile 对</td></tr>
+            <tr><td><span class="badge badge-green">GET</span></td><td class="mono" style="font-size:.75rem;">/api/profile/ncu-summary</td><td>NCU 分析</td></tr>
+            <tr><td><span class="badge badge-yellow">POST</span></td><td class="mono" style="font-size:.75rem;">/api/cluster/eval-suite</td><td>集群评估</td></tr>
+            <tr><td><span class="badge badge-yellow">POST</span></td><td class="mono" style="font-size:.75rem;">/api/cluster/promote-run</td><td>发布运行</td></tr>
+            <tr><td><span class="badge badge-yellow">POST</span></td><td class="mono" style="font-size:.75rem;">/api/ai/execute</td><td>AI 工具执行</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div style="margin-top:24px;">
+      <div class="code-block">
+<span class="cmt"># Dynamic endpoint generation from route registry</span>
+<span class="kw">def</span> <span class="fn">_register_routes</span>():
+    <span class="kw">for</span> route <span class="kw">in</span> <span class="fn">get_routes</span>():
+        <span class="kw">if</span> route.method.upper() == <span class="str">"GET"</span>:
+            fastapi_app.<span class="fn">get</span>(route.path)(<span class="fn">_make_endpoint</span>(route))
+        <span class="kw">elif</span> route.method.upper() == <span class="str">"POST"</span>:
+            fastapi_app.<span class="fn">post</span>(route.path)(<span class="fn">_make_endpoint</span>(route))
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 7: Component Architecture ==================== -->
+<div class="slide" id="slide-6">
+  <div class="slide-inner">
+    <h2>Component Architecture</h2>
+    <p class="subtitle" style="margin-bottom:28px;">12 reusable components + 11 page routes</p>
+
+    <div class="grid-2">
+      <div>
+        <h3 style="color:var(--accent);margin-bottom:16px;">Core Components</h3>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:rgba(99,102,241,.15);display:flex;align-items:center;justify-content:center;font-size:1.2rem;">&#x1F3D7;</div>
+            <div>
+              <div style="font-weight:600;">DashboardShell</div>
+              <div style="font-size:.78rem;color:var(--text-dim);">布局容器 &bull; 键盘快捷键 &bull; Navigation</div>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:rgba(34,197,94,.15);display:flex;align-items:center;justify-content:center;font-size:1.2rem;">&#x1F4CA;</div>
+            <div>
+              <div style="font-weight:600;">SpeedupChart</div>
+              <div style="font-size:.78rem;color:var(--text-dim);">Recharts 横向柱状图 &bull; Benchmark/Chapter 切换</div>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:rgba(6,182,212,.15);display:flex;align-items:center;justify-content:center;font-size:1.2rem;">&#x1F4BB;</div>
+            <div>
+              <div style="font-weight:600;">GpuCard</div>
+              <div style="font-size:.78rem;color:var(--text-dim);">GPU 实时状态 &bull; 显存/温度/功耗/利用率</div>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:rgba(236,72,153,.15);display:flex;align-items:center;justify-content:center;font-size:1.2rem;">&#x1F916;</div>
+            <div>
+              <div style="font-weight:600;">AIAssistantTab</div>
+              <div style="font-size:.78rem;color:var(--text-dim);">MCP 工具执行面板 &bull; 直接从 UI 调用</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <h3 style="color:var(--cyan);margin-bottom:16px;">Data Components</h3>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:rgba(234,179,8,.15);display:flex;align-items:center;justify-content:center;font-size:1.2rem;">&#x1F4CB;</div>
+            <div>
+              <div style="font-weight:600;">BenchmarkTable</div>
+              <div style="font-size:.78rem;color:var(--text-dim);">分页表格 &bull; 搜索/排序/筛选 &bull; Chapter 过滤</div>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:rgba(249,115,22,.15);display:flex;align-items:center;justify-content:center;font-size:1.2rem;">&#x1F3AF;</div>
+            <div>
+              <div style="font-weight:600;">StatsCard</div>
+              <div style="font-size:.78rem;color:var(--text-dim);">统计卡片 &bull; Trend 指示器 &bull; Icon 变体</div>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:rgba(139,92,246,.15);display:flex;align-items:center;justify-content:center;font-size:1.2rem;">&#x1F4C8;</div>
+            <div>
+              <div style="font-weight:600;">StatusChart</div>
+              <div style="font-size:.78rem;color:var(--text-dim);">成功率饼图 &bull; succeeded/failed/skipped</div>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <div style="width:40px;height:40px;border-radius:10px;background:rgba(239,68,68,.15);display:flex;align-items:center;justify-content:center;font-size:1.2rem;">&#x1F4E6;</div>
+            <div>
+              <div style="font-weight:600;">DependenciesWidget</div>
+              <div style="font-size:.78rem;color:var(--text-dim);">依赖版本展示 &bull; SoftwareStackWidget</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 8: SSE GPU Streaming ==================== -->
+<div class="slide" id="slide-7">
+  <div class="slide-inner">
+    <h2>Real-time GPU Streaming</h2>
+    <p class="subtitle" style="margin-bottom:32px;">Server-Sent Events for live GPU telemetry</p>
+
+    <div class="grid-2-1">
+      <div>
+        <div class="code-block" style="margin-bottom:20px;">
+<span class="cmt"># Backend: SSE event stream (server.py)</span>
+<span class="kw">@</span>fastapi_app.<span class="fn">get</span>(<span class="str">"/api/gpu/stream"</span>)
+<span class="kw">async def</span> <span class="fn">gpu_stream</span>(request, interval=<span class="num">5.0</span>):
+    <span class="kw">async def</span> <span class="fn">_event_stream</span>():
+        <span class="kw">while True</span>:
+            <span class="kw">if await</span> request.<span class="fn">is_disconnected</span>():
+                <span class="kw">break</span>
+            payload = {
+                <span class="str">"timestamp"</span>: <span class="fn">time.strftime</span>(...),
+                <span class="str">"gpu"</span>: <span class="fn">get_engine</span>().gpu.<span class="fn">info</span>(),
+            }
+            <span class="kw">yield</span> <span class="str">f"event: gpu\ndata: </span>{json.<span class="fn">dumps</span>(payload)}<span class="str">\n\n"</span>
+            <span class="kw">await</span> asyncio.<span class="fn">sleep</span>(interval)
+    <span class="kw">return</span> <span class="type">StreamingResponse</span>(
+        <span class="fn">_event_stream</span>(),
+        media_type=<span class="str">"text/event-stream"</span>
+    )
+        </div>
+        <div class="code-block">
+<span class="cmt">// Frontend: useGpuStream hook</span>
+<span class="kw">export function</span> <span class="fn">useGpuStream</span>({ enabled, intervalMs }) {
+  <span class="kw">const</span> [gpu, setGpu] = <span class="fn">useState</span>(<span class="kw">null</span>);
+  <span class="fn">useEffect</span>(() => {
+    <span class="kw">const</span> es = <span class="kw">new</span> <span class="type">EventSource</span>(<span class="str">`/api/gpu/stream?interval=${intervalMs/1000}`</span>);
+    es.<span class="fn">addEventListener</span>(<span class="str">"gpu"</span>, (e) => {
+      <span class="kw">const</span> data = <span class="fn">JSON.parse</span>(e.data);
+      <span class="fn">setGpu</span>(data.gpu);
+    });
+    <span class="kw">return</span> () => es.<span class="fn">close</span>();
+  }, [enabled, intervalMs]);
+  <span class="kw">return</span> { gpu, lastUpdated };
+}
+        </div>
+      </div>
+
+      <div>
+        <div class="card glow" style="text-align:center;padding:32px 20px;">
+          <div style="font-size:3rem;margin-bottom:12px;">&#x1F7E2;</div>
+          <h3>Live GPU Data</h3>
+          <div style="margin-top:16px;text-align:left;">
+            <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">
+              <span style="font-size:.8rem;color:var(--text-dim);">Utilization</span>
+              <span class="mono" style="font-size:.85rem;color:var(--green);">87%</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">
+              <span style="font-size:.8rem;color:var(--text-dim);">Memory</span>
+              <span class="mono" style="font-size:.85rem;color:var(--cyan);">24576 / 81920 MB</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">
+              <span style="font-size:.8rem;color:var(--text-dim);">Temperature</span>
+              <span class="mono" style="font-size:.85rem;color:var(--yellow);">72 C</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);">
+              <span style="font-size:.8rem;color:var(--text-dim);">Power</span>
+              <span class="mono" style="font-size:.85rem;color:var(--orange);">320 / 700 W</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;padding:8px 0;">
+              <span style="font-size:.8rem;color:var(--text-dim);">Clock (SM/Mem)</span>
+              <span class="mono" style="font-size:.85rem;color:var(--accent);">2100 / 2619 MHz</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 9: Type System ==================== -->
+<div class="slide" id="slide-8">
+  <div class="slide-inner">
+    <h2>Type System (755 lines)</h2>
+    <p class="subtitle" style="margin-bottom:28px;">Comprehensive TypeScript interfaces for the entire data model</p>
+
+    <div class="grid-3">
+      <div class="card">
+        <h3 style="color:var(--accent);">Benchmark</h3>
+        <div class="code-block" style="font-size:.72rem;">
+<span class="kw">interface</span> <span class="type">Benchmark</span> {
+  name: <span class="type">string</span>
+  chapter: <span class="type">string</span>
+  status: <span class="str">'succeeded'</span> | <span class="str">'failed'</span> | <span class="str">'skipped'</span>
+  baseline_time_ms: <span class="type">number</span>
+  optimized_time_ms: <span class="type">number</span>
+  speedup: <span class="type">number</span>
+  optimization_goal?: <span class="str">'speed'</span> | <span class="str">'memory'</span>
+}
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--green);">GpuInfo</h3>
+        <div class="code-block" style="font-size:.72rem;">
+<span class="kw">interface</span> <span class="type">GpuInfo</span> {
+  name: <span class="type">string</span>
+  memory_total: <span class="type">number</span>  <span class="cmt">// MB</span>
+  memory_used: <span class="type">number</span>
+  utilization: <span class="type">number</span>
+  temperature: <span class="type">number</span>
+  power?: <span class="type">number</span>  <span class="cmt">// watts</span>
+  cuda_version?: <span class="type">string</span>
+}
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--cyan);">E2E Status</h3>
+        <div class="code-block" style="font-size:.72rem;">
+<span class="kw">interface</span> <span class="type">E2EStatusSnapshot</span> {
+  run_id?: <span class="type">string</span>
+  overall_status?: <span class="type">string</span>
+  stages?: <span class="type">Stage</span>[]
+  issue_groups?: <span class="type">IssueGroup</span>[]
+  liveness?: { orchestrator_live, watcher_live }
+  ledgers?: { summary, active_issue_ledger }
+}
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:24px;">
+      <div class="card">
+        <h3>Type Categories</h3>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;">
+          <span class="tag tag-accent">Benchmark (10+)</span>
+          <span class="tag tag-green">GPU & System (5+)</span>
+          <span class="tag tag-cyan">Profiler (6+)</span>
+          <span class="tag tag-yellow">Tier-1 (8+)</span>
+          <span class="tag tag-pink">Cluster (8+)</span>
+          <span class="tag tag-orange">Contracts (6+)</span>
+          <span class="tag tag-accent">Compare (4+)</span>
+          <span class="tag tag-green">History & Trends (5+)</span>
+          <span class="tag tag-cyan">E2E (6+)</span>
+          <span class="tag tag-yellow">Clock Lock (4+)</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 10: Page Architecture ==================== -->
+<div class="slide" id="slide-9">
+  <div class="slide-inner">
+    <h2>Page Architecture</h2>
+    <p class="subtitle" style="margin-bottom:28px;">App Router pattern with shared DashboardShell layout</p>
+
+    <div class="code-block" style="margin-bottom:24px;">
+<span class="dir">src/app/</span>
+├── <span class="ext-ts">layout.tsx</span>          <span class="cmt">// Root layout: fonts, ToastProvider, animated BG</span>
+├── <span class="ext-ts">page.tsx</span>            <span class="cmt">// Overview: StatsCard + SpeedupChart + BenchmarkTable</span>
+├── <span class="dir">compare/</span>            <span class="cmt">// Run comparison with delta analysis</span>
+├── <span class="dir">profiler/</span>           <span class="cmt">// NCU/NSys profile viewer</span>
+├── <span class="dir">memory/</span>             <span class="cmt">// Memory analysis & timeline</span>
+├── <span class="dir">multi-gpu/</span>          <span class="cmt">// Multi-GPU topology & communication</span>
+├── <span class="dir">history/</span>            <span class="cmt">// Historical trends & regression detection</span>
+├── <span class="dir">e2e/</span>                <span class="cmt">// End-to-end run status & stages</span>
+├── <span class="dir">tier1/</span>              <span class="cmt">// Core suite: geomean, target history</span>
+├── <span class="dir">system/</span>             <span class="cmt">// Software stack, clock lock, dependencies</span>
+├── <span class="dir">cluster/</span>            <span class="cmt">// Cluster eval, field report, canonical pkg</span>
+└── <span class="dir">contracts/</span>          <span class="cmt">// Benchmark contracts & YAML schema</span>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3>Shared Layout Pattern</h3>
+        <div class="code-block" style="font-size:.78rem;">
+<span class="cmt">// Every page uses DashboardShell</span>
+&lt;<span class="type">DashboardShell</span>
+  title=<span class="str">"Page Title"</span>
+  subtitle=<span class="str">"Description"</span>
+  onRefresh={handleRefresh}
+  actions={&lt;<span class="type">RefreshButton</span> /&gt;}
+  headerWidgets={&lt;<span class="type">Widgets</span> /&gt;}
+&gt;
+  {<span class="cmt">/* Page content */</span>}
+&lt;/<span class="type">DashboardShell</span>&gt;
+        </div>
+      </div>
+      <div class="card">
+        <h3>Root Layout</h3>
+        <div class="code-block" style="font-size:.78rem;">
+<span class="cmt">// layout.tsx: Global styling & providers</span>
+&lt;html className=<span class="str">"spaceGrotesk jetbrainsMono"</span>&gt;
+  &lt;body className=<span class="str">"bg-brand-bg text-white"</span>&gt;
+    <span class="cmt">{/* Animated gradient background */}</span>
+    &lt;div className=<span class="str">"radial-gradient"</span> /&gt;
+    &lt;div className=<span class="str">"grid.svg opacity-5"</span> /&gt;
+    &lt;<span class="type">ToastProvider</span>&gt;
+      {children}
+    &lt;/<span class="type">ToastProvider</span>&gt;
+  &lt;/body&gt;
+&lt;/html&gt;
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 11: Key Features ==================== -->
+<div class="slide" id="slide-10">
+  <div class="slide-inner">
+    <h2>Key Features</h2>
+    <p class="subtitle" style="margin-bottom:28px;">Production-grade dashboard with AI integration</p>
+
+    <div class="grid-2">
+      <div>
+        <div class="card" style="margin-bottom:16px;border-left:3px solid var(--accent);">
+          <h3>&#x26A1; Performance Monitoring</h3>
+          <ul style="font-size:.85rem;color:var(--text-dim);line-height:1.8;list-style:none;">
+            <li>&#x2713; Average / Max / Min speedup tracking</li>
+            <li>&#x2713; Per-chapter and per-benchmark breakdown</li>
+            <li>&#x2713; Historical trend analysis with regression detection</li>
+            <li>&#x2713; Success rate monitoring with trend indicators</li>
+          </ul>
+        </div>
+        <div class="card" style="margin-bottom:16px;border-left:3px solid var(--green);">
+          <h3>&#x1F4BB; GPU Telemetry</h3>
+          <ul style="font-size:.85rem;color:var(--text-dim);line-height:1.8;list-style:none;">
+            <li>&#x2713; Real-time SSE streaming (5s interval)</li>
+            <li>&#x2713; Memory, temperature, power, utilization</li>
+            <li>&#x2713; Clock lock verification</li>
+            <li>&#x2713; HBM temperature support</li>
+          </ul>
+        </div>
+      </div>
+      <div>
+        <div class="card" style="margin-bottom:16px;border-left:3px solid var(--cyan);">
+          <h3>&#x1F9E0; AI Integration</h3>
+          <ul style="font-size:.85rem;color:var(--text-dim);line-height:1.8;list-style:none;">
+            <li>&#x2713; MCP tool execution from UI</li>
+            <li>&#x2713; AI-powered performance analysis</li>
+            <li>&#x2713; Bottleneck detection & recommendations</li>
+            <li>&#x2713; LLM analysis with key findings</li>
+          </ul>
+        </div>
+        <div class="card" style="margin-bottom:16px;border-left:3px solid var(--orange);">
+          <h3>&#x1F3D7; Cluster Management</h3>
+          <ul style="font-size:.85rem;color:var(--text-dim);line-height:1.8;list-style:none;">
+            <li>&#x2713; Eval suite execution</li>
+            <li>&#x2713; Field report generation & validation</li>
+            <li>&#x2713; Canonical package building</li>
+            <li>&#x2713; Run promotion workflow</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 12: Data Flow ==================== -->
+<div class="slide" id="slide-11">
+  <div class="slide-inner">
+    <h2>Data Flow Pattern</h2>
+    <p class="subtitle" style="margin-bottom:32px;">Request lifecycle from UI to GPU and back</p>
+
+    <div style="display:flex;flex-direction:column;gap:20px;">
+      <div class="flow">
+        <div class="flow-node" style="background:rgba(99,102,241,.1);border-color:rgba(99,102,241,.3);">
+          <div class="flow-node-label">Step 1</div>
+          <div class="flow-node-name">User Action</div>
+        </div>
+        <div class="flow-arrow">&#x2192;</div>
+        <div class="flow-node">
+          <div class="flow-node-label">Step 2</div>
+          <div class="flow-node-name">React Hook</div>
+        </div>
+        <div class="flow-arrow">&#x2192;</div>
+        <div class="flow-node highlight">
+          <div class="flow-node-label">Step 3</div>
+          <div class="flow-node-name">fetchAPI()</div>
+        </div>
+        <div class="flow-arrow">&#x2192;</div>
+        <div class="flow-node">
+          <div class="flow-node-label">Step 4</div>
+          <div class="flow-node-name">FastAPI Router</div>
+        </div>
+        <div class="flow-arrow">&#x2192;</div>
+        <div class="flow-node">
+          <div class="flow-node-label">Step 5</div>
+          <div class="flow-node-name">Route Handler</div>
+        </div>
+        <div class="flow-arrow">&#x2192;</div>
+        <div class="flow-node" style="background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.3);">
+          <div class="flow-node-label">Step 6</div>
+          <div class="flow-node-name">Core Engine</div>
+        </div>
+      </div>
+
+      <div class="grid-3">
+        <div class="card">
+          <h3 style="color:var(--accent);">Envelope Pattern</h3>
+          <div class="code-block" style="font-size:.75rem;">
+{
+  <span class="str">"status"</span>: <span class="str">"ok"</span>,
+  <span class="str">"result"</span>: { <span class="cmt">/* data */</span> },
+  <span class="str">"duration_ms"</span>: <span class="num">42</span>,
+  <span class="str">"context"</span>: { ... }
+}
+          </div>
+        </div>
+        <div class="card">
+          <h3 style="color:var(--green);">Error Handling</h3>
+          <div class="code-block" style="font-size:.75rem;">
+<span class="kw">try</span>:
+    result = route.<span class="fn">handler</span>(params)
+<span class="kw">except</span> <span class="type">Exception</span> <span class="kw">as</span> exc:
+    result = {
+      <span class="str">"success"</span>: <span class="kw">False</span>,
+      <span class="str">"error"</span>: <span class="fn">str</span>(exc),
+      <span class="str">"error_type"</span>: <span class="fn">_type_name</span>(exc),
+    }
+          </div>
+        </div>
+        <div class="card">
+          <h3 style="color:var(--cyan);">Client Unwrap</h3>
+          <div class="code-block" style="font-size:.75rem;">
+<span class="kw">function</span> <span class="fn">unwrapEnvelope</span>&lt;T&gt;(payload) {
+  <span class="kw">if</span> (payload?.<span class="str">'result'</span>)
+    <span class="kw">return</span> payload.result <span class="kw">as</span> T;
+  <span class="kw">return</span> payload <span class="kw">as</span> T;
+}
+<span class="cmt">// SWR for caching</span>
+<span class="cmt">// APIError class</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 13: Summary ==================== -->
+<div class="slide" id="slide-12">
+  <div class="slide-inner" style="text-align:center;">
+    <h2 style="font-size:2.5rem;margin-bottom:16px;">Summary</h2>
+    <p class="subtitle" style="max-width:600px;margin:0 auto 40px;">
+      A production-grade, full-stack GPU performance monitoring dashboard with AI-powered insights.
+    </p>
+
+    <div class="grid-4" style="margin-bottom:40px;">
+      <div class="stat-card" style="text-align:center;">
+        <div class="stat-value" style="color:var(--accent);">2</div>
+        <div class="stat-sub">Stack Layers</div>
+        <div style="font-size:.7rem;color:var(--text-dim);">FastAPI + Next.js</div>
+      </div>
+      <div class="stat-card" style="text-align:center;">
+        <div class="stat-value" style="color:var(--green);">11</div>
+        <div class="stat-sub">Page Routes</div>
+        <div style="font-size:.7rem;color:var(--text-dim);">App Router</div>
+      </div>
+      <div class="stat-card" style="text-align:center;">
+        <div class="stat-value" style="color:var(--cyan);">12</div>
+        <div class="stat-sub">Components</div>
+        <div style="font-size:.7rem;color:var(--text-dim);">Reusable widgets</div>
+      </div>
+      <div class="stat-card" style="text-align:center;">
+        <div class="stat-value" style="color:var(--orange);">20+</div>
+        <div class="stat-sub">API Endpoints</div>
+        <div style="font-size:.7rem;color:var(--text-dim);">MCP-aligned</div>
+      </div>
+    </div>
+
+    <div style="display:flex;justify-content:center;gap:12px;flex-wrap:wrap;margin-bottom:40px;">
+      <span class="tag tag-accent">TypeScript 5.4</span>
+      <span class="tag tag-green">Python 3</span>
+      <span class="tag tag-cyan">React 18</span>
+      <span class="tag tag-yellow">Tailwind 3.4</span>
+      <span class="tag tag-pink">Recharts 2.12</span>
+      <span class="tag tag-orange">Uvicorn</span>
+    </div>
+
+    <div class="card" style="max-width:700px;margin:0 auto;text-align:left;">
+      <h3>Highlights</h3>
+      <ul style="font-size:.88rem;color:var(--text-dim);line-height:2;list-style:none;margin-top:12px;">
+        <li>&#x1F535; SSE real-time GPU streaming with auto-reconnect</li>
+        <li>&#x1F535; Dynamic API route registry with envelope response pattern</li>
+        <li>&#x1F535; Keyboard-driven navigation (1-9, 0, C shortcuts)</li>
+        <li>&#x1F535; Comprehensive 755-line TypeScript type system</li>
+        <li>&#x1F535; MCP tool integration for AI-powered analysis</li>
+        <li>&#x1F535; Cluster eval suite with field report validation</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== JavaScript ==================== -->
+<script>
+(function() {
+  const slides = document.querySelectorAll('.slide');
+  const navDots = document.getElementById('navDots');
+  const counter = document.getElementById('slideCounter');
+  let currentSlide = 0;
+
+  // Create nav dots
+  slides.forEach((_, i) => {
+    const dot = document.createElement('button');
+    dot.className = 'nav-dot';
+    dot.dataset.index = i;
+    dot.addEventListener('click', () => {
+      slides[i].scrollIntoView({ behavior: 'smooth' });
+    });
+    navDots.appendChild(dot);
+  });
+
+  // Intersection Observer for slide visibility
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('visible');
+        const index = Array.from(slides).indexOf(entry.target);
+        currentSlide = index;
+        updateNav(index);
+      }
+    });
+  }, { threshold: 0.3 });
+
+  slides.forEach(slide => observer.observe(slide));
+
+  function updateNav(index) {
+    document.querySelectorAll('.nav-dot').forEach((dot, i) => {
+      dot.classList.toggle('active', i === index);
+    });
+    counter.textContent = `${index + 1} / ${slides.length}`;
+  }
+
+  // Keyboard navigation
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowRight' || e.key === ' ') {
+      e.preventDefault();
+      const next = Math.min(currentSlide + 1, slides.length - 1);
+      slides[next].scrollIntoView({ behavior: 'smooth' });
+    } else if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+      e.preventDefault();
+      const prev = Math.max(currentSlide - 1, 0);
+      slides[prev].scrollIntoView({ behavior: 'smooth' });
+    }
+  });
+
+  // Initial state
+  updateNav(0);
+  slides[0].classList.add('visible');
+})();
+</script>
+
+</body>
+</html>

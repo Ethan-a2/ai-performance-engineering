@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Systems Performance - 文档可视化</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            overflow: hidden;
+            height: 100vh;
+        }
+        
+        .presentation {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 40px;
+            opacity: 0;
+            transform: translateX(100%);
+            transition: all 0.5s ease-in-out;
+            background: white;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+        
+        .slide.active {
+            opacity: 1;
+            transform: translateX(0);
+        }
+        
+        .slide.prev {
+            opacity: 0;
+            transform: translateX(-100%);
+        }
+        
+        h1 {
+            font-size: 2.5rem;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        h2 {
+            font-size: 1.8rem;
+            color: #34495e;
+            margin-bottom: 15px;
+        }
+        
+        h3 {
+            font-size: 1.4rem;
+            color: #7f8c8d;
+            margin-bottom: 10px;
+        }
+        
+        p, li {
+            font-size: 1.1rem;
+            line-height: 1.6;
+            margin-bottom: 10px;
+        }
+        
+        ul {
+            margin-left: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .content-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+            width: 100%;
+            max-width: 1200px;
+        }
+        
+        .card {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 25px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            border-left: 5px solid #3498db;
+        }
+        
+        .card h3 {
+            color: #2980b9;
+            margin-bottom: 15px;
+        }
+        
+        .architecture-diagram {
+            background: #ecf0f1;
+            border-radius: 10px;
+            padding: 20px;
+            font-family: monospace;
+            white-space: pre;
+            font-size: 0.9rem;
+            line-height: 1.4;
+            overflow-x: auto;
+            margin: 20px 0;
+            width: 100%;
+            max-width: 800px;
+        }
+        
+        .progress-bar {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            z-index: 100;
+        }
+        
+        .progress-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: rgba(255,255,255,0.5);
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .progress-dot.active {
+            background: #3498db;
+            transform: scale(1.2);
+        }
+        
+        .navigation {
+            position: fixed;
+            top: 50%;
+            transform: translateY(-50%);
+            background: rgba(0,0,0,0.2);
+            color: white;
+            border: none;
+            padding: 15px;
+            cursor: pointer;
+            font-size: 1.5rem;
+            z-index: 100;
+            border-radius: 5px;
+        }
+        
+        .nav-prev {
+            left: 20px;
+        }
+        
+        .nav-next {
+            right: 20px;
+        }
+        
+        .navigation:hover {
+            background: rgba(0,0,0,0.4);
+        }
+        
+        .title-slide {
+            text-align: center;
+        }
+        
+        .title-slide h1 {
+            font-size: 3rem;
+            margin-bottom: 30px;
+            color: #2c3e50;
+        }
+        
+        .title-slide p {
+            font-size: 1.3rem;
+            color: #7f8c8d;
+            max-width: 800px;
+        }
+        
+        .feature-list {
+            list-style: none;
+            margin-left: 0;
+        }
+        
+        .feature-list li {
+            padding: 8px 0;
+            border-bottom: 1px solid #eee;
+        }
+        
+        .feature-list li:before {
+            content: "✓";
+            color: #27ae60;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+            width: 100%;
+            max-width: 800px;
+            margin: 30px 0;
+        }
+        
+        .stat-item {
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+        
+        .stat-number {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #3498db;
+            margin-bottom: 5px;
+        }
+        
+        .stat-label {
+            font-size: 0.9rem;
+            color: #7f8c8d;
+        }
+        
+        .code-block {
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 20px;
+            border-radius: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            line-height: 1.5;
+            overflow-x: auto;
+            margin: 20px 0;
+            width: 100%;
+            max-width: 800px;
+        }
+        
+        .highlight {
+            color: #f39c12;
+            font-weight: bold;
+        }
+        
+        .table-container {
+            width: 100%;
+            max-width: 1000px;
+            overflow-x: auto;
+            margin: 20px 0;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        th, td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        
+        th {
+            background: #3498db;
+            color: white;
+            font-weight: 600;
+        }
+        
+        tr:nth-child(even) {
+            background: #f8f9fa;
+        }
+        
+        .emoji {
+            font-size: 1.2rem;
+            margin-right: 5px;
+        }
+        
+        @media (max-width: 768px) {
+            .content-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            
+            h1 {
+                font-size: 2rem;
+            }
+            
+            .slide {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="presentation">
+        <!-- 封面幻灯片 -->
+        <div class="slide title-slide active" id="slide-1">
+            <h1>AI Systems Performance</h1>
+            <h2>文档可视化概览</h2>
+            <p>探索AI系统性能工程的核心文档、架构和工具</p>
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <div class="stat-number">10</div>
+                    <div class="stat-label">核心领域</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number">264+</div>
+                    <div class="stat-label">基准测试</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number">20</div>
+                    <div class="stat-label">章节</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number">7.16x</div>
+                    <div class="stat-label">平均加速</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 目录幻灯片 -->
+        <div class="slide" id="slide-2">
+            <h1>目录</h1>
+            <div class="content-grid">
+                <div class="card">
+                    <h3>1. 项目概述</h3>
+                    <p>AI系统性能工程的整体架构和目标</p>
+                </div>
+                <div class="card">
+                    <h3>2. API架构</h3>
+                    <p>统一的10域API设计</p>
+                </div>
+                <div class="card">
+                    <h3>3. 基准测试框架</h3>
+                    <p>生产级基准测试执行系统</p>
+                </div>
+                <div class="card">
+                    <h3>4. 性能路线图</h3>
+                    <p>仓库演进计划和当前状态</p>
+                </div>
+                <div class="card">
+                    <h3>5. 测试方法论</h3>
+                    <p>三层基准测试方法</p>
+                </div>
+                <div class="card">
+                    <h3>6. MCP工具</h3>
+                    <p>AI助手集成工具</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 项目概述幻灯片 -->
+        <div class="slide" id="slide-3">
+            <h1>项目概述</h1>
+            <h2>AI系统性能工程</h2>
+            <div class="content-grid">
+                <div>
+                    <p>这是一个生产级的AI系统性能工程框架，提供：</p>
+                    <ul class="feature-list">
+                        <li>统一的性能分析和优化接口</li>
+                        <li>自动化基准测试发现和执行</li>
+                        <li>全面的性能验证和反模式检测</li>
+                        <li>历史趋势跟踪和回归检测</li>
+                        <li>多GPU和分布式系统支持</li>
+                    </ul>
+                </div>
+                <div class="architecture-diagram">
+┌─────────────────────────────────────────────┐
+│           AI Systems Performance           │
+├─────────────────────────────────────────────┤
+│   User Interfaces                         │
+│   ┌─────┐  ┌─────┐  ┌───────┐  ┌───────┐  │
+│   │ CLI │  │ MCP │  │Dashboard│ │Python API│
+│   └──┬──┘  └──┬──┘  └───┬───┘  └───┬───┘  │
+│      │        │         │         │       │
+│      └────────┴─────────┴─────────┘       │
+│                     │                     │
+│   ┌─────────────────▼─────────────────┐   │
+│   │     PerformanceEngine             │   │
+│   │     (core/engine.py)              │   │
+│   │   10 Domains:                     │   │
+│   │   gpu│system│profile│analyze│...  │   │
+│   └───────────────────────────────────┘   │
+└─────────────────────────────────────────────┘</div>
+            </div>
+        </div>
+        
+        <!-- API架构幻灯片 -->
+        <div class="slide" id="slide-4">
+            <h1>统一API架构</h1>
+            <h2>10个核心领域</h2>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>领域</th>
+                            <th>功能</th>
+                            <th>CLI命令</th>
+                            <th>MCP工具</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><span class="emoji">🖥️</span>GPU</td>
+                            <td>硬件信息、拓扑、电源管理</td>
+                            <td>aisp gpu info</td>
+                            <td>gpu_info</td>
+                        </tr>
+                        <tr>
+                            <td><span class="emoji">⚙️</span>System</td>
+                            <td>系统级性能指标</td>
+                            <td>aisp system status</td>
+                            <td>system_status</td>
+                        </tr>
+                        <tr>
+                            <td><span class="emoji">📊</span>Profile</td>
+                            <td>性能分析集成</td>
+                            <td>aisp profile nsys</td>
+                            <td>profile_nsys</td>
+                        </tr>
+                        <tr>
+                            <td><span class="emoji">🔍</span>Analyze</td>
+                            <td>瓶颈识别和分析</td>
+                            <td>aisp analyze bottlenecks</td>
+                            <td>analyze_bottlenecks</td>
+                        </tr>
+                        <tr>
+                            <td><span class="emoji">🚀</span>Optimize</td>
+                            <td>优化建议和推荐</td>
+                            <td>aisp optimize recommend</td>
+                            <td>optimize</td>
+                        </tr>
+                        <tr>
+                            <td><span class="emoji">🤖</span>AI</td>
+                            <td>AI驱动的性能分析</td>
+                            <td>aisp ai ask</td>
+                            <td>ask</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <!-- 基准测试框架幻灯片 -->
+        <div class="slide" id="slide-5">
+            <h1>基准测试框架</h1>
+            <h2>生产级基准测试执行系统</h2>
+            <div class="content-grid">
+                <div class="card">
+                    <h3>核心特性</h3>
+                    <ul class="feature-list">
+                        <li>自动发现264+基准测试对</li>
+                        <li>子进程隔离执行</li>
+                        <li>超时保护和错误恢复</li>
+                        <li>CUDA事件精确计时</li>
+                        <li>统计分析（均值、中位数、百分位数）</li>
+                        <li>内存跟踪和性能分析集成</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>执行模式</h3>
+                    <ul>
+                        <li><strong>子进程模式</strong>（默认）：真正的隔离执行</li>
+                        <li><strong>线程模式</strong>：快速原型开发</li>
+                        <li><strong>Torchrun模式</strong>：多GPU分布式</li>
+                    </ul>
+                    <div class="code-block">
+# 运行所有基准测试
+python -m cli.aisp bench run
+
+# 运行特定目标
+python -m cli.aisp bench run --targets ch10:atomic_reduction
+
+# 运行Tier-1套件
+python -m cli.aisp bench run-tier1</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 性能路线图幻灯片 -->
+        <div class="slide" id="slide-6">
+            <h1>性能仓库路线图</h1>
+            <h2>演进计划和当前状态</h2>
+            <div class="content-grid">
+                <div class="card">
+                    <h3>成功标准</h3>
+                    <ul class="feature-list">
+                        <li>规范基准测试套件</li>
+                        <li>历史证据跟踪</li>
+                        <li>反模式强制执行</li>
+                        <li>共享基础设施</li>
+                        <li>证据优先文档</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>当前状态</h3>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>阶段</th>
+                                    <th>状态</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>Tier-1规范套件</td>
+                                    <td><span style="color: #27ae60;">✅ 已实现</span></td>
+                                </tr>
+                                <tr>
+                                    <td>历史趋势跟踪</td>
+                                    <td><span style="color: #27ae60;">✅ 已实现</span></td>
+                                </tr>
+                                <tr>
+                                    <td>反模式检查</td>
+                                    <td><span style="color: #f39c12;">🔄 进行中</span></td>
+                                </tr>
+                                <tr>
+                                    <td>共享基准基础</td>
+                                    <td><span style="color: #f39c12;">🔄 进行中</span></td>
+                                </tr>
+                                <tr>
+                                    <td>证据优先文档</td>
+                                    <td><span style="color: #f39c12;">🔄 进行中</span></td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 基准测试方法论幻灯片 -->
+        <div class="slide" id="slide-7">
+            <h1>基准测试方法论</h1>
+            <h2>三层基准测试方法</h2>
+            <div class="content-grid">
+                <div class="card">
+                    <h3>1. 微基准测试</h3>
+                    <p>隔离子系统限制和回归</p>
+                    <ul>
+                        <li>计算、通信、存储分析</li>
+                        <li>内核级性能分析</li>
+                        <li>硬件限制识别</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>2. 组件基准测试</h3>
+                    <p>测量服务、数据加载器、调度器路径</p>
+                    <ul>
+                        <li>固定工作负载语义</li>
+                        <li>子系统回归识别</li>
+                        <li>用户可见路径分析</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>3. 端到端基准测试</h3>
+                    <p>在理解下层后验证现实工作流</p>
+                    <ul>
+                        <li>实际用户体验测量</li>
+                        <li>完整系统交互</li>
+                        <li>队列和调度影响</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="code-block">
+<span class="highlight">工作负载冻结规则</span>：在比较任何内容之前，冻结工作负载定义：
+- 相同模型
+- 相同序列长度组合
+- 相同精度
+- 相同批处理策略
+- 相同数据集或提示语料库</div>
+        </div>
+        
+        <!-- MCP工具幻灯片 -->
+        <div class="slide" id="slide-8">
+            <h1>MCP工具</h1>
+            <h2>AI助手集成工具</h2>
+            <div class="content-grid">
+                <div class="card">
+                    <h3>核心工具</h3>
+                    <ul>
+                        <li><strong>gpu_info</strong>：获取GPU硬件信息</li>
+                        <li><strong>analyze_bottlenecks</strong>：识别性能问题</li>
+                        <li><strong>optimize</strong>：运行快速LLM基准测试变体</li>
+                        <li><strong>benchmark_explore</strong>：复制基线基准测试，运行变体</li>
+                        <li><strong>recommend</strong>：获取优化建议</li>
+                        <li><strong>ask</strong>：询问性能问题</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>工作流程</h3>
+                    <div class="code-block">
+# 深度比较基线 vs 优化
+{
+  "targets": ["ch10:atomic_reduction"],
+  "output_dir": "artifacts/runs",
+  "async": true
+}
+
+# 标准基准测试运行
+{
+  "targets": ["ch10:atomic_reduction"]
+}</div>
+                    <p><strong>安全说明</strong>：MCP服务器通过stdio使用JSON-RPC，用于本地使用（编辑器集成、本地自动化、CI）。</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 验证系统幻灯片 -->
+        <div class="slide" id="slide-9">
+            <h1>验证系统</h1>
+            <h2>95个有效性问题保护</h2>
+            <div class="content-grid">
+                <div class="card">
+                    <h3>关键保护</h3>
+                    <ul class="feature-list">
+                        <li>计时保护（流同步、事件计时）</li>
+                        <li>输出验证（常量输出、陈旧缓存）</li>
+                        <li>工作负载完整性（精度不匹配、隐藏降采样）</li>
+                        <li>位置验证（CPU溢出、设置预计算）</li>
+                        <li>内存跟踪（预分配输出、输入输出别名）</li>
+                        <li>CUDA保护（异步Memcpy、工作区预计算）</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>真实世界事件</h3>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>年份</th>
+                                    <th>事件</th>
+                                    <th>问题类型</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>2025</td>
+                                    <td>Locus/KernelBench流漏洞</td>
+                                    <td>未同步流</td>
+                                </tr>
+                                <tr>
+                                    <td>2025</td>
+                                    <td>AI基准测试科学严谨性</td>
+                                    <td>指标定义游戏</td>
+                                </tr>
+                                <tr>
+                                    <td>2025</td>
+                                    <td>MMLU基准测试错误</td>
+                                    <td>无效基本事实</td>
+                                </tr>
+                                <tr>
+                                    <td>2024</td>
+                                    <td>AI代理基准测试捷径</td>
+                                    <td>缺失保留集</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 总结幻灯片 -->
+        <div class="slide" id="slide-10">
+            <h1>总结</h1>
+            <h2>AI系统性能工程的核心价值</h2>
+            <div class="content-grid">
+                <div class="card">
+                    <h3>关键成就</h3>
+                    <ul class="feature-list">
+                        <li>统一的10域API架构</li>
+                        <li>生产级基准测试框架</li>
+                        <li>全面的验证系统（95个有效性问题）</li>
+                        <li>历史趋势跟踪和回归检测</li>
+                        <li>多接口支持（CLI、MCP、Dashboard、Python API）</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>下一步</h3>
+                    <ul>
+                        <li>完成反模式检查实现</li>
+                        <li>扩展共享基准基础设施</li>
+                        <li>增强证据优先文档</li>
+                        <li>优化多GPU和分布式支持</li>
+                        <li>集成更多AI驱动分析</li>
+                    </ul>
+                </div>
+            </div>
+            <div style="margin-top: 40px; text-align: center;">
+                <p style="font-size: 1.2rem; color: #7f8c8d;">
+                    探索更多：<code>python -m cli.aisp --help</code>
+                </p>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 导航按钮 -->
+    <button class="navigation nav-prev" onclick="prevSlide()">❮</button>
+    <button class="navigation nav-next" onclick="nextSlide()">❯</button>
+    
+    <!-- 进度条 -->
+    <div class="progress-bar" id="progressBar"></div>
+    
+    <script>
+        let currentSlide = 1;
+        const totalSlides = 10;
+        
+        function showSlide(n) {
+            // 隐藏所有幻灯片
+            document.querySelectorAll('.slide').forEach(slide => {
+                slide.classList.remove('active', 'prev');
+            });
+            
+            // 显示当前幻灯片
+            const current = document.getElementById(`slide-${n}`);
+            current.classList.add('active');
+            
+            // 更新进度条
+            updateProgressBar();
+        }
+        
+        function nextSlide() {
+            if (currentSlide < totalSlides) {
+                currentSlide++;
+                showSlide(currentSlide);
+            }
+        }
+        
+        function prevSlide() {
+            if (currentSlide > 1) {
+                currentSlide--;
+                showSlide(currentSlide);
+            }
+        }
+        
+        function updateProgressBar() {
+            const progressBar = document.getElementById('progressBar');
+            progressBar.innerHTML = '';
+            
+            for (let i = 1; i <= totalSlides; i++) {
+                const dot = document.createElement('div');
+                dot.className = `progress-dot ${i === currentSlide ? 'active' : ''}`;
+                dot.onclick = () => {
+                    currentSlide = i;
+                    showSlide(currentSlide);
+                };
+                progressBar.appendChild(dot);
+            }
+        }
+        
+        // 键盘导航
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') {
+                nextSlide();
+            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+                prevSlide();
+            }
+        });
+        
+        // 触摸滑动支持
+        let touchStartX = 0;
+        let touchEndX = 0;
+        
+        document.addEventListener('touchstart', (e) => {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+        
+        document.addEventListener('touchend', (e) => {
+            touchEndX = e.changedTouches[0].screenX;
+            handleSwipe();
+        });
+        
+        function handleSwipe() {
+            const swipeThreshold = 50;
+            const diff = touchStartX - touchEndX;
+            
+            if (Math.abs(diff) > swipeThreshold) {
+                if (diff > 0) {
+                    nextSlide();
+                } else {
+                    prevSlide();
+                }
+            }
+        }
+        
+        // 初始化
+        updateProgressBar();
+    </script>
+</body>
+</html>
