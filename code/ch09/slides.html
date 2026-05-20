@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch09 - Arithmetic Intensity & Kernel Fusion</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --text: #c9d1d9;
+    --dim: #8b949e;
+    --border: #30363d;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,-apple-system,sans-serif; overflow:hidden; }
+
+  /* Slide container */
+  .deck { position:relative; width:100vw; height:100vh; }
+  .slide {
+    position:absolute; inset:0;
+    display:flex; flex-direction:column; justify-content:center; align-items:center;
+    padding:60px 80px;
+    opacity:0; pointer-events:none;
+    transition: opacity .45s ease, transform .45s ease;
+    transform: translateX(40px);
+  }
+  .slide.active { opacity:1; pointer-events:auto; transform:translateX(0); }
+  .slide.prev   { opacity:0; transform:translateX(-40px); }
+
+  /* Typography */
+  h1 { font-size:2.8rem; font-weight:700; color:#fff; margin-bottom:12px; text-align:center; line-height:1.15; }
+  h2 { font-size:2rem; font-weight:600; color:var(--accent); margin-bottom:24px; text-align:center; }
+  h3 { font-size:1.35rem; font-weight:600; color:var(--purple); margin-bottom:12px; }
+  p, li { font-size:1.15rem; line-height:1.65; color:var(--text); }
+  .subtitle { font-size:1.25rem; color:var(--dim); margin-bottom:32px; text-align:center; }
+  .big-number { font-size:4.5rem; font-weight:800; color:var(--green); line-height:1; }
+  .label { font-size:.95rem; color:var(--dim); text-transform:uppercase; letter-spacing:1.5px; margin-top:6px; }
+
+  /* Layout helpers */
+  .center { text-align:center; }
+  .cols { display:flex; gap:36px; width:100%; max-width:1200px; }
+  .col  { flex:1; }
+  .card {
+    background:var(--card); border:1px solid var(--border); border-radius:12px;
+    padding:28px 28px; margin-bottom:16px;
+  }
+  .card h3 { margin-bottom:10px; }
+
+  /* Data table */
+  table { width:100%; border-collapse:collapse; font-size:1.05rem; }
+  th { text-align:left; color:var(--accent); border-bottom:2px solid var(--border); padding:10px 14px; font-weight:600; }
+  td { padding:10px 14px; border-bottom:1px solid var(--border); }
+  tr:last-child td { border-bottom:none; }
+  .val-good  { color:var(--green); font-weight:600; }
+  .val-warn  { color:var(--orange); font-weight:600; }
+  .val-bad   { color:var(--red); font-weight:600; }
+
+  /* Bar chart */
+  .bar-group { margin:14px 0; }
+  .bar-label { font-size:.9rem; color:var(--dim); margin-bottom:4px; }
+  .bar-track { height:28px; background:#21262d; border-radius:6px; overflow:hidden; position:relative; }
+  .bar-fill {
+    height:100%; border-radius:6px;
+    display:flex; align-items:center; padding-left:12px;
+    font-size:.85rem; font-weight:600; color:#fff;
+    transition: width 1.2s cubic-bezier(.22,1,.36,1);
+    width:0;
+  }
+  .slide.active .bar-fill { /* width set inline */ }
+
+  /* Roofline canvas */
+  #roofline-canvas { width:100%; max-width:700px; aspect-ratio:16/9; }
+
+  /* Code block */
+  .code-block {
+    background:#0d1117; border:1px solid var(--border); border-radius:10px;
+    padding:20px 24px; font-family:'Cascadia Code','Fira Code',monospace;
+    font-size:.92rem; line-height:1.6; overflow-x:auto; white-space:pre;
+    color:var(--text); width:100%; max-width:750px;
+  }
+  .kw  { color:#ff7b72; }
+  .fn  { color:#d2a8ff; }
+  .str { color:#a5d6ff; }
+  .cm  { color:#8b949e; font-style:italic; }
+  .num { color:#79c0ff; }
+  .type{ color:#ffa657; }
+
+  /* Progress bar */
+  .progress { position:fixed; bottom:0; left:0; height:4px; background:var(--accent); transition:width .4s ease; z-index:100; }
+
+  /* Nav hint */
+  .nav-hint {
+    position:fixed; bottom:18px; right:28px; font-size:.8rem; color:var(--dim);
+    opacity:.6; z-index:100;
+  }
+
+  /* Animated dots bg */
+  .dots { position:absolute; inset:0; overflow:hidden; z-index:-1; }
+  .dots span {
+    position:absolute; width:3px; height:3px; background:var(--accent); border-radius:50%;
+    opacity:.12; animation: float 18s infinite ease-in-out;
+  }
+  @keyframes float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-30px)} }
+
+  /* Fusion diagram */
+  .fusion-flow { display:flex; align-items:center; gap:12px; justify-content:center; flex-wrap:wrap; margin:18px 0; }
+  .fusion-box {
+    background:var(--card); border:2px solid var(--border); border-radius:10px;
+    padding:14px 20px; text-align:center; min-width:130px;
+    transition: border-color .3s, box-shadow .3s;
+  }
+  .fusion-box.highlight { border-color:var(--green); box-shadow:0 0 18px rgba(63,185,80,.25); }
+  .fusion-arrow { font-size:1.6rem; color:var(--dim); }
+
+  /* Metric cards row */
+  .metric-row { display:flex; gap:24px; margin:20px 0; flex-wrap:wrap; justify-content:center; }
+  .metric-card {
+    background:var(--card); border:1px solid var(--border); border-radius:12px;
+    padding:22px 28px; text-align:center; min-width:170px;
+  }
+  .metric-card .big-number { font-size:3rem; }
+
+  /* Kernel pipeline */
+  .pipeline { display:flex; gap:0; align-items:stretch; width:100%; max-width:900px; margin:16px 0; }
+  .pipe-stage {
+    flex:1; padding:16px; text-align:center; border:1px solid var(--border);
+    font-size:.95rem; font-weight:600; position:relative;
+  }
+  .pipe-stage:first-child { border-radius:10px 0 0 10px; }
+  .pipe-stage:last-child  { border-radius:0 10px 10px 0; }
+  .pipe-stage .pipe-sub { font-size:.78rem; font-weight:400; color:var(--dim); margin-top:4px; }
+
+  /* List */
+  ul { list-style:none; padding:0; }
+  ul li { padding:6px 0; padding-left:22px; position:relative; }
+  ul li::before { content:'▸'; position:absolute; left:0; color:var(--accent); }
+
+  /* Animations */
+  .fade-in { animation: fadeIn .6s ease both; }
+  @keyframes fadeIn { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:none} }
+  .delay-1 { animation-delay:.15s; }
+  .delay-2 { animation-delay:.3s; }
+  .delay-3 { animation-delay:.45s; }
+  .delay-4 { animation-delay:.6s; }
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+
+<!-- ============ SLIDE 0: Title ============ -->
+<div class="slide active" data-slide="0">
+  <div class="dots">
+    <span style="left:10%;top:20%;animation-delay:0s"></span>
+    <span style="left:30%;top:60%;animation-delay:2s"></span>
+    <span style="left:55%;top:35%;animation-delay:4s"></span>
+    <span style="left:75%;top:75%;animation-delay:1s"></span>
+    <span style="left:90%;top:15%;animation-delay:3s"></span>
+    <span style="left:45%;top:85%;animation-delay:5s"></span>
+  </div>
+  <h1 class="fade-in">Chapter 9</h1>
+  <h2 class="fade-in delay-1">Arithmetic Intensity & Kernel Fusion</h2>
+  <p class="subtitle fade-in delay-2">Moving workloads along the roofline with tiling, fusion, and CUTLASS/Triton on Blackwell</p>
+  <div class="metric-row fade-in delay-3">
+    <div class="metric-card">
+      <div class="big-number">80</div>
+      <div class="label">Source Files</div>
+    </div>
+    <div class="metric-card">
+      <div class="big-number">12</div>
+      <div class="label">Benchmark Pairs</div>
+    </div>
+    <div class="metric-card">
+      <div class="big-number">6</div>
+      <div class="label">Precision Modes</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 1: Problem ============ -->
+<div class="slide" data-slide="1">
+  <h2>The Problem</h2>
+  <p class="subtitle" style="max-width:800px">"The useful question is not <em>is this compute-bound or memory-bound?</em> but <em>which arithmetic-intensity and fusion changes create a measurable gain?</em>"</p>
+  <div class="cols" style="max-width:1000px">
+    <div class="col">
+      <div class="card">
+        <h3 style="color:var(--red)">Baseline Path</h3>
+        <ul>
+          <li>Lower-intensity or less-fused kernels</li>
+          <li>More time moving data than doing math</li>
+          <li>Easy to inspect, but far from hardware roofline</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3 style="color:var(--green)">Optimized Path</h3>
+        <ul>
+          <li>CUTLASS / Triton / custom kernels with better tiling</li>
+          <li>Fused schedules that reduce redundant memory work</li>
+          <li>Same benchmark contract — gains are reproducible</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 2: Roofline Concept ============ -->
+<div class="slide" data-slide="2">
+  <h2>Roofline Model</h2>
+  <canvas id="roofline-canvas"></canvas>
+  <p class="subtitle" style="margin-top:16px;font-size:1rem">Arithmetic Intensity (FLOP/byte) vs Throughput (FLOP/s)</p>
+</div>
+
+<!-- ============ SLIDE 3: Measured Results ============ -->
+<div class="slide" data-slide="3">
+  <h2>Measured Speedups</h2>
+  <table style="max-width:850px">
+    <thead>
+      <tr><th>Target</th><th>Baseline</th><th>Optimized</th><th>Speedup</th><th>What Changed</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>cutlass_gemm</code></td>
+        <td>0.178 ms</td>
+        <td>0.045 ms</td>
+        <td class="val-good">3.95×</td>
+        <td>Better GEMM schedule & kernel</td>
+      </tr>
+      <tr>
+        <td><code>memory_bound</code></td>
+        <td>3.491 ms</td>
+        <td>0.205 ms</td>
+        <td class="val-good">17.05×</td>
+        <td>Less wasted memory movement</td>
+      </tr>
+      <tr>
+        <td><code>sdpa_attention</code></td>
+        <td>0.762 ms</td>
+        <td>0.446 ms</td>
+        <td class="val-good">1.71×</td>
+        <td>Improved compute/memory balance</td>
+      </tr>
+    </tbody>
+  </table>
+  <div style="margin-top:24px; max-width:850px; width:100%">
+    <div class="bar-group">
+      <div class="bar-label">cutlass_gemm — 3.95× faster</div>
+      <div class="bar-track"><div class="bar-fill" style="width:75%;background:linear-gradient(90deg,var(--green),var(--accent))">3.95×</div></div>
+    </div>
+    <div class="bar-group">
+      <div class="bar-label">memory_bound — 17.05× faster</div>
+      <div class="bar-track"><div class="bar-fill" style="width:98%;background:linear-gradient(90deg,var(--green),var(--purple))">17.05×</div></div>
+    </div>
+    <div class="bar-group">
+      <div class="bar-label">sdpa_attention — 1.71× faster</div>
+      <div class="bar-track"><div class="bar-fill" style="width:40%;background:linear-gradient(90deg,var(--orange),var(--accent))">1.71×</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 4: Benchmark Pairs ============ -->
+<div class="slide" data-slide="4">
+  <h2>Benchmark Pairs (12 total)</h2>
+  <div class="cols" style="max-width:1100px">
+    <div class="col">
+      <div class="card">
+        <h3>Compute Path</h3>
+        <table>
+          <tr><td><code>compute_bound</code></td><td class="val-warn">Roofline ceiling</td></tr>
+          <tr><td><code>cutlass_gemm</code></td><td class="val-good">FP16 GEMM</td></tr>
+          <tr><td><code>cutlass_gemm_fp8</code></td><td class="val-good">FP8 GEMM</td></tr>
+          <tr><td><code>cutlass_gemm_fp4</code></td><td class="val-good">FP4 GEMM</td></tr>
+          <tr><td><code>cublaslt_gemm</code></td><td class="val-good">cuBLASLt FP32</td></tr>
+          <tr><td><code>cublaslt_gemm_fp16</code></td><td class="val-good">cuBLASLt FP16</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Memory / Fusion Path</h3>
+        <table>
+          <tr><td><code>memory_bound</code></td><td class="val-warn">Bandwidth ceiling</td></tr>
+          <tr><td><code>fused_l2norm</code></td><td class="val-good">L2 norm fusion</td></tr>
+          <tr><td><code>sdpa_attention</code></td><td class="val-good">FlashAttention</td></tr>
+          <tr><td><code>micro_tiling_matmul</code></td><td class="val-good">Register tiling</td></tr>
+          <tr><td><code>triton</code></td><td class="val-good">Triton elementwise</td></tr>
+          <tr><td><code>tcgen05_tma_pipeline</code></td><td class="val-good">TMA pipeline</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 5: Precision Ladder ============ -->
+<div class="slide" data-slide="5">
+  <h2>The Precision Ladder</h2>
+  <p class="subtitle">From FP32 → FP16 → FP8 → FP4 → NVFP4 (with CUTLASS + cuBLASLt)</p>
+  <div class="pipeline">
+    <div class="pipe-stage" style="background:#1a1e2e;border-color:var(--dim)">
+      <div style="font-size:1.8rem">FP32</div>
+      <div class="pipe-sub">32 bit / elem<br>Baseline</div>
+    </div>
+    <div class="pipe-stage" style="background:#1a2233;border-color:var(--accent)">
+      <div style="font-size:1.8rem">FP16</div>
+      <div class="pipe-sub">16 bit / elem<br>2× bandwidth</div>
+    </div>
+    <div class="pipe-stage" style="background:#162230;border-color:var(--green)">
+      <div style="font-size:1.8rem">FP8</div>
+      <div class="pipe-sub">8 bit / elem<br>4× bandwidth</div>
+    </div>
+    <div class="pipe-stage" style="background:#142028;border-color:var(--purple)">
+      <div style="font-size:1.8rem">FP4</div>
+      <div class="pipe-sub">4 bit / elem<br>8× bandwidth</div>
+    </div>
+    <div class="pipe-stage" style="background:#1c1830;border-color:var(--orange)">
+      <div style="font-size:1.8rem">NVFP4</div>
+      <div class="pipe-sub">Block-scaled<br>CUTLASS native</div>
+    </div>
+  </div>
+  <div class="cols" style="max-width:1000px;margin-top:24px">
+    <div class="col">
+      <div class="card">
+        <h3>CUTLASS Path</h3>
+        <p>Template metaprogramming with CuTe DSL, per-channel quantization, block-scaled FP4 with all concepts</p>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>cuBLASLt Path</h3>
+        <p>Native heuristic dispatch, capability-gated NVFP4, clean skip when driver lacks support</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 6: Kernel Fusion ============ -->
+<div class="slide" data-slide="6">
+  <h2>Kernel Fusion: L2 Norm Example</h2>
+  <p class="subtitle">Fuse reduction-heavy kernels to eliminate redundant memory trips</p>
+
+  <h3 style="text-align:center;margin-top:12px;color:var(--red)">Before: 3 separate kernels</h3>
+  <div class="fusion-flow">
+    <div class="fusion-box">
+      <div style="font-size:1.3rem">x²</div>
+      <div class="pipe-sub">Square<br><span style="color:var(--red)">Read x → HBM</span></div>
+    </div>
+    <div class="fusion-arrow">→</div>
+    <div class="fusion-box">
+      <div style="font-size:1.3rem">Σx²</div>
+      <div class="pipe-sub">Sum<br><span style="color:var(--red)">R/W intermediate</span></div>
+    </div>
+    <div class="fusion-arrow">→</div>
+    <div class="fusion-box">
+      <div style="font-size:1.3rem">x/‖x‖</div>
+      <div class="pipe-sub">Normalize<br><span style="color:var(--red)">Read x again</span></div>
+    </div>
+  </div>
+
+  <h3 style="text-align:center;margin-top:28px;color:var(--green)">After: 1 fused kernel</h3>
+  <div class="fusion-flow">
+    <div class="fusion-box highlight" style="min-width:360px">
+      <div style="font-size:1.5rem">x² → Σ → x/‖x‖</div>
+      <div class="pipe-sub">All in one kernel — registers hold intermediate values<br><span style="color:var(--green)">Single HBM read + write</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 7: SDPA Attention ============ -->
+<div class="slide" data-slide="7">
+  <h2>Attention Fusion: SDPA</h2>
+  <p class="subtitle">3 kernels → 1 fused FlashAttention-style kernel</p>
+  <div class="cols" style="max-width:1100px">
+    <div class="col">
+      <div class="card">
+        <h3 style="color:var(--red)">Baseline: 3 Kernels</h3>
+        <div class="code-block"><span class="cm"># Kernel 1: Q @ K^T → HBM</span>
+attn_scores = matmul(Q, K.transpose())
+<span class="cm"># Scale</span>
+attn_scores = attn_scores * scale
+<span class="cm"># Kernel 2: softmax → HBM</span>
+attn_weights = softmax(attn_scores)
+<span class="cm"># Kernel 3: attn @ V → HBM</span>
+output = matmul(attn_weights, V)</div>
+        <p style="margin-top:12px;font-size:.95rem;color:var(--dim)">2 HBM round-trips for intermediate tensors (S×S matrix)</p>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3 style="color:var(--green)">Optimized: Fused</h3>
+        <div class="code-block"><span class="cm"># Single fused kernel</span>
+<span class="cm"># Q, K, V loaded once from HBM</span>
+<span class="cm"># Tiling: compute Q@K^T in SRAM</span>
+<span class="cm"># Online softmax (no full materialization)</span>
+<span class="cm"># Accumulate attn@V incrementally</span>
+<span class="cm"># Single write-back to HBM</span>
+output = <span class="fn">flash_attention</span>(Q, K, V)</div>
+        <p style="margin-top:12px;font-size:.95rem;color:var(--dim)">S×S attention matrix never leaves SRAM — 1.71× speedup</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 8: Micro-Tiling ============ -->
+<div class="slide" data-slide="8">
+  <h2>Micro-Tiling & Register Blocking</h2>
+  <p class="subtitle">Balancing register pressure with data reuse for tensor cores</p>
+  <div class="cols" style="max-width:1000px">
+    <div class="col">
+      <div class="card">
+        <h3>Key Techniques</h3>
+        <ul>
+          <li>Explicit register blocking (TM × TN tiles)</li>
+          <li><code>cp.async</code> prefetch from global → shared</li>
+          <li>Double-buffered shared memory</li>
+          <li>Warp-level MMA with <code>wmma</code> / <code>mma.sync</code></li>
+          <li>Occupancy tuning (registers vs threads)</li>
+        </ul>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>tcgen05 Pipeline</h3>
+        <ul>
+          <li>Blackwell tensor-core generation 05</li>
+          <li>TMA (Tensor Memory Accelerator) loads</li>
+          <li>Producer/consumer async pipeline</li>
+          <li>Staged loads with inline PTX hooks</li>
+          <li>Architecture-gated intrinsics</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div style="margin-top:20px">
+    <div class="code-block" style="max-width:750px;font-size:.85rem"><span class="cm">// Micro-tiling: each thread computes a TM×TN sub-tile</span>
+<span class="cm">// Shared memory holds BK×BN tile of B (prefetched via cp.async)</span>
+<span class="cm">// Register file holds BM×BK tile of A (thread-local)</span>
+<span class="cm">// Accumulator: TM×TN registers, fused across K iterations</span>
+<span class="kw">for</span> (<span class="type">int</span> k = <span class="num">0</span>; k < K; k += BK) {
+    <span class="fn">cp_async</span>(smem_B, &B[...]);  <span class="cm">// prefetch next B tile</span>
+    <span class="fn">mma_sync</span>(acc, reg_A, smem_B); <span class="cm">// tensor core MMA</span>
+}</div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 9: Triton ============ -->
+<div class="slide" data-slide="9">
+  <h2>Triton: Rapid Prototyping</h2>
+  <p class="subtitle">Python-level kernel authoring with compiler-generated PTX on Blackwell</p>
+  <div class="cols" style="max-width:1000px">
+    <div class="col">
+      <div class="card">
+        <h3>Baseline (PyTorch)</h3>
+        <div class="code-block" style="font-size:.85rem"><span class="cm"># Standard PyTorch elementwise</span>
+<span class="kw">def</span> <span class="fn">baseline_elementwise</span>(x, out):
+    out.copy_(x * <span class="num">2.0</span> + <span class="num">1.0</span>)</div>
+        <p style="margin-top:10px;font-size:.9rem;color:var(--dim)">Launches 2 kernels (mul + add), reads/writes HBM twice</p>
+      </div>
+    </div>
+    <div class="col">
+      <div class="card">
+        <h3>Optimized (Triton)</h3>
+        <div class="code-block" style="font-size:.85rem"><span class="cm"># Single Triton kernel</span>
+<span class="kw">@triton.jit</span>
+<span class="kw">def</span> <span class="fn">fused_elementwise</span>(X, OUT, N):
+    pid = tl.program_id(<span class="num">0</span>)
+    offs = pid * BLOCK + tl.arange(<span class="num">0</span>, BLOCK)
+    x = tl.load(X + offs)
+    tl.store(OUT + offs, x * <span class="num">2.0</span> + <span class="num">1.0</span>)</div>
+        <p style="margin-top:10px;font-size:.9rem;color:var(--dim)">1 kernel, 1 HBM read + write, vectorized loads</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 10: Architecture ============ -->
+<div class="slide" data-slide="10">
+  <h2>Directory Architecture</h2>
+  <div style="max-width:900px;width:100%">
+    <div class="code-block" style="font-size:.82rem;line-height:1.5">ch09/
+├── <span class="fn">baseline_compute_bound.py</span>     <span class="cm"># Roofline compute ceiling</span>
+├── <span class="fn">optimized_compute_bound.py</span>    <span class="cm"># Tuned compute path</span>
+├── <span class="fn">baseline_memory_bound.py</span>      <span class="cm"># Roofline bandwidth ceiling</span>
+├── <span class="fn">optimized_memory_bound.py</span>     <span class="cm"># Fused memory path</span>
+│
+├── <span class="fn">baseline_cutlass_gemm*.cu/.py</span> <span class="cm"># CUTLASS FP16/FP8/FP4/NVFP4</span>
+├── <span class="fn">optimized_cutlass_gemm*.cu/.py</span>
+├── <span class="fn">baseline_cublaslt_gemm*.cu/.py</span> <span class="cm"># cuBLASLt FP32/FP16/FP8/FP4</span>
+├── <span class="fn">optimized_cublaslt_gemm*.cu/.py</span>
+│
+├── <span class="fn">baseline_fused_l2norm.cu/.py</span>  <span class="cm"># L2 norm fusion</span>
+├── <span class="fn">optimized_fused_l2norm.cu/.py</span>
+├── <span class="fn">baseline_sdpa_attention.py</span>    <span class="cm"># Attention fusion</span>
+├── <span class="fn">optimized_sdpa_attention.py</span>
+│
+├── <span class="fn">baseline_triton.py</span>            <span class="cm"># Triton prototyping</span>
+├── <span class="fn">baseline_micro_tiling*.cu/.py</span>  <span class="cm"># Register tiling</span>
+├── <span class="fn">baseline_tcgen05_tma_pipeline.py</span> <span class="cm"># Blackwell TMA</span>
+├── <span class="fn">inline_ptx_example.cu</span>         <span class="cm"># Inline PTX demo</span>
+├── <span class="fn">compare.py</span>                    <span class="cm"># Harness entry</span>
+└── <span class="fn">expectations_*.json</span>           <span class="cm"># Regression thresholds</span></div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 11: Learning Goals ============ -->
+<div class="slide" data-slide="11">
+  <h2>Learning Goals</h2>
+  <div style="max-width:850px">
+    <div class="card fade-in" style="margin-bottom:16px">
+      <h3>1. Roofline Reasoning</h3>
+      <p>Separate compute-bound vs memory-bound behaviors. Adjust kernels to move workloads toward the roofline knee.</p>
+    </div>
+    <div class="card fade-in delay-1" style="margin-bottom:16px">
+      <h3>2. Micro-Tiling Design</h3>
+      <p>Design schedules that balance register pressure with data reuse. Use <code>cp.async</code> prefetch and double-buffered shared memory.</p>
+    </div>
+    <div class="card fade-in delay-2" style="margin-bottom:16px">
+      <h3>3. CUTLASS & Triton</h3>
+      <p>Leverage template metaprogramming (CUTLASS) and Python-level kernel authoring (Triton) for rapid iteration with custom CUDA fallbacks.</p>
+    </div>
+    <div class="card fade-in delay-3">
+      <h3>4. Kernel Fusion</h3>
+      <p>Fuse reduction-heavy kernels (norm + activation) to eliminate redundant memory trips. Use online algorithms to avoid materializing intermediates.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ============ SLIDE 12: Key Takeaways ============ -->
+<div class="slide" data-slide="12">
+  <h2>Key Takeaways</h2>
+  <div class="metric-row" style="margin-bottom:32px">
+    <div class="metric-card">
+      <div class="big-number" style="color:var(--green)">17×</div>
+      <div class="label">Memory-bound speedup</div>
+    </div>
+    <div class="metric-card">
+      <div class="big-number" style="color:var(--accent)">4×</div>
+      <div class="label">GEMM speedup</div>
+    </div>
+    <div class="metric-card">
+      <div class="big-number" style="color:var(--purple)">1.7×</div>
+      <div class="label">Attention speedup</div>
+    </div>
+  </div>
+  <div style="max-width:800px;text-align:center">
+    <p style="font-size:1.3rem;line-height:1.7;color:#fff">
+      Arithmetic-intensity gains and fusion gains show up <strong style="color:var(--green)">very differently</strong> depending on whether the workload is <strong style="color:var(--accent)">math-limited</strong> or <strong style="color:var(--orange)">traffic-limited</strong>.
+    </p>
+    <p style="font-size:1.1rem;color:var(--dim);margin-top:24px">
+      The right read is not that every CUTLASS change is dramatic —<br>
+      it's that <em>knowing which lever to pull</em> is what matters.
+    </p>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<div class="progress" id="progress"></div>
+<div class="nav-hint">← → arrow keys or click to navigate</div>
+
+<script>
+(function(){
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length;
+  let cur = 0;
+
+  function go(idx){
+    if(idx<0||idx>=total) return;
+    slides[cur].classList.remove('active');
+    slides[cur].classList.add(idx>cur?'prev':'');
+    slides[cur].classList.add(idx<cur?'prev':'');
+    // clean
+    slides.forEach((s,i)=>{ if(i!==idx){ s.classList.remove('active','prev'); }});
+    cur = idx;
+    slides[cur].classList.add('active');
+    document.getElementById('progress').style.width = ((cur/(total-1))*100)+'%';
+    // trigger bar animations
+    if(cur===3) animateBars();
+    // trigger roofline draw
+    if(cur===2) drawRoofline();
+  }
+
+  function next(){ go(cur+1); }
+  function prev(){ go(cur-1); }
+
+  document.addEventListener('keydown', e=>{
+    if(e.key==='ArrowRight'||e.key===' '||e.key==='Enter') { e.preventDefault(); next(); }
+    if(e.key==='ArrowLeft'||e.key==='Backspace') { e.preventDefault(); prev(); }
+    if(e.key==='Home') { e.preventDefault(); go(0); }
+    if(e.key==='End')  { e.preventDefault(); go(total-1); }
+  });
+
+  document.getElementById('deck').addEventListener('click', e=>{
+    const x = e.clientX / window.innerWidth;
+    if(x > 0.5) next(); else prev();
+  });
+
+  // Touch
+  let tx=0;
+  document.addEventListener('touchstart', e=>{ tx=e.touches[0].clientX; });
+  document.addEventListener('touchend', e=>{
+    const dx = e.changedTouches[0].clientX - tx;
+    if(Math.abs(dx)>50){ dx<0?next():prev(); }
+  });
+
+  // Bar animation
+  function animateBars(){
+    document.querySelectorAll('.slide[data-slide="3"] .bar-fill').forEach(b=>{
+      const w = b.style.width;
+      b.style.width='0';
+      requestAnimationFrame(()=>requestAnimationFrame(()=>{ b.style.width=w; }));
+    });
+  }
+
+  // Roofline drawing
+  function drawRoofline(){
+    const c = document.getElementById('roofline-canvas');
+    if(!c) return;
+    const ctx = c.getContext('2d');
+    const W = c.width = c.offsetWidth * 2;
+    const H = c.height = c.offsetHeight * 2;
+    ctx.scale(2,2);
+    const w = c.offsetWidth, h = c.offsetHeight;
+    ctx.clearRect(0,0,w,h);
+
+    const pad = {l:60,r:30,t:30,b:50};
+    const pw = w-pad.l-pad.r, ph = h-pad.t-pad.b;
+
+    // Axes
+    ctx.strokeStyle='#30363d'; ctx.lineWidth=1;
+    ctx.beginPath();
+    ctx.moveTo(pad.l, pad.t);
+    ctx.lineTo(pad.l, h-pad.b);
+    ctx.lineTo(w-pad.r, h-pad.b);
+    ctx.stroke();
+
+    // Labels
+    ctx.fillStyle='#8b949e'; ctx.font='12px sans-serif';
+    ctx.textAlign='center';
+    ctx.fillText('Arithmetic Intensity (FLOP/byte)', pad.l+pw/2, h-8);
+    ctx.save();
+    ctx.translate(16, pad.t+ph/2);
+    ctx.rotate(-Math.PI/2);
+    ctx.fillText('Throughput (TFLOP/s)', 0, 0);
+    ctx.restore();
+
+    // Roofline: flat compute ceiling then diagonal memory line
+    const roofPeak = 0.35; // normalized height of compute ceiling
+    const kneeX = 0.4;     // normalized x of knee
+    const peakY = pad.t + ph*(1-roofPeak);
+    const kneePx = pad.l + pw*kneeX;
+    const botY = h-pad.b;
+
+    // Fill area
+    ctx.fillStyle='rgba(88,166,255,0.07)';
+    ctx.beginPath();
+    ctx.moveTo(pad.l, botY);
+    ctx.lineTo(kneePx, peakY);
+    ctx.lineTo(w-pad.r, peakY);
+    ctx.lineTo(w-pad.r, botY);
+    ctx.closePath();
+    ctx.fill();
+
+    // Memory-bound line (diagonal)
+    ctx.strokeStyle='#f85149'; ctx.lineWidth=2.5;
+    ctx.setLineDash([6,4]);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, botY);
+    ctx.lineTo(kneePx, peakY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Compute-bound ceiling
+    ctx.strokeStyle='#3fb950'; ctx.lineWidth=2.5;
+    ctx.beginPath();
+    ctx.moveTo(kneePx, peakY);
+    ctx.lineTo(w-pad.r, peakY);
+    ctx.stroke();
+
+    // Labels on lines
+    ctx.fillStyle='#f85149'; ctx.font='bold 13px sans-serif';
+    ctx.save();
+    ctx.translate(pad.l+pw*0.17, botY-ph*0.22);
+    ctx.rotate(-0.65);
+    ctx.fillText('Memory BW ceiling', 0, 0);
+    ctx.restore();
+
+    ctx.fillStyle='#3fb950';
+    ctx.fillText('Compute ceiling', kneePx+pw*0.12, peakY-10);
+
+    // Plot points
+    const points = [
+      {name:'memory_bound', x:0.12, y:0.08, color:'#f85149'},
+      {name:'sdpa_attention', x:0.22, y:0.18, color:'#d29922'},
+      {name:'cutlass_gemm', x:0.55, y:0.82, color:'#3fb950'},
+      {name:'compute_bound', x:0.78, y:0.92, color:'#58a6ff'},
+    ];
+    points.forEach(p=>{
+      const px = pad.l + pw*p.x;
+      const py = pad.t + ph*(1-p.y);
+      ctx.beginPath();
+      ctx.arc(px, py, 7, 0, Math.PI*2);
+      ctx.fillStyle=p.color;
+      ctx.fill();
+      ctx.strokeStyle='#0d1117';
+      ctx.lineWidth=2;
+      ctx.stroke();
+      ctx.fillStyle='#c9d1d9';
+      ctx.font='11px sans-serif';
+      ctx.textAlign='left';
+      ctx.fillText(p.name, px+12, py+4);
+    });
+
+    // Axes ticks
+    ctx.fillStyle='#8b949e'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+    for(let i=0;i<=5;i++){
+      const x = pad.l + pw*(i/5);
+      ctx.fillText((i*20)+'', x, h-pad.b+18);
+    }
+    ctx.textAlign='right';
+    for(let i=0;i<=4;i++){
+      const y = pad.t + ph*(1-i/4);
+      ctx.fillText((i*500)+'', pad.l-8, y+4);
+    }
+  }
+
+  // Initial state
+  go(0);
+})();
+</script>
+</body>
+</html>

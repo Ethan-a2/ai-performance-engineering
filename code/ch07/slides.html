@@ -1,0 +1,1016 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 7 - Memory Access Patterns</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface2: #1a1a26;
+    --border: #2a2a3a;
+    --text: #e8e8f0;
+    --text-dim: #8888a0;
+    --accent: #6366f1;
+    --accent2: #818cf8;
+    --green: #34d399;
+    --red: #f87171;
+    --orange: #fb923c;
+    --cyan: #22d3ee;
+    --yellow: #fbbf24;
+    --pink: #f472b6;
+    --code-bg: #0d0d14;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  .slide {
+    display: none;
+    width: 100vw;
+    height: 100vh;
+    padding: 60px 80px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .slide.active { display: flex; flex-direction: column; }
+
+  .slide-number {
+    position: absolute;
+    bottom: 24px;
+    right: 40px;
+    font-size: 14px;
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .progress-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--cyan));
+    transition: width 0.4s ease;
+    z-index: 100;
+  }
+
+  h1 {
+    font-size: 52px;
+    font-weight: 800;
+    line-height: 1.15;
+    background: linear-gradient(135deg, var(--accent2), var(--cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 20px;
+  }
+
+  h2 {
+    font-size: 40px;
+    font-weight: 700;
+    margin-bottom: 28px;
+    color: var(--text);
+  }
+
+  h3 {
+    font-size: 26px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: var(--accent2);
+  }
+
+  p, li {
+    font-size: 22px;
+    line-height: 1.65;
+    color: var(--text);
+  }
+
+  .subtitle {
+    font-size: 26px;
+    color: var(--text-dim);
+    font-weight: 400;
+    margin-bottom: 40px;
+  }
+
+  ul { list-style: none; padding-left: 0; }
+  ul li { padding: 6px 0; padding-left: 28px; position: relative; }
+  ul li::before {
+    content: '▸';
+    position: absolute;
+    left: 0;
+    color: var(--accent2);
+    font-weight: 700;
+  }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 36px;
+    flex: 1;
+    align-items: start;
+  }
+
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 28px;
+    flex: 1;
+    align-items: start;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px;
+  }
+
+  .card.accent-border { border-color: var(--accent); }
+  .card.green-border { border-color: var(--green); }
+  .card.red-border { border-color: var(--red); }
+  .card.cyan-border { border-color: var(--cyan); }
+
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 15px;
+    line-height: 1.6;
+    color: var(--text);
+  }
+
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9em;
+  }
+
+  .kw { color: var(--pink); }
+  .fn { color: var(--cyan); }
+  .tp { color: var(--yellow); }
+  .cm { color: #555570; font-style: italic; }
+  .str { color: var(--green); }
+  .num { color: var(--orange); }
+  .dir { color: var(--accent2); }
+
+  .highlight-box {
+    background: linear-gradient(135deg, rgba(99,102,241,0.12), rgba(34,211,238,0.08));
+    border-left: 4px solid var(--accent);
+    border-radius: 0 12px 12px 0;
+    padding: 20px 28px;
+    margin: 16px 0;
+  }
+
+  .metric {
+    text-align: center;
+    padding: 20px;
+  }
+
+  .metric .value {
+    font-size: 56px;
+    font-weight: 800;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .metric .label {
+    font-size: 16px;
+    color: var(--text-dim);
+    margin-top: 8px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+  }
+
+  .metric.green .value { color: var(--green); }
+  .metric.accent .value { color: var(--accent2); }
+  .metric.orange .value { color: var(--orange); }
+  .metric.cyan .value { color: var(--cyan); }
+  .metric.red .value { color: var(--red); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 18px;
+  }
+
+  th {
+    text-align: left;
+    padding: 12px 16px;
+    border-bottom: 2px solid var(--accent);
+    color: var(--accent2);
+    font-weight: 600;
+    font-size: 15px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  td {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  tr:hover td { background: rgba(99,102,241,0.06); }
+
+  .tag {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .tag.baseline { background: rgba(248,113,113,0.15); color: var(--red); }
+  .tag.optimized { background: rgba(52,211,153,0.15); color: var(--green); }
+  .tag.new { background: rgba(34,211,238,0.15); color: var(--cyan); }
+
+  .arrow {
+    font-size: 40px;
+    color: var(--green);
+    text-align: center;
+    padding: 10px 0;
+  }
+
+  .flex-center {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1;
+  }
+
+  .diagram-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 24px;
+    text-align: center;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    color: var(--text);
+  }
+
+  .versus {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+  }
+
+  .versus .vs {
+    font-size: 32px;
+    font-weight: 800;
+    color: var(--orange);
+    flex-shrink: 0;
+  }
+
+  .mem-block {
+    display: inline-block;
+    width: 22px;
+    height: 22px;
+    border-radius: 3px;
+    margin: 1px;
+  }
+
+  .mem-block.global { background: var(--red); opacity: 0.7; }
+  .mem-block.shared { background: var(--green); opacity: 0.7; }
+  .mem-block.tma { background: var(--cyan); opacity: 0.7; }
+  .mem-block.empty { background: var(--border); opacity: 0.3; }
+
+  .nav-hint {
+    position: fixed;
+    bottom: 24px;
+    left: 40px;
+    font-size: 13px;
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+    opacity: 0.5;
+  }
+
+  .title-slide {
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+  }
+
+  .title-slide h1 { font-size: 72px; margin-bottom: 16px; }
+
+  .section-divider {
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+  }
+
+  .section-divider h2 {
+    font-size: 56px;
+    background: linear-gradient(135deg, var(--accent2), var(--cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .section-num {
+    font-size: 120px;
+    font-weight: 800;
+    font-family: 'JetBrains Mono', monospace;
+    color: rgba(99,102,241,0.12);
+    position: absolute;
+    top: 40px;
+    right: 80px;
+  }
+
+  .icon { font-size: 48px; margin-bottom: 16px; }
+
+  .comparison-row {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    margin: 12px 0;
+  }
+
+  .comparison-row .label {
+    width: 120px;
+    font-weight: 600;
+    font-size: 16px;
+    color: var(--text-dim);
+    text-align: right;
+    flex-shrink: 0;
+  }
+
+  .bar-container {
+    flex: 1;
+    height: 32px;
+    background: var(--surface);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .bar {
+    height: 100%;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    padding-left: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    font-weight: 600;
+    color: white;
+  }
+
+  .bar.baseline-bar { background: linear-gradient(90deg, #ef4444, #f87171); }
+  .bar.optimized-bar { background: linear-gradient(90deg, #059669, #34d399); }
+</style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<!-- ==================== SLIDE 1: Title ==================== -->
+<div class="slide title-slide active" data-slide="1">
+  <div style="margin-bottom:20px;">
+    <span style="font-size:64px;">🧠</span>
+  </div>
+  <h1>Chapter 7</h1>
+  <p class="subtitle" style="font-size:32px; margin-top:8px;">Memory Access Patterns</p>
+  <p style="font-size:20px; color:var(--text-dim); margin-top:24px; max-width:700px;">
+    从标量拷贝到 TMA 张量传输 — 理解 GPU 内存布局如何驱动性能
+  </p>
+  <div style="margin-top:48px; display:flex; gap:40px; justify-content:center;">
+    <div class="metric green">
+      <div class="value" style="font-size:44px;">45.4×</div>
+      <div class="label">Lookup 加速</div>
+    </div>
+    <div class="metric accent">
+      <div class="value" style="font-size:44px;">3.44×</div>
+      <div class="label">TMA 2D 拷贝</div>
+    </div>
+    <div class="metric orange">
+      <div class="value" style="font-size:44px;">3.18×</div>
+      <div class="label">Tiled Matmul</div>
+    </div>
+  </div>
+  <div class="slide-number">1 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 2: Agenda ==================== -->
+<div class="slide" data-slide="2">
+  <h2>目录</h2>
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:24px; margin-top:16px; flex:1;">
+    <div class="card accent-border">
+      <h3>01 · 内存合并访问</h3>
+      <p style="font-size:18px; color:var(--text-dim);">Scalar → Coalesced → float4 向量化</p>
+    </div>
+    <div class="card green-border">
+      <h3>02 · 共享内存 Tiling</h3>
+      <p style="font-size:18px; color:var(--text-dim);">Naive Matmul → Shared-Memory Tiled Matmul</p>
+    </div>
+    <div class="card cyan-border">
+      <h3>03 · TMA 张量传输</h3>
+      <p style="font-size:18px; color:var(--text-dim);">手动 2D 拷贝 → cp.async.bulk.tensor</p>
+    </div>
+    <div class="card" style="border-color:var(--orange);">
+      <h3>04 · Cache-Locality 优化</h3>
+      <p style="font-size:18px; color:var(--text-dim);">随机查表 → 预排布连续访问</p>
+    </div>
+    <div class="card" style="border-color:var(--yellow);">
+      <h3>05 · 性能基准与验证</h3>
+      <p style="font-size:18px; color:var(--text-dim);">Harness、Profile、期望基线</p>
+    </div>
+    <div class="card" style="border-color:var(--pink);">
+      <h3>06 · 学习目标总结</h3>
+      <p style="font-size:18px; color:var(--text-dim);">核心 Takeaway 与实践指南</p>
+    </div>
+  </div>
+  <div class="slide-number">2 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 3: Section - Coalescing ==================== -->
+<div class="slide section-divider" data-slide="3">
+  <div class="section-num">01</div>
+  <h2>内存合并访问</h2>
+  <p class="subtitle" style="margin-top:16px;">Scalar → Coalesced → float4 Vectorized</p>
+  <div class="slide-number">3 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 4: Scalar vs Vectorized ==================== -->
+<div class="slide" data-slide="4">
+  <h2>Scalar Copy vs float4 Vectorized Copy</h2>
+  <div class="grid-2" style="margin-top:8px;">
+    <div>
+      <div class="card red-border" style="margin-bottom:16px;">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+          <span class="tag baseline">BASELINE</span>
+          <span style="font-weight:600;">baseline_copy_scalar.cu</span>
+        </div>
+<pre><span class="cm">// 每线程 4 字节 load/store</span>
+<span class="kw">__global__</span> <span class="tp">void</span> <span class="fn">copyScalar</span>(
+    <span class="kw">const</span> <span class="tp">float</span>* in,
+    <span class="tp">float</span>* out, <span class="tp">int</span> n) {
+  <span class="tp">int</span> idx = blockIdx.x * blockDim.x
+          + threadIdx.x;
+  <span class="kw">if</span> (idx &lt; n)
+    out[idx] = in[idx]; <span class="cm">// 4B load + 4B store</span>
+}</pre>
+      </div>
+      <div style="display:flex; gap:16px;">
+        <div class="metric red" style="flex:1;">
+          <div class="value" style="font-size:36px;">4B</div>
+          <div class="label">每线程传输</div>
+        </div>
+        <div class="metric orange" style="flex:1;">
+          <div class="value" style="font-size:36px;">N</div>
+          <div class="label">指令数量</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border" style="margin-bottom:16px;">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+          <span class="tag optimized">OPTIMIZED</span>
+          <span style="font-weight:600;">optimized_copy_scalar_vectorized.cu</span>
+        </div>
+<pre><span class="cm">// 每线程 16 字节 load/store</span>
+<span class="kw">__global__</span> <span class="tp">void</span> <span class="fn">copyVectorized</span>(
+    <span class="kw">const</span> <span class="tp">float4</span>* in,
+    <span class="tp">float4</span>* out, <span class="tp">int</span> n) {
+  <span class="tp">int</span> idx = blockIdx.x * blockDim.x
+          + threadIdx.x;
+  <span class="kw">if</span> (idx &lt; n)
+    out[idx] = in[idx]; <span class="cm">// 16B load + 16B store</span>
+}</pre>
+      </div>
+      <div style="display:flex; gap:16px;">
+        <div class="metric green" style="flex:1;">
+          <div class="value" style="font-size:36px;">16B</div>
+          <div class="label">每线程传输</div>
+        </div>
+        <div class="metric green" style="flex:1;">
+          <div class="value" style="font-size:36px;">N/4</div>
+          <div class="label">指令数量</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-number">4 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 5: Coalescing Visual ==================== -->
+<div class="slide" data-slide="5">
+  <h2>为什么合并访问至关重要</h2>
+  <div style="flex:1; display:flex; flex-direction:column; justify-content:center; gap:36px;">
+    <div class="card" style="padding:32px;">
+      <h3 style="margin-bottom:20px;">GPU 内存事务模型（128-byte Cache Line）</h3>
+      <div style="display:flex; align-items:center; gap:40px;">
+        <div style="text-align:center;">
+          <div style="margin-bottom:8px; font-weight:600; color:var(--red);">未合并访问</div>
+          <div style="font-family:'JetBrains Mono',monospace; font-size:13px; line-height:2;">
+            Thread 0 → <span class="mem-block global"></span> addr 0x00<br>
+            Thread 1 → <span class="mem-block global"></span> addr 0x40 (跨 cache line!)<br>
+            Thread 2 → <span class="mem-block global"></span> addr 0x80<br>
+            Thread 3 → <span class="mem-block global"></span> addr 0xC0
+          </div>
+          <div style="margin-top:12px; color:var(--red); font-weight:700;">4 个事务 / warp</div>
+        </div>
+        <div style="font-size:48px; color:var(--orange);">VS</div>
+        <div style="text-align:center;">
+          <div style="margin-bottom:8px; font-weight:600; color:var(--green);">合并访问</div>
+          <div style="font-family:'JetBrains Mono',monospace; font-size:13px; line-height:2;">
+            Thread 0 → <span class="mem-block global"></span> addr 0x00<br>
+            Thread 1 → <span class="mem-block global"></span> addr 0x04 (同一 cache line!)<br>
+            Thread 2 → <span class="mem-block global"></span> addr 0x08<br>
+            Thread 3 → <span class="mem-block global"></span> addr 0x0C
+          </div>
+          <div style="margin-top:12px; color:var(--green); font-weight:700;">1 个事务 / warp</div>
+        </div>
+      </div>
+    </div>
+    <div class="highlight-box">
+      <strong>float4 向量化的双重收益：</strong>
+      每线程 16B → 4× 更少指令 + 自然对齐到 128B 事务边界 → 最大化带宽利用率
+    </div>
+  </div>
+  <div class="slide-number">5 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 6: Section - Tiled Matmul ==================== -->
+<div class="slide section-divider" data-slide="6">
+  <div class="section-num">02</div>
+  <h2>共享内存 Tiling</h2>
+  <p class="subtitle" style="margin-top:16px;">Naive Matmul → Shared-Memory Tiled Matmul</p>
+  <div class="slide-number">6 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 7: Matmul Comparison ==================== -->
+<div class="slide" data-slide="7">
+  <h2>Naive vs Tiled Matmul (N=1024)</h2>
+  <div class="grid-2" style="margin-top:8px;">
+    <div>
+      <div class="card red-border">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
+          <span class="tag baseline">BASELINE</span>
+        </div>
+<pre><span class="kw">__global__</span> <span class="tp">void</span> <span class="fn">naive_matmul</span>(
+    <span class="kw">const</span> <span class="tp">float</span>* A,
+    <span class="kw">const</span> <span class="tp">float</span>* B,
+    <span class="tp">float</span>* C, <span class="tp">int</span> n) {
+  <span class="tp">int</span> row = blockIdx.y * blockDim.y + threadIdx.y;
+  <span class="tp">int</span> col = blockIdx.x * blockDim.x + threadIdx.x;
+
+  <span class="tp">float</span> sum = <span class="num">0.0f</span>;
+  <span class="kw">for</span> (<span class="tp">int</span> k = <span class="num">0</span>; k &lt; n; ++k) {
+    <span class="cm">// A 按行读 → 合并 ✓</span>
+    <span class="cm">// B 按列读 → 跨步访问 ✗</span>
+    sum += A[row * n + k] * B[k * n + col];
+  }
+  C[row * n + col] = sum;
+}</pre>
+        <div class="metric red" style="margin-top:16px;">
+          <div class="value" style="font-size:40px;">1.165 ms</div>
+          <div class="label">平均耗时</div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:16px;">
+          <span class="tag optimized">OPTIMIZED</span>
+        </div>
+<pre><span class="kw">__global__</span> <span class="tp">void</span> <span class="fn">matmul_tiled</span>(
+    <span class="kw">const</span> <span class="tp">float</span>* A,
+    <span class="kw">const</span> <span class="tp">float</span>* B,
+    <span class="tp">float</span>* C, <span class="tp">int</span> n) {
+  <span class="dir">__shared__</span> <span class="tp">float</span> As[TILE][TILE];
+  <span class="dir">__shared__</span> <span class="tp">float</span> Bs[TILE][TILE];
+
+  <span class="tp">float</span> sum = <span class="num">0.0f</span>;
+  <span class="kw">for</span> (<span class="tp">int</span> t = <span class="num">0</span>; t &lt; n/TILE; ++t) {
+    As[ty][tx] = A[row * n + t*TILE + tx];
+    Bs[ty][tx] = B[(t*TILE + ty) * n + col];
+    <span class="dir">__syncthreads</span>();
+
+    <span class="kw">for</span> (<span class="tp">int</span> i = <span class="num">0</span>; i &lt; TILE; ++i)
+      sum += As[ty][i] * Bs[i][tx];
+    <span class="dir">__syncthreads</span>();
+  }
+}</pre>
+        <div class="metric green" style="margin-top:16px;">
+          <div class="value" style="font-size:40px;">0.367 ms</div>
+          <div class="label">平均耗时</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-number">7 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 8: Tiling Mechanics ==================== -->
+<div class="slide" data-slide="8">
+  <h2>Shared-Memory Tiling 工作原理</h2>
+  <div style="flex:1; display:flex; flex-direction:column; justify-content:center; gap:24px;">
+    <div style="display:flex; gap:24px; align-items:stretch;">
+      <div class="card" style="flex:1; text-align:center;">
+        <h3 style="color:var(--red);">Step 1: 全局→共享</h3>
+        <div style="margin:16px 0;">
+          <div style="font-family:'JetBrains Mono',monospace; font-size:13px;">
+            Global Memory (慢, 大)<br>
+            <div style="margin:8px 0;">
+              <span class="mem-block global"></span><span class="mem-block global"></span><span class="mem-block global"></span><span class="mem-block global"></span>
+              <span class="mem-block global"></span><span class="mem-block global"></span><span class="mem-block global"></span><span class="mem-block global"></span>
+              <span class="mem-block global"></span><span class="mem-block global"></span><span class="mem-block global"></span><span class="mem-block global"></span>
+              <span class="mem-block global"></span><span class="mem-block global"></span><span class="mem-block global"></span><span class="mem-block global"></span>
+            </div>
+            <span style="font-size:24px;">↓ 加载 tile ↓</span>
+            <div style="margin:8px 0;">
+              <span class="mem-block shared"></span><span class="mem-block shared"></span><span class="mem-block shared"></span><span class="mem-block shared"></span>
+            </div>
+            Shared Memory (快, 小)
+          </div>
+        </div>
+      </div>
+      <div class="card" style="flex:1; text-align:center;">
+        <h3 style="color:var(--green);">Step 2: 共享内存计算</h3>
+        <div style="margin:16px 0;">
+          <div style="font-family:'JetBrains Mono',monospace; font-size:13px;">
+            As[32][32] × Bs[32][32]<br>
+            <div style="margin:12px 0;">
+              <span class="mem-block shared"></span><span class="mem-block shared"></span>  ×  <span class="mem-block shared"></span><span class="mem-block shared"></span><br>
+              <span class="mem-block shared"></span><span class="mem-block shared"></span>  ×  <span class="mem-block shared"></span><span class="mem-block shared"></span>
+            </div>
+            <span style="font-size:14px;">每个线程累积 32 次乘加<br>全部在共享内存中完成</span>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="flex:1; text-align:center;">
+        <h3 style="color:var(--cyan);">Step 3: 同步 + 写回</h3>
+        <div style="margin:16px 0;">
+          <div style="font-family:'JetBrains Mono',monospace; font-size:13px;">
+            __syncthreads()<br>
+            <div style="margin:12px 0;">
+              累积所有 tile 的结果<br>
+              <span style="font-size:20px;">→</span><br>
+              写入 Global Memory
+            </div>
+            C[row][col] = sum
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="highlight-box">
+      <strong>关键收益：</strong>
+      每个 A/B 元素被 TILE 个线程复用 → 全局内存访问减少 TILE 倍（32×）→
+      共享内存延迟 ~20-30 cycles vs 全局内存 ~200-400 cycles
+    </div>
+  </div>
+  <div class="slide-number">8 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 9: Section - TMA ==================== -->
+<div class="slide section-divider" data-slide="9">
+  <div class="section-num">03</div>
+  <h2>TMA 张量传输</h2>
+  <p class="subtitle" style="margin-top:16px;">手动 2D 拷贝 → cp.async.bulk.tensor</p>
+  <div class="slide-number">9 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 10: TMA ==================== -->
+<div class="slide" data-slide="10">
+  <h2>TMA (Tensor Memory Accelerator) 2D Bulk Copy</h2>
+  <div class="grid-2" style="margin-top:8px;">
+    <div>
+      <div class="card red-border" style="margin-bottom:20px;">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+          <span class="tag baseline">BASELINE</span>
+          <span style="font-size:15px;">手动 2D 拷贝</span>
+        </div>
+<pre><span class="cm">// 每个线程手动逐行逐列拷贝</span>
+<span class="kw">for</span> (<span class="tp">int</span> r = threadIdx.y; r &lt; TILE_M; ...) {
+  <span class="kw">for</span> (<span class="tp">int</span> c = threadIdx.x; c &lt; TILE_N; ...) {
+    tile[r][c] = src_row[g_col]; <span class="cm">// 标量 load</span>
+  }
+}
+<span class="dir">__syncthreads</span>();
+<span class="cm">// 再逐标量写回...</span></pre>
+      </div>
+      <div class="metric red">
+        <div class="value" style="font-size:40px;">0.029 ms</div>
+        <div class="label">手动 2D staging</div>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border" style="margin-bottom:20px;">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+          <span class="tag optimized">OPTIMIZED</span>
+          <span style="font-size:15px;">TMA Tensor-Map</span>
+        </div>
+<pre><span class="cm">// 硬件张量引擎一条指令完成 2D 块传输</span>
+<span class="cm">// 使用 cp.async.bulk.tensor</span>
+<span class="cm">// + tensor map descriptor</span>
+<span class="cm">// DMA 引擎直接操作，不占用 SM</span>
+
+<span class="cm">// 优势：</span>
+<span class="cm">// 1. 释放 SM 算力</span>
+<span class="cm">// 2. 硬件级地址计算</span>
+<span class="cm">// 3. 支持 2D/3D/4D 张量布局</span></pre>
+      </div>
+      <div class="metric green">
+        <div class="value" style="font-size:40px;">0.008 ms</div>
+        <div class="label">TMA bulk tensor</div>
+      </div>
+    </div>
+  </div>
+  <div style="text-align:center; margin-top:16px;">
+    <span style="font-size:28px; font-weight:800; color:var(--green);">3.44× 加速</span>
+    <span style="font-size:18px; color:var(--text-dim);"> — DMA 引擎替代 SM 标量拷贝</span>
+  </div>
+  <div class="slide-number">10 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 11: Section - Lookup ==================== -->
+<div class="slide section-divider" data-slide="11">
+  <div class="section-num">04</div>
+  <h2>Cache-Locality 优化</h2>
+  <p class="subtitle" style="margin-top:16px;">随机查表 → 预排布连续访问</p>
+  <div class="slide-number">11 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 12: Lookup ==================== -->
+<div class="slide" data-slide="12">
+  <h2>Lookup 工作负载：数据布局重排</h2>
+  <div class="grid-2" style="margin-top:8px;">
+    <div>
+      <div class="card red-border">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+          <span class="tag baseline">BASELINE</span>
+        </div>
+<pre><span class="cm">// 随机查表: 每线程 64 步随机跳跃</span>
+<span class="kw">__global__</span> <span class="tp">void</span> <span class="fn">lookupNaive</span>(
+    <span class="kw">const</span> <span class="tp">float</span>* table,
+    <span class="kw">const</span> <span class="tp">int</span>* indices,
+    <span class="tp">float</span>* out, <span class="tp">int</span> n) {
+  <span class="tp">int</span> index = indices[idx];
+  <span class="kw">for</span> (<span class="tp">int</span> iter = <span class="num">0</span>; iter &lt; <span class="num">64</span>; ++iter) {
+    val += <span class="fn">__ldg</span>(table + index);
+    index = <span class="fn">advance_lcg</span>(index);
+    <span class="cm">// LCG 随机 → cache 友好度极低</span>
+  }
+}</pre>
+        <div style="margin-top:16px;">
+          <div style="font-family:'JetBrains Mono',monospace; font-size:13px; text-align:center;">
+            <span class="mem-block global"></span><span class="mem-block empty"></span><span class="mem-block empty"></span><span class="mem-block global"></span><span class="mem-block empty"></span><span class="mem-block empty"></span><span class="mem-block global"></span>
+            <br>随机跳跃 → L2 cache 几乎失效
+          </div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border">
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:12px;">
+          <span class="tag optimized">OPTIMIZED</span>
+        </div>
+<pre><span class="cm">// 预排布: Host 端预计算所有路径</span>
+<span class="cm">// paths[step][idx] = table[路径值]</span>
+<span class="cm">// 步骤维度在外，线程维度在内</span>
+
+<span class="kw">__global__</span> <span class="tp">void</span> <span class="fn">lookupOptimized</span>(
+    <span class="kw">const</span> <span class="tp">float</span>* <span class="dir">__restrict__</span> paths,
+    <span class="tp">float</span>* out, <span class="tp">int</span> n) {
+  <span class="kw">for</span> (<span class="tp">int</span> step = <span class="num">0</span>; step &lt; <span class="num">64</span>; ++step) {
+    val += paths[step * n + idx];
+    <span class="cm">// 合并访问！相邻线程读相邻地址</span>
+  }
+}</pre>
+        <div style="margin-top:16px;">
+          <div style="font-family:'JetBrains Mono',monospace; font-size:13px; text-align:center;">
+            <span class="mem-block shared"></span><span class="mem-block shared"></span><span class="mem-block shared"></span><span class="mem-block shared"></span><span class="mem-block shared"></span><span class="mem-block shared"></span><span class="mem-block shared"></span>
+            <br>连续访问 → L2 cache line 100% 利用
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div style="text-align:center; margin-top:20px;">
+    <span style="font-size:32px; font-weight:800; color:var(--green);">45.4× 加速</span>
+    <span style="font-size:18px; color:var(--text-dim);"> — 用 Host 端预排布换 Device 端 cache 命中率</span>
+  </div>
+  <div class="slide-number">12 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 13: Full Results ==================== -->
+<div class="slide" data-slide="13">
+  <h2>性能基准结果总览</h2>
+  <div style="flex:1; display:flex; flex-direction:column; justify-content:center; gap:24px;">
+    <table>
+      <thead>
+        <tr>
+          <th>Benchmark</th>
+          <th>Baseline</th>
+          <th>Optimized</th>
+          <th>Speedup</th>
+          <th>优化手段</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>tma_bulk_tensor_2d</strong></td>
+          <td><span style="color:var(--red);">0.029 ms</span></td>
+          <td><span style="color:var(--green);">0.008 ms</span></td>
+          <td><strong style="color:var(--green);">3.44×</strong></td>
+          <td>Tensor-Map TMA 硬件拷贝</td>
+        </tr>
+        <tr>
+          <td><strong>lookup</strong></td>
+          <td><span style="color:var(--red);">0.397 ms</span></td>
+          <td><span style="color:var(--green);">0.009 ms</span></td>
+          <td><strong style="color:var(--green);">45.41×</strong></td>
+          <td>数据布局预排布 + 合并访问</td>
+        </tr>
+        <tr>
+          <td><strong>matmul</strong></td>
+          <td><span style="color:var(--red);">1.165 ms</span></td>
+          <td><span style="color:var(--green);">0.367 ms</span></td>
+          <td><strong style="color:var(--green);">3.18×</strong></td>
+          <td>Shared-Memory Tiling</td>
+        </tr>
+        <tr>
+          <td><strong>hbm_copy</strong></td>
+          <td><span style="color:var(--red);">scalar</span></td>
+          <td><span style="color:var(--green);">float4</span></td>
+          <td><strong style="color:var(--green);">~3-4×</strong></td>
+          <td>向量化 load/store</td>
+        </tr>
+        <tr>
+          <td><strong>transpose</strong></td>
+          <td><span style="color:var(--red);">naive</span></td>
+          <td><span style="color:var(--green);">padded</span></td>
+          <td><strong style="color:var(--green);">~2×</strong></td>
+          <td>消除 bank conflict</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="highlight-box">
+      <strong>共性规律：</strong>
+      内存访问模式优化的收益远超计算优化 —
+      45× 的 Lookup 加速证明：改变数据布局比改变计算逻辑更有效
+    </div>
+  </div>
+  <div class="slide-number">13 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 14: Benchmark Infrastructure ==================== -->
+<div class="slide" data-slide="14">
+  <h2>基准验证与 Profiling 工具链</h2>
+  <div class="grid-2" style="margin-top:8px;">
+    <div>
+      <div class="card accent-border" style="margin-bottom:20px;">
+        <h3>运行基准</h3>
+<pre style="font-size:14px;"><span class="cm"># 单个 target</span>
+python -m cli.aisp bench run \
+  --targets ch07:matmul \
+  --profile minimal
+
+<span class="cm"># 全章扫描</span>
+python -m cli.aisp bench run \
+  --targets ch07 \
+  --profile minimal
+
+<span class="cm"># 快速对比</span>
+python -m ch07.compare</pre>
+      </div>
+      <div class="card" style="border-color:var(--yellow);">
+        <h3 style="color:var(--yellow);">期望基线</h3>
+        <p style="font-size:16px; color:var(--text-dim);">
+          <code>expectations_b200.json</code><br>
+          <code>expectations_4x_gb200.json</code><br>
+          刷新: <code>--update-expectations</code>
+        </p>
+      </div>
+    </div>
+    <div>
+      <div class="card green-border" style="margin-bottom:20px;">
+        <h3>Deep-Dive Profiling</h3>
+<pre style="font-size:14px;"><span class="cm"># Nsight Compute kernel 分析</span>
+python -m cli.aisp bench run \
+  --targets ch07:lookup \
+  --profile deep_dive \
+  --single-gpu
+
+<span class="cm"># Nsight Systems timeline</span>
+make profile-nsys
+
+<span class="cm"># 完整 profiling</span>
+make profile-all</pre>
+      </div>
+      <div class="card cyan-border">
+        <h3 style="color:var(--cyan);">验证清单</h3>
+        <ul style="font-size:16px;">
+          <li>hbm_copy: bandwidth gap 证明向量化有效</li>
+          <li>matmul: >80% 共享内存带宽利用率</li>
+          <li>tma_copy: strict tensor-map 路径验证</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="slide-number">14 / 15</div>
+</div>
+
+<!-- ==================== SLIDE 15: Takeaways ==================== -->
+<div class="slide" data-slide="15">
+  <h2>核心学习目标</h2>
+  <div style="flex:1; display:flex; flex-direction:column; justify-content:center; gap:20px;">
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px;">
+      <div class="card accent-border">
+        <h3>🎯 合并访问</h3>
+        <p style="font-size:18px;">
+          测量 scalar → coalesced → float4 的带宽差距。
+          理解 128-byte cache line 事务模型与线程束对齐。
+        </p>
+      </div>
+      <div class="card green-border">
+        <h3>🎯 共享内存 Tiling</h3>
+        <p style="font-size:18px;">
+          使用 shared memory tiling、async copy、tensor map
+          在实际工作负载中量化收益。
+        </p>
+      </div>
+      <div class="card cyan-border">
+        <h3>🎯 Cache-Locality 分析</h3>
+        <p style="font-size:18px;">
+          分析 lookup-heavy 工作负载，重组数据布局
+          以缓解 cache-thrashing 访问模式。
+        </p>
+      </div>
+      <div class="card" style="border-color:var(--orange);">
+        <h3>🎯 量化决策</h3>
+        <p style="font-size:18px;">
+          量化 transpose 和 gather/scatter 开销，
+          用数据驱动布局变更决策，而非凭直觉。
+        </p>
+      </div>
+    </div>
+    <div class="highlight-box" style="margin-top:12px;">
+      <strong>关键结论：</strong>
+      Chapter 7 中最戏剧性的加速（45.4×）来自数据布局变换而非计算优化 —
+      <em>内存访问模式决定性能，而非计算复杂度</em>。
+    </div>
+    <div style="text-align:center; margin-top:12px;">
+      <p style="font-size:18px; color:var(--text-dim);">
+        复现: <code style="color:var(--cyan);">python -m cli.aisp bench run --targets ch07 --profile minimal</code>
+      </p>
+    </div>
+  </div>
+  <div class="slide-number">15 / 15</div>
+</div>
+
+<div class="nav-hint">← → 翻页 &nbsp;|&nbsp; ESC 总览</div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  const progress = document.getElementById('progress');
+  let current = 0;
+
+  function show(idx) {
+    slides[current].classList.remove('active');
+    current = Math.max(0, Math.min(idx, slides.length - 1));
+    slides[current].classList.add('active');
+    progress.style.width = ((current + 1) / slides.length * 100) + '%';
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') {
+      e.preventDefault(); show(current + 1);
+    }
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+      e.preventDefault(); show(current - 1);
+    }
+    if (e.key === 'Home') { e.preventDefault(); show(0); }
+    if (e.key === 'End') { e.preventDefault(); show(slides.length - 1); }
+  });
+
+  document.addEventListener('click', e => {
+    const x = e.clientX / window.innerWidth;
+    if (x > 0.5) show(current + 1);
+    else show(current - 1);
+  });
+
+  let touchStartX = 0;
+  document.addEventListener('touchstart', e => { touchStartX = e.touches[0].clientX; });
+  document.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    if (Math.abs(dx) > 50) {
+      dx < 0 ? show(current + 1) : show(current - 1);
+    }
+  });
+</script>
+
+</body>
+</html>

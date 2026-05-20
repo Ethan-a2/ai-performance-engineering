@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CUDA Programming Fundamentals - Chapter 6</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.3.1/reveal.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.3.1/theme/black.min.css">
+    <style>
+        .reveal {
+            font-size: 28px;
+        }
+        .reveal h1, .reveal h2, .reveal h3 {
+            text-transform: none;
+        }
+        .reveal pre {
+            width: 100%;
+            font-size: 16px;
+        }
+        .reveal code {
+            font-family: 'Courier New', Courier, monospace;
+        }
+        .performance-table {
+            font-size: 20px;
+            margin: 0 auto;
+        }
+        .performance-table th, .performance-table td {
+            padding: 8px 12px;
+            text-align: center;
+        }
+        .highlight {
+            color: #ff6b6b;
+            font-weight: bold;
+        }
+        .optimization {
+            color: #4ecdc4;
+            font-weight: bold;
+        }
+        .baseline {
+            color: #96ceb4;
+            font-weight: bold;
+        }
+        .code-comparison {
+            display: flex;
+            gap: 20px;
+        }
+        .code-block {
+            flex: 1;
+            background: #2d2d2d;
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="reveal">
+        <div class="slides">
+            <!-- Slide 1: Title -->
+            <section>
+                <h1>CUDA Programming Fundamentals</h1>
+                <h3>Chapter 6: From Python to CUDA C++</h3>
+                <p>Kernel Mechanics, Occupancy, Memory Layouts, and Performance Optimization</p>
+                <br>
+                <p><small>AI Performance Engineering Book</small></p>
+            </section>
+
+            <!-- Slide 2: Chapter Overview -->
+            <section>
+                <h2>Chapter 6 Overview</h2>
+                <ul>
+                    <li><span class="baseline">Baseline Path</span>: Simple kernels, poor GPU utilization</li>
+                    <li><span class="optimization">Optimized Path</span>: Vectorized, parallelized, ILP-aware kernels</li>
+                    <li>Focus on <span class="highlight">measured deltas</span> under the harness</li>
+                    <li>Profiler-heavy chapter for deep performance analysis</li>
+                </ul>
+                <br>
+                <p><em>"Kernel mechanics stop being theoretical"</em></p>
+            </section>
+
+            <!-- Slide 3: Directory Structure -->
+            <section>
+                <h2>Directory Structure</h2>
+                <pre><code>
+ch06/
+├── my_first_kernel.cu          # Hello-world CUDA kernel
+├── baseline_add_cuda.cu        # Sequential add (poor utilization)
+├── optimized_add_cuda_parallel.cu  # Parallel add (optimized)
+├── baseline_attention_ilp.py   # Low ILP attention benchmark
+├── optimized_attention_ilp.py  # High ILP attention benchmark
+├── baseline_bank_conflicts.cu  # Shared memory bank conflicts
+├── optimized_bank_conflicts.cu # Padded shared memory
+├── baseline_launch_bounds_cuda.cu  # No launch bounds
+├── optimized_launch_bounds_cuda.cu # With launch bounds
+├── baseline_autotuning.py      # Fixed parameters
+├── optimized_autotuning.py     # Autotuned parameters
+└── cuda_extensions/            # CUDA extensions for Python
+                </code></pre>
+            </section>
+
+            <!-- Slide 4: Performance Results -->
+            <section>
+                <h2>Measured Performance Deltas</h2>
+                <table class="performance-table">
+                    <tr>
+                        <th>Target</th>
+                        <th>Baseline</th>
+                        <th>Optimized</th>
+                        <th>Speedup</th>
+                        <th>Key Change</th>
+                    </tr>
+                    <tr>
+                        <td><code>add</code></td>
+                        <td class="baseline">172.202 ms</td>
+                        <td class="optimization">0.044 ms</td>
+                        <td class="highlight">3881x</td>
+                        <td>True CUDA implementation</td>
+                    </tr>
+                    <tr>
+                        <td><code>attention_ilp</code></td>
+                        <td class="baseline">140.603 ms</td>
+                        <td class="optimization">0.529 ms</td>
+                        <td class="highlight">265.82x</td>
+                        <td>4 independent chains per thread</td>
+                    </tr>
+                    <tr>
+                        <td><code>autotuning</code></td>
+                        <td class="baseline">63.881 ms</td>
+                        <td class="optimization">16.310 ms</td>
+                        <td class="highlight">3.92x</td>
+                        <td>Optimal schedule selection</td>
+                    </tr>
+                </table>
+                <br>
+                <p><small>Note: Baselines are intentionally pedagogical for teaching purposes</small></p>
+            </section>
+
+            <!-- Slide 5: CUDA Kernel Basics -->
+            <section>
+                <h2>CUDA Kernel Basics</h2>
+                <div class="code-comparison">
+                    <div class="code-block">
+                        <h4>Simple Kernel (my_first_kernel.cu)</h4>
+                        <pre><code>
+__global__ void double_values(float* data, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        data[idx] *= 2.0f;
+    }
+}
+                        </code></pre>
+                    </div>
+                    <div class="code-block">
+                        <h4>Key Concepts</h4>
+                        <ul>
+                            <li><code>__global__</code>: Device function callable from host</li>
+                            <li><code>blockIdx</code>: Block index in grid</li>
+                            <li><code>threadIdx</code>: Thread index in block</li>
+                            <li>Grid/Block hierarchy for parallelism</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Slide 6: Sequential vs Parallel -->
+            <section>
+                <h2>Sequential vs Parallel Execution</h2>
+                <div class="code-comparison">
+                    <div class="code-block">
+                        <h4>Baseline: Sequential (baseline_add_cuda.cu)</h4>
+                        <pre><code>
+__global__ void addSequential(
+    const float* A, const float* B, 
+    float* C, int n) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int i = 0; i < n; ++i) {
+            C[i] = A[i] + B[i];
+        }
+    }
+}
+                        </code></pre>
+                        <p>❌ Only 1 thread does all work</p>
+                    </div>
+                    <div class="code-block">
+                        <h4>Optimized: Parallel (optimized_add_cuda_parallel.cu)</h4>
+                        <pre><code>
+__global__ void addParallel(
+    const float* A, const float* B, 
+    float* C, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        C[idx] = A[idx] + B[idx];
+    }
+}
+                        </code></pre>
+                        <p>✅ All threads work in parallel</p>
+                    </div>
+                </div>
+                <p><span class="highlight">3881x speedup</span> from proper parallelization</p>
+            </section>
+
+            <!-- Slide 7: ILP Optimization -->
+            <section>
+                <h2>Instruction-Level Parallelism (ILP)</h2>
+                <div class="code-comparison">
+                    <div class="code-block">
+                        <h4>Baseline: 1 chain per thread</h4>
+                        <pre><code>
+// baseline_attention_ilp.py
+self._extension.sequential_ops(dst, src)
+// Low ILP: dependent operations
+                        </code></pre>
+                        <p>❌ Limited instruction parallelism</p>
+                    </div>
+                    <div class="code-block">
+                        <h4>Optimized: 4 chains per thread</h4>
+                        <pre><code>
+// optimized_attention_ilp.py
+self._extension.unrolled_ilp(dst, src)
+// High ILP: 4 independent chains
+                        </code></pre>
+                        <p>✅ 4-way ILP for better throughput</p>
+                    </div>
+                </div>
+                <p><span class="highlight">265.82x speedup</span> from increased ILP</p>
+            </section>
+
+            <!-- Slide 8: Bank Conflicts -->
+            <section>
+                <h2>Shared Memory Bank Conflicts</h2>
+                <div class="code-comparison">
+                    <div class="code-block">
+                        <h4>Baseline: Bank Conflicts</h4>
+                        <pre><code>
+// baseline_bank_conflicts.cu
+__shared__ float shared_data[TILE_VALUES];
+// All threads access same bank
+acc += shared_data[logical_offset];
+                        </code></pre>
+                        <p>❌ Warp serialization due to bank conflicts</p>
+                    </div>
+                    <div class="code-block">
+                        <h4>Optimized: Padded Memory</h4>
+                        <pre><code>
+// optimized_bank_conflicts.cu
+__shared__ float shared_data[PADDED_VALUES];
+// Padded stride avoids conflicts
+int padded_idx = col * PADDED_STRIDE + row;
+acc += shared_data[padded_idx];
+                        </code></pre>
+                        <p>✅ Unique bank per thread lane</p>
+                    </div>
+                </div>
+                <p>Key: <code>PADDED_STRIDE = NUM_BANKS + 1</code></p>
+            </section>
+
+            <!-- Slide 9: Launch Bounds -->
+            <section>
+                <h2>Launch Bounds Optimization</h2>
+                <div class="code-comparison">
+                    <div class="code-block">
+                        <h4>Baseline: No Launch Bounds</h4>
+                        <pre><code>
+// baseline_launch_bounds_cuda.cu
+__global__ void kernel_no_lb(
+    const float* input, float* output, int n) {
+    // Compiler decides register usage
+}
+                        </code></pre>
+                    </div>
+                    <div class="code-block">
+                        <h4>Optimized: With Launch Bounds</h4>
+                        <pre><code>
+// optimized_launch_bounds_cuda.cu
+__global__ __launch_bounds__(kThreads, kMinBlocksPerSm)
+void kernel_with_lb(
+    const float* input, float* output, int n) {
+    // Hints compiler for better occupancy
+}
+                        </code></pre>
+                    </div>
+                </div>
+                <p><code>__launch_bounds__(1024, 2)</code>: Max threads, min blocks per SM</p>
+            </section>
+
+            <!-- Slide 10: Autotuning -->
+            <section>
+                <h2>Autotuning Optimization</h2>
+                <div class="code-comparison">
+                    <div class="code-block">
+                        <h4>Baseline: Fixed Parameters</h4>
+                        <pre><code>
+// baseline_autotuning.py
+self.block_size = 2048  # Fixed micro-chunk
+for start in range(0, self.N, self.block_size):
+    # Process with fixed chunk size
+                        </code></pre>
+                        <p>❌ May not be optimal for all inputs</p>
+                    </div>
+                    <div class="code-block">
+                        <h4>Optimized: Autotuned Parameters</h4>
+                        <pre><code>
+// optimized_autotuning.py
+self.candidates = [1024, 2048, 4096, 8192]
+self.optimal_chunk = self._autotune_chunk_size()
+# Benchmark each candidate, pick best
+                        </code></pre>
+                        <p>✅ Finds optimal schedule at runtime</p>
+                    </div>
+                </div>
+                <p><span class="highlight">3.92x speedup</span> from optimal chunk selection</p>
+            </section>
+
+            <!-- Slide 11: Memory Optimization Patterns -->
+            <section>
+                <h2>Memory Optimization Patterns</h2>
+                <ul>
+                    <li><strong>Vectorized Access</strong>: Use float4 for coalesced memory access</li>
+                    <li><strong>Shared Memory</strong>: Reduce global memory bandwidth</li>
+                    <li><strong>Bank Conflict Avoidance</strong>: Pad shared memory arrays</li>
+                    <li><strong>Memory Coalescing</strong>: Adjacent threads access adjacent addresses</li>
+                    <li><strong>Unified Memory</strong>: Automatic data migration between CPU/GPU</li>
+                </ul>
+                <br>
+                <p>Key insight: <em>"Memory layout matters as much as computation"</em></p>
+            </section>
+
+            <!-- Slide 12: Profiling Tools -->
+            <section>
+                <h2>Profiling and Analysis</h2>
+                <pre><code>
+# Deep dive profiling
+python -m cli.aisp bench run --targets ch06:add --profile deep_dive --single-gpu
+python -m cli.aisp bench run --targets ch06:attention_ilp --profile deep_dive --single-gpu
+python -m cli.aisp bench run --targets ch06:autotuning --profile deep_dive --single-gpu
+                </code></pre>
+                <h4>Expected Profiler Story:</h4>
+                <ul>
+                    <li><code>add</code>: Removal of framework overhead, better GPU utilization</li>
+                    <li><code>attention_ilp</code>: Higher work per thread via ILP</li>
+                    <li><code>autotuning</code>: Better schedule choice, not different math</li>
+                </ul>
+            </section>
+
+            <!-- Slide 13: Learning Goals -->
+            <section>
+                <h2>Learning Goals</h2>
+                <ol>
+                    <li>Write and launch custom CUDA kernels</li>
+                    <li>Understand occupancy, launch bounds, and register pressure</li>
+                    <li>Use ILP and vectorized memory ops for throughput</li>
+                    <li>Validate unified memory and allocator tuning</li>
+                    <li>Connect wall-clock deltas to profiler evidence</li>
+                </ol>
+                <br>
+                <p><em>"From theoretical knowledge to measured performance improvements"</em></p>
+            </section>
+
+            <!-- Slide 14: Key Takeaways -->
+            <section>
+                <h2>Key Takeaways</h2>
+                <ul>
+                    <li><span class="highlight">Parallelization</span> is fundamental (3881x for simple add)</li>
+                    <li><span class="optimization">ILP</span> dramatically improves throughput (265x)</li>
+                    <li><span class="baseline">Memory layout</span> affects performance significantly</li>
+                    <li><span class="optimization">Autotuning</span> finds optimal configurations</li>
+                    <li><span class="baseline">Launch bounds</span> guide compiler optimizations</li>
+                    <li>Always <span class="highlight">measure and profile</span> your kernels</li>
+                </ul>
+                <br>
+                <p><strong>Next Chapter:</strong> Advanced CUDA Patterns and Multi-GPU</p>
+            </section>
+
+            <!-- Slide 15: Thank You -->
+            <section>
+                <h1>Thank You</h1>
+                <h3>Questions & Discussion</h3>
+                <br>
+                <p>Chapter 6: CUDA Programming Fundamentals</p>
+                <p><small>AI Performance Engineering Book</small></p>
+            </section>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.3.1/reveal.min.js"></script>
+    <script>
+        Reveal.initialize({
+            hash: true,
+            slideNumber: true,
+            transition: 'slide',
+            backgroundTransition: 'fade'
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 5 - Storage and IO Optimization</title>
+<style>
+  :root {
+    --bg-dark: #0f172a;
+    --bg-card: #1e293b;
+    --accent: #38bdf8;
+    --accent2: #818cf8;
+    --accent3: #34d399;
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --danger: #f87171;
+    --warning: #fbbf24;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: var(--bg-dark);
+    color: var(--text);
+    overflow: hidden;
+    height: 100vh;
+  }
+  .slide {
+    display: none;
+    width: 100vw;
+    height: 100vh;
+    padding: 60px 80px;
+    flex-direction: column;
+    justify-content: center;
+  }
+  .slide.active { display: flex; }
+  h1 {
+    font-size: 3.2rem;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 24px;
+    line-height: 1.2;
+  }
+  h2 {
+    font-size: 2.4rem;
+    color: var(--accent);
+    margin-bottom: 20px;
+  }
+  h3 {
+    font-size: 1.5rem;
+    color: var(--accent2);
+    margin: 16px 0 12px;
+  }
+  p, li {
+    font-size: 1.25rem;
+    line-height: 1.8;
+    color: var(--text);
+  }
+  ul { list-style: none; padding-left: 0; }
+  ul li::before {
+    content: "▸ ";
+    color: var(--accent);
+    font-weight: bold;
+  }
+  .subtitle {
+    font-size: 1.6rem;
+    color: var(--text-dim);
+    margin-bottom: 32px;
+  }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px;
+    margin-top: 20px;
+  }
+  .grid-3 {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 30px;
+    margin-top: 20px;
+  }
+  .card {
+    background: var(--bg-card);
+    border-radius: 16px;
+    padding: 32px;
+    border: 1px solid rgba(56, 189, 248, 0.15);
+    transition: transform 0.2s;
+  }
+  .card:hover { transform: translateY(-4px); }
+  .card h3 {
+    margin-top: 0;
+    font-size: 1.3rem;
+  }
+  .card ul li {
+    font-size: 1.1rem;
+    margin-bottom: 6px;
+  }
+  .metric {
+    font-size: 3.5rem;
+    font-weight: 800;
+    color: var(--accent3);
+    text-align: center;
+    margin: 10px 0;
+  }
+  .metric-label {
+    font-size: 1rem;
+    color: var(--text-dim);
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+  }
+  .baseline { border-left: 4px solid var(--danger); }
+  .optimized { border-left: 4px solid var(--accent3); }
+  code {
+    background: rgba(56, 189, 248, 0.1);
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 1.05rem;
+    color: var(--accent);
+  }
+  pre {
+    background: var(--bg-card);
+    border-radius: 12px;
+    padding: 24px;
+    overflow-x: auto;
+    font-size: 1rem;
+    line-height: 1.6;
+    border: 1px solid rgba(56, 189, 248, 0.1);
+    margin-top: 12px;
+  }
+  pre code {
+    background: none;
+    padding: 0;
+    color: var(--text);
+  }
+  .flow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin: 20px 0;
+    flex-wrap: wrap;
+  }
+  .flow-node {
+    background: var(--bg-card);
+    border: 2px solid var(--accent);
+    border-radius: 12px;
+    padding: 16px 24px;
+    text-align: center;
+    min-width: 120px;
+  }
+  .flow-arrow {
+    font-size: 2rem;
+    color: var(--accent);
+  }
+  .flow-node.bottleneck {
+    border-color: var(--danger);
+    background: rgba(248, 113, 113, 0.1);
+  }
+  .flow-node.fast {
+    border-color: var(--accent3);
+    background: rgba(52, 211, 153, 0.1);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+    font-size: 1.15rem;
+  }
+  th, td {
+    padding: 14px 20px;
+    text-align: left;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+  }
+  th {
+    color: var(--accent);
+    font-weight: 600;
+    border-bottom: 2px solid var(--accent);
+  }
+  .speedup {
+    color: var(--accent3);
+    font-weight: 700;
+    font-size: 1.2em;
+  }
+  .nav {
+    position: fixed;
+    bottom: 30px;
+    right: 40px;
+    display: flex;
+    gap: 12px;
+    z-index: 100;
+  }
+  .nav button {
+    background: var(--bg-card);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 10px 24px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 1rem;
+    transition: all 0.2s;
+  }
+  .nav button:hover {
+    background: var(--accent);
+    color: var(--bg-dark);
+  }
+  .slide-counter {
+    position: fixed;
+    bottom: 35px;
+    left: 40px;
+    color: var(--text-dim);
+    font-size: 1rem;
+  }
+  .highlight {
+    background: linear-gradient(135deg, rgba(56, 189, 248, 0.2), rgba(129, 140, 248, 0.2));
+    border-radius: 12px;
+    padding: 24px 32px;
+    margin: 16px 0;
+    border-left: 4px solid var(--accent);
+  }
+  .tag {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-right: 8px;
+  }
+  .tag-baseline { background: rgba(248, 113, 113, 0.2); color: var(--danger); }
+  .tag-optimized { background: rgba(52, 211, 153, 0.2); color: var(--accent3); }
+  .tag-info { background: rgba(56, 189, 248, 0.2); color: var(--accent); }
+  .diagram-box {
+    background: var(--bg-card);
+    border-radius: 16px;
+    padding: 40px;
+    margin-top: 20px;
+    font-family: 'Cascadia Code', monospace;
+    font-size: 1.05rem;
+    line-height: 1.9;
+    white-space: pre;
+    overflow-x: auto;
+    border: 1px solid rgba(56, 189, 248, 0.1);
+  }
+  .comparison-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 3rem;
+    color: var(--accent3);
+    margin: 0 20px;
+  }
+</style>
+</head>
+<body>
+
+<!-- Slide 1: Title -->
+<div class="slide active" id="slide1">
+  <div style="text-align: center; margin-top: -40px;">
+    <div style="font-size: 1.2rem; color: var(--text-dim); letter-spacing: 4px; text-transform: uppercase; margin-bottom: 20px;">AI Performance Engineering</div>
+    <h1 style="font-size: 4rem; margin-bottom: 16px;">Chapter 5</h1>
+    <h1 style="font-size: 3.5rem; margin-bottom: 40px;">Storage & IO Optimization</h1>
+    <p class="subtitle" style="max-width: 800px; margin: 0 auto;">
+      Feeding GPUs efficiently: tune DataLoader workers, vectorize preprocessing, overlap IO with compute, and adopt GPUDirect Storage.
+    </p>
+    <div style="margin-top: 50px; display: flex; justify-content: center; gap: 40px;">
+      <div>
+        <div class="metric">72.6x</div>
+        <div class="metric-label">Vectorization Speedup</div>
+      </div>
+      <div>
+        <div class="metric">2.07x</div>
+        <div class="metric-label">Storage IO Speedup</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 2: The Problem -->
+<div class="slide" id="slide2">
+  <h2>The Problem: GPU Starvation</h2>
+  <p style="margin-bottom: 24px;">GPUs don't care how elegant a kernel is if the input path is late.</p>
+  
+  <div class="flow">
+    <div class="flow-node bottleneck">Disk / NVMe</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-node bottleneck">CPU Staging<br><small style="color:var(--danger)">Bottleneck!</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-node">PCIe Transfer</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-node fast">GPU Compute</div>
+  </div>
+
+  <div class="grid-2" style="margin-top: 40px;">
+    <div class="card baseline">
+      <h3><span class="tag tag-baseline">Baseline</span> Symptoms</h3>
+      <ul>
+        <li>CPU-heavy preprocessing & unvectorized parsing</li>
+        <li>Storage paths serialize work on the host</li>
+        <li>DataLoader leaves visible GPU idle time</li>
+        <li>Pageable memory blocks async transfers</li>
+      </ul>
+    </div>
+    <div class="card optimized">
+      <h3><span class="tag tag-optimized">Optimized</span> Goals</h3>
+      <ul>
+        <li>Vectorized preprocessing removes Python loops</li>
+        <li>Overlap IO with compute via streams</li>
+        <li>Tuned worker/prefetch settings</li>
+        <li>GPUDirect Storage bypasses CPU entirely</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 3: Architecture Overview -->
+<div class="slide" id="slide3">
+  <h2>Architecture: Benchmark Pairs</h2>
+  <p style="margin-bottom: 24px;">Three optimization axes, each with baseline vs. optimized comparison.</p>
+
+  <div class="grid-3">
+    <div class="card">
+      <h3 style="color: var(--accent);">1. Vectorization</h3>
+      <div style="margin: 16px 0;">
+        <span class="tag tag-baseline">baseline</span> Python chunked loop<br>
+        <code>for start in range(0, N, chunk)</code>
+      </div>
+      <div style="margin: 16px 0;">
+        <span class="tag tag-optimized">optimized</span> Single torch kernel<br>
+        <code>data.sum()</code>
+      </div>
+      <div class="metric" style="font-size: 2.5rem; margin-top: 20px;">72.6x</div>
+    </div>
+    <div class="card">
+      <h3 style="color: var(--accent);">2. Storage CPU</h3>
+      <div style="margin: 16px 0;">
+        <span class="tag tag-baseline">baseline</span> Pageable host + every-iter alloc<br>
+        <code>np.load() → torch.from_numpy()</code>
+      </div>
+      <div style="margin: 16px 0;">
+        <span class="tag tag-optimized">optimized</span> mmap + pinned buffers<br>
+        <code>mmap → np.copyto → non_blocking</code>
+      </div>
+      <div class="metric" style="font-size: 2.5rem; margin-top: 20px;">2.07x</div>
+    </div>
+    <div class="card">
+      <h3 style="color: var(--accent);">3. AI Pipeline</h3>
+      <div style="margin: 16px 0;">
+        <span class="tag tag-baseline">baseline</span> Sync read per block<br>
+        <code>np.load(step) → .to(device)</code>
+      </div>
+      <div style="margin: 16px 0;">
+        <span class="tag tag-optimized">optimized</span> Double-buffer + stream overlap<br>
+        <code>mmap + pinned + copy_stream</code>
+      </div>
+      <div class="metric" style="font-size: 2.5rem; margin-top: 20px; color: var(--accent);">Overlap</div>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 4: Vectorization Deep Dive -->
+<div class="slide" id="slide4">
+  <h2>Deep Dive: Vectorization</h2>
+  <p style="margin-bottom: 20px;">1M elements, chunk size 4096 — Python loop vs. single GPU kernel.</p>
+
+  <div class="grid-2">
+    <div>
+      <h3><span class="tag tag-baseline">Baseline</span> Scalar Chunking</h3>
+      <pre><code>result = torch.zeros(1, device=device)
+chunk = 4096
+for start in range(0, N, chunk):  # 244 iterations!
+    result += data[start:start+chunk].sum()</code></pre>
+      <div class="highlight" style="margin-top: 16px;">
+        <strong>Problem:</strong> 244 Python loop iterations, each launching a tiny kernel. Python overhead dominates.
+      </div>
+    </div>
+    <div>
+      <h3><span class="tag tag-optimized">Optimized</span> Vectorized</h3>
+      <pre><code># Single kernel call — no Python loop
+result = data.sum().unsqueeze(0)</code></pre>
+      <div class="highlight" style="margin-top: 16px; border-left-color: var(--accent3);">
+        <strong>Solution:</strong> One fused reduction kernel. Eliminates 243 kernel launches and all Python overhead.
+      </div>
+    </div>
+  </div>
+
+  <table style="margin-top: 30px;">
+    <tr>
+      <th>Metric</th>
+      <th>Baseline</th>
+      <th>Optimized</th>
+      <th>Delta</th>
+    </tr>
+    <tr>
+      <td>Latency</td>
+      <td>3.861 ms</td>
+      <td>0.053 ms</td>
+      <td class="speedup">72.64x faster</td>
+    </tr>
+    <tr>
+      <td>Kernel Launches</td>
+      <td>244</td>
+      <td>1</td>
+      <td class="speedup">244x fewer</td>
+    </tr>
+    <tr>
+      <td>Python Overhead</td>
+      <td>~95% of time</td>
+      <td>~0%</td>
+      <td class="speedup">Eliminated</td>
+    </tr>
+  </table>
+</div>
+
+<!-- Slide 5: Storage CPU Deep Dive -->
+<div class="slide" id="slide5">
+  <h2>Deep Dive: Storage IO Path</h2>
+  <p style="margin-bottom: 20px;">64MB tensor — pageable memory vs. mmap + pinned buffers.</p>
+
+  <div class="grid-2">
+    <div>
+      <h3><span class="tag tag-baseline">Baseline</span> Pageable CPU</h3>
+      <pre><code># Every iteration: full load + new allocation
+cpu_loaded = np.load(filepath)
+data = torch.from_numpy(cpu_loaded).to(device)</code></pre>
+      <div class="diagram-box" style="font-size: 0.9rem; padding: 20px;">
+Disk → <span style="color:var(--danger)">np.load (alloc)</span> → <span style="color:var(--danger)">torch.from_numpy</span> → <span style="color:var(--danger)">CUDA memcpy (pinned?)</span>
+      </div>
+    </div>
+    <div>
+      <h3><span class="tag tag-optimized">Optimized</span> mmap + Pinned</h3>
+      <pre><code># Setup: one-time buffer creation
+host_buf = torch.empty(size, pin_memory=True)
+device_buf = torch.empty(size, device=device)
+
+# Benchmark: zero-alloc hot path
+mapped = np.load(filepath, mmap_mode="r")
+np.copyto(host_view, mapped)
+device_buf.copy_(host_buf, non_blocking=True)</code></pre>
+      <div class="diagram-box" style="font-size: 0.9rem; padding: 20px;">
+Disk → <span style="color:var(--accent3)">mmap view (O(1))</span> → <span style="color:var(--accent3)">pinned buf</span> → <span style="color:var(--accent3)">async DMA</span>
+      </div>
+    </div>
+  </div>
+
+  <table style="margin-top: 30px;">
+    <tr>
+      <th>Optimization</th>
+      <th>Effect</th>
+    </tr>
+    <tr>
+      <td><code>mmap_mode="r"</code></td>
+      <td>Zero-copy file view, OS handles page faults</td>
+    </tr>
+    <tr>
+      <td><code>pin_memory=True</code></td>
+      <td>Enables async DMA transfer to GPU</td>
+    </tr>
+    <tr>
+      <td><code>non_blocking=True</code></td>
+      <td>Overlaps copy with compute on default stream</td>
+    </tr>
+    <tr>
+      <td>Reusable buffers</td>
+      <td>Eliminates per-iteration allocation overhead</td>
+    </tr>
+  </table>
+</div>
+
+<!-- Slide 6: AI Pipeline Overlap -->
+<div class="slide" id="slide6">
+  <h2>Deep Dive: AI Pipeline Overlap</h2>
+  <p style="margin-bottom: 16px;">256 inference blocks — sync reads vs. double-buffered prefetch.</p>
+
+  <div style="margin-bottom: 30px;">
+    <h3>Baseline: Sequential (Sync)</h3>
+    <div class="diagram-box" style="font-size: 1rem;">
+<span style="color:var(--danger)">[Load block 0]</span> → [Compute 0] → <span style="color:var(--danger)">[Load block 1]</span> → [Compute 1] → <span style="color:var(--danger)">[Load block 2]</span> → ...
+│◄── GPU idle ──►│               │◄── GPU idle ──►│               │◄── GPU idle ──►│
+    </div>
+  </div>
+
+  <div>
+    <h3>Optimized: Double-Buffer Overlap</h3>
+    <div class="diagram-box" style="font-size: 1rem;">
+[<span style="color:var(--accent3)">Prefetch 0</span>] → [<span style="color:var(--accent3)">Prefetch 1</span> + Compute 0] → [<span style="color:var(--accent3)">Prefetch 2</span> + Compute 1] → ...
+                  │◄── overlapped ──►│               │◄── overlapped ──►│
+    </div>
+  </div>
+
+  <div class="grid-2" style="margin-top: 24px;">
+    <div class="card">
+      <h3>Key Technique: Double Buffering</h3>
+      <pre><code>host_buffers = [buf0, buf1]   # pinned
+device_buffers = [dev0, dev1]
+copy_stream = torch.cuda.Stream()
+
+# Pipeline: prefetch next while computing current
+stage_to_host(next_slot, step+1)
+enqueue_copy(next_slot)       # on copy_stream
+out = block(current_input)    # on default stream</code></pre>
+    </div>
+    <div class="card">
+      <h3>Stream Synchronization</h3>
+      <pre><code># Default stream waits for copy_stream
+current_stream.wait_stream(copy_stream)
+
+# Non-blocking copy runs on dedicated stream
+with torch.cuda.stream(copy_stream):
+    device_buf.copy_(host_buf, non_blocking=True)</code></pre>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 7: GPUDirect Storage -->
+<div class="slide" id="slide7">
+  <h2>GPUDirect Storage (GDS)</h2>
+  <p style="margin-bottom: 24px;">Bypass CPU entirely: NVMe → GPU via DMA over PCIe.</p>
+
+  <div class="flow" style="margin: 30px 0;">
+    <div class="flow-node">NVMe SSD</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-node fast">PCIe DMA<br><small>Zero CPU copy</small></div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-node fast">GPU VRAM</div>
+  </div>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3>Traditional Path</h3>
+      <div class="diagram-box" style="font-size: 0.95rem;">
+NVMe → <span style="color:var(--danger)">kernel buffer</span> → <span style="color:var(--danger)">user buffer</span> → <span style="color:var(--danger)">pinned buffer</span> → GPU
+       CPU copies: 3              CPU↔GPU copy: 1
+      </div>
+      <p style="margin-top: 12px; color: var(--danger);">4 memory copies, CPU bottleneck</p>
+    </div>
+    <div class="card">
+      <h3>GDS Path</h3>
+      <div class="diagram-box" style="font-size: 0.95rem;">
+NVMe → <span style="color:var(--accent3)">GPU VRAM (RDMA)</span>
+       Zero CPU involvement
+      </div>
+      <p style="margin-top: 12px; color: var(--accent3);">1 DMA transfer, no CPU staging</p>
+    </div>
+  </div>
+
+  <div class="highlight" style="margin-top: 24px;">
+    <strong>Fail-Fast Design:</strong> <code>gds_cufile_minimal.py</code> either confirms usable cuFile/GDS support or exits with <code style="color: var(--danger);">SKIPPED:</code> — no host-mediated fallback numbers published under GDS name.
+  </div>
+</div>
+
+<!-- Slide 8: Benchmark Harness -->
+<div class="slide" id="slide8">
+  <h2>Benchmark Harness Architecture</h2>
+  <p style="margin-bottom: 24px;">95 validity protections ensure reliable, comparable results.</p>
+
+  <div class="grid-2">
+    <div class="card">
+      <h3>Lifecycle</h3>
+      <pre><code>class BaseBenchmark:
+    def setup(self)           # Init, seed=42
+    def benchmark_fn(self)    # Timed hot path
+    def teardown(self)        # Cleanup
+    def get_config(self)      # Iterations, warmup
+    def validate_result(self) # Correctness check</code></pre>
+    </div>
+    <div class="card">
+      <h3>Verification</h3>
+      <pre><code>class VerificationPayloadMixin:
+    def capture_verification_payload(self)
+        self._set_verification_payload(
+            inputs={...},
+            output=self.output,
+            batch_size=...,
+            output_tolerance=(rtol, atol),
+        )</code></pre>
+    </div>
+  </div>
+
+  <div class="grid-3" style="margin-top: 20px;">
+    <div class="card" style="text-align: center;">
+      <div class="metric" style="font-size: 2rem;">95</div>
+      <div class="metric-label">Validity Checks</div>
+    </div>
+    <div class="card" style="text-align: center;">
+      <div class="metric" style="font-size: 2rem;">42</div>
+      <div class="metric-label">Deterministic Seed</div>
+    </div>
+    <div class="card" style="text-align: center;">
+      <div class="metric" style="font-size: 2rem;">strict</div>
+      <div class="metric-label">Default Profile</div>
+    </div>
+  </div>
+
+  <div class="highlight" style="margin-top: 16px;">
+    <strong>Post-Timing Verification:</strong> Benchmarks run once with warmup + N iterations. Outputs captured via <code>get_verify_output()</code>, compared after timing completes. No redundant runs.
+  </div>
+</div>
+
+<!-- Slide 9: Results -->
+<div class="slide" id="slide9">
+  <h2>Measured Results</h2>
+  <p style="margin-bottom: 30px;">Validated on B200 hardware from canonical run artifacts.</p>
+
+  <table>
+    <tr>
+      <th>Benchmark Target</th>
+      <th>Baseline</th>
+      <th>Optimized</th>
+      <th>Speedup</th>
+      <th>What Changed</th>
+    </tr>
+    <tr>
+      <td><strong>vectorization</strong></td>
+      <td>3.861 ms</td>
+      <td>0.053 ms</td>
+      <td class="speedup">72.64x</td>
+      <td>Python loops → vectorized kernel</td>
+    </tr>
+    <tr>
+      <td><strong>storage_cpu</strong></td>
+      <td>111.652 ms</td>
+      <td>53.898 ms</td>
+      <td class="speedup">2.07x</td>
+      <td>Pageable → mmap + pinned buffers</td>
+    </tr>
+    <tr>
+      <td><strong>ai (info)</strong></td>
+      <td colspan="4" style="color: var(--text-dim);">Overlap/control demo — not a canonical speed target</td>
+    </tr>
+  </table>
+
+  <div class="grid-2" style="margin-top: 40px;">
+    <div class="card" style="text-align: center;">
+      <div class="metric-label">Headline Win</div>
+      <div class="metric" style="font-size: 4rem;">72.6x</div>
+      <p style="color: var(--text-dim); margin-top: 8px;">Preprocessing is the bottleneck, not raw hardware</p>
+    </div>
+    <div class="card" style="text-align: center;">
+      <div class="metric-label">Key Insight</div>
+      <div style="font-size: 1.4rem; margin-top: 20px; color: var(--accent);">
+        "The headline win is often preprocessing, not raw storage hardware."
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 10: Directory Layout -->
+<div class="slide" id="slide10">
+  <h2>Directory Layout</h2>
+  
+  <div class="grid-2">
+    <div class="card">
+      <h3 style="color: var(--accent3);">Benchmark Pairs</h3>
+      <pre style="font-size: 0.95rem;">baseline_storage_cpu.py
+optimized_storage_cpu.py
+
+baseline_vectorization.py
+optimized_vectorization.py
+
+baseline_ai.py
+optimized_ai.py
+
+baseline_host_staged_reduction.py
+optimized_host_staged_reduction.py
+
+baseline_distributed_multigpu.py
+optimized_distributed_multigpu.py</pre>
+    </div>
+    <div class="card">
+      <h3 style="color: var(--accent2);">Utilities & Harness</h3>
+      <pre style="font-size: 0.95rem;">ai_common.py          # Shared TinyBlock model
+metrics_common.py     # Storage metrics helpers
+compare.py            # Harness entrypoint
+storage_io_optimization.py  # Overlap demo
+
+gds_cufile_minimal.py         # GDS capability probe
+gpudirect_storage_example.py  # GDS example
+
+requirements.txt
+expectations_{hardware}.json  # Regression baselines</pre>
+    </div>
+  </div>
+
+  <div class="highlight" style="margin-top: 24px;">
+    <strong>Repro Commands:</strong><br>
+    <code>python -m ch05.compare</code> — Quick comparison<br>
+    <code>python -m cli.aisp bench run --targets ch05 --profile minimal</code> — Full harness run<br>
+    <code>python -m ch05.gds_cufile_minimal /tmp/gds_test.bin 1073741824 --generate</code> — GDS probe
+  </div>
+</div>
+
+<!-- Slide 11: Key Takeaways -->
+<div class="slide" id="slide11">
+  <h2>Key Takeaways</h2>
+
+  <div class="grid-2" style="margin-top: 30px;">
+    <div class="card">
+      <h3 style="color: var(--accent3);">Do This</h3>
+      <ul>
+        <li>Vectorize preprocessing — eliminate Python loops</li>
+        <li>Use <code>mmap_mode="r"</code> for storage reads</li>
+        <li>Pin host buffers for async DMA transfers</li>
+        <li>Double-buffer to overlap IO with compute</li>
+        <li>Tune DataLoader workers & prefetch factor</li>
+        <li>Use GPU streams for pipeline parallelism</li>
+        <li>Evaluate GDS when NVMe is the bottleneck</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="color: var(--danger);">Avoid This</h3>
+      <ul>
+        <li>Python loops over tensor chunks</li>
+        <li>Per-iteration memory allocation</li>
+        <li>Pageable memory for GPU transfers</li>
+        <li>Synchronous storage reads in hot paths</li>
+        <li>Publishing fallback numbers as GDS results</li>
+        <li>Ignoring GPU idle time in profiling</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight" style="margin-top: 30px; text-align: center;">
+    <div style="font-size: 1.5rem; color: var(--accent); margin-bottom: 8px;">
+      "GPUs do not care how elegant a kernel is if the input path is late."
+    </div>
+    <p style="color: var(--text-dim);">
+      Detect IO stalls → restructure pipeline → keep GPUs busy
+    </p>
+  </div>
+</div>
+
+<!-- Slide 12: End -->
+<div class="slide" id="slide12">
+  <div style="text-align: center; margin-top: -60px;">
+    <h1 style="font-size: 3.5rem; margin-bottom: 40px;">Chapter 5 Complete</h1>
+    <div style="font-size: 1.3rem; color: var(--text-dim); max-width: 700px; margin: 0 auto;">
+      Storage and IO Optimization — from Python loops to vectorized kernels, from pageable memory to GPUDirect Storage.
+    </div>
+    <div style="margin-top: 50px; display: flex; justify-content: center; gap: 60px;">
+      <div>
+        <div class="metric">72.6x</div>
+        <div class="metric-label">Vectorization</div>
+      </div>
+      <div>
+        <div class="metric">2.07x</div>
+        <div class="metric-label">Storage IO</div>
+      </div>
+      <div>
+        <div class="metric">95</div>
+        <div class="metric-label">Validity Checks</div>
+      </div>
+    </div>
+    <p style="margin-top: 60px; color: var(--text-dim); font-size: 1.1rem;">
+      AI Performance Engineering · Chapter 5
+    </p>
+  </div>
+</div>
+
+<!-- Navigation -->
+<div class="nav">
+  <button onclick="prevSlide()">← Prev</button>
+  <button onclick="nextSlide()">Next →</button>
+</div>
+<div class="slide-counter" id="counter">1 / 12</div>
+
+<script>
+  let current = 0;
+  const slides = document.querySelectorAll('.slide');
+  const counter = document.getElementById('counter');
+
+  function showSlide(n) {
+    slides[current].classList.remove('active');
+    current = ((n % slides.length) + slides.length) % slides.length;
+    slides[current].classList.add('active');
+    counter.textContent = `${current + 1} / ${slides.length}`;
+  }
+
+  function nextSlide() { showSlide(current + 1); }
+  function prevSlide() { showSlide(current - 1); }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); nextSlide(); }
+    if (e.key === 'ArrowLeft') { e.preventDefault(); prevSlide(); }
+  });
+</script>
+
+</body>
+</html>

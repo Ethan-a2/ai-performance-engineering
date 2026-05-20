@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 16 - Production Inference Optimization</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0f0f23;
+            color: #e0e0e0;
+            overflow: hidden;
+            height: 100vh;
+        }
+        
+        .slide-container {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+        
+        .slide {
+            display: none;
+            width: 90%;
+            max-width: 1200px;
+            padding: 40px;
+            animation: fadeIn 0.5s ease-in;
+        }
+        
+        .slide.active {
+            display: block;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        h1 {
+            font-size: 3rem;
+            background: linear-gradient(135deg, #00d2ff, #7b2cbf);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 20px;
+        }
+        
+        h2 {
+            font-size: 2rem;
+            color: #00d2ff;
+            margin-bottom: 25px;
+            border-bottom: 2px solid #00d2ff;
+            padding-bottom: 10px;
+        }
+        
+        h3 {
+            font-size: 1.4rem;
+            color: #7b2cbf;
+            margin: 15px 0;
+        }
+        
+        .subtitle {
+            font-size: 1.5rem;
+            color: #888;
+            margin-bottom: 30px;
+        }
+        
+        .content {
+            font-size: 1.1rem;
+            line-height: 1.8;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 25px;
+            margin-top: 20px;
+        }
+        
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 25px;
+            border: 1px solid rgba(0, 210, 255, 0.2);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0, 210, 255, 0.2);
+        }
+        
+        .card h3 {
+            color: #00d2ff;
+            margin-bottom: 15px;
+        }
+        
+        .metric {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #4ade80;
+        }
+        
+        .metric-label {
+            font-size: 0.9rem;
+            color: #888;
+        }
+        
+        .code-block {
+            background: #1a1a2e;
+            border-radius: 10px;
+            padding: 20px;
+            font-family: 'Fira Code', 'Consolas', monospace;
+            font-size: 0.9rem;
+            overflow-x: auto;
+            margin: 15px 0;
+            border-left: 4px solid #7b2cbf;
+        }
+        
+        .keyword { color: #ff79c6; }
+        .string { color: #f1fa8c; }
+        .comment { color: #6272a4; }
+        .function { color: #50fa7b; }
+        .number { color: #bd93f9; }
+        
+        .nav-controls {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            display: flex;
+            gap: 15px;
+        }
+        
+        .nav-btn {
+            background: rgba(0, 210, 255, 0.2);
+            border: 1px solid #00d2ff;
+            color: #00d2ff;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+        }
+        
+        .nav-btn:hover {
+            background: #00d2ff;
+            color: #0f0f23;
+        }
+        
+        .progress {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #00d2ff, #7b2cbf);
+            transition: width 0.3s ease;
+        }
+        
+        .slide-counter {
+            position: fixed;
+            bottom: 30px;
+            left: 30px;
+            color: #888;
+            font-size: 1rem;
+        }
+        
+        .highlight {
+            background: linear-gradient(135deg, rgba(0, 210, 255, 0.1), rgba(123, 44, 191, 0.1));
+            padding: 20px;
+            border-radius: 10px;
+            margin: 15px 0;
+        }
+        
+        .file-tree {
+            font-family: 'Fira Code', monospace;
+            font-size: 0.9rem;
+            background: #1a1a2e;
+            padding: 20px;
+            border-radius: 10px;
+        }
+        
+        .file-tree .folder { color: #00d2ff; }
+        .file-tree .file { color: #e0e0e0; }
+        .file-tree .baseline { color: #f1fa8c; }
+        .file-tree .optimized { color: #50fa7b; }
+        
+        ul {
+            list-style: none;
+            margin: 10px 0;
+        }
+        
+        ul li {
+            padding: 8px 0;
+            padding-left: 25px;
+            position: relative;
+        }
+        
+        ul li:before {
+            content: "▸";
+            color: #00d2ff;
+            position: absolute;
+            left: 0;
+        }
+        
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        
+        .comparison-table th, .comparison-table td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .comparison-table th {
+            background: rgba(0, 210, 255, 0.1);
+            color: #00d2ff;
+        }
+        
+        .comparison-table tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .tag {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            margin: 2px;
+        }
+        
+        .tag-flash { background: rgba(0, 210, 255, 0.2); color: #00d2ff; }
+        .tag-quant { background: rgba(123, 44, 191, 0.2); color: #bd93f9; }
+        .tag-sched { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+        .tag-cache { background: rgba(255, 121, 198, 0.2); color: #ff79c6; }
+    </style>
+</head>
+<body>
+    <div class="slide-container">
+        <!-- Slide 1: Title -->
+        <div class="slide active" id="slide1">
+            <h1>Chapter 16</h1>
+            <div class="subtitle">Production Inference Optimization</div>
+            <div class="content">
+                <p>将推理服务从"一堆优化技巧"变成"延迟预算管理"</p>
+                <div class="grid" style="margin-top: 40px;">
+                    <div class="card">
+                        <h3>核心问题</h3>
+                        <p>哪些服务路径的改变能真正改善稳态延迟、调度效率或内存行为？</p>
+                    </div>
+                    <div class="card">
+                        <h3>验证方法</h3>
+                        <p>使用统一的基准测试框架，确保增益可比较、可复现</p>
+                    </div>
+                    <div class="card">
+                        <h3>目标硬件</h3>
+                        <p>B200 / GB200 Blackwell 架构优化</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 2: Overview -->
+        <div class="slide" id="slide2">
+            <h2>目录结构总览</h2>
+            <div class="file-tree">
+                <span class="folder">ch16/</span><br>
+                ├── <span class="baseline">baseline_*.py</span> &nbsp;&nbsp;<span style="color:#888">基准实现</span><br>
+                ├── <span class="optimized">optimized_*.py</span> &nbsp;&nbsp;<span style="color:#888">优化变体</span><br>
+                ├── <span class="file">inference_*.py</span> &nbsp;&nbsp;<span style="color:#888">推理编排脚本</span><br>
+                ├── <span class="file">moe_*.py</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#888">MoE 推理测试</span><br>
+                ├── <span class="file">cache_monitoring.py</span><br>
+                ├── <span class="file">scheduler.py</span><br>
+                ├── <span class="file">compare.py</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#888">基准对比入口</span><br>
+                └── <span class="file">configs/</span> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color:#888">配置目录</span>
+            </div>
+            <div class="grid" style="margin-top: 20px;">
+                <div class="tag tag-flash">Flash SDP</div>
+                <div class="tag tag-flash">Block Sparse</div>
+                <div class="tag tag-quant">AWQ/GPTQ/SmoothQuant</div>
+                <div class="tag tag-quant">NVFP4</div>
+                <div class="tag tag-sched">Runtime Scheduler</div>
+                <div class="tag tag-cache">Cache Monitoring</div>
+            </div>
+        </div>
+        
+        <!-- Slide 3: Performance Results -->
+        <div class="slide" id="slide3">
+            <h2>实测性能提升</h2>
+            <div class="content">
+                <p style="color: #888; margin-bottom: 20px;">来源: artifacts/runs/20260303_163946__bench__profile_minimal_targets_20/</p>
+                <table class="comparison-table">
+                    <thead>
+                        <tr>
+                            <th>优化目标</th>
+                            <th>基线</th>
+                            <th>优化后</th>
+                            <th>加速比</th>
+                            <th>优化手段</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>flash_sdp</code></td>
+                            <td>0.322 ms</td>
+                            <td>0.198 ms</td>
+                            <td><span class="metric" style="font-size:1.5rem">1.63x</span></td>
+                            <td>Flash SDP 路径</td>
+                        </tr>
+                        <tr>
+                            <td><code>flashinfer_block_sparse</code></td>
+                            <td>0.941 ms</td>
+                            <td>0.239 ms</td>
+                            <td><span class="metric" style="font-size:1.5rem">3.94x</span></td>
+                            <td>块稀疏注意力</td>
+                        </tr>
+                        <tr>
+                            <td><code>runtime_scheduler</code></td>
+                            <td>112.762 ms</td>
+                            <td>63.425 ms</td>
+                            <td><span class="metric" style="font-size:1.5rem">1.78x</span></td>
+                            <td>调度器/运行时协调</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <!-- Slide 4: Flash SDP -->
+        <div class="slide" id="slide4">
+            <h2>Flash SDP 注意力优化</h2>
+            <div class="grid">
+                <div class="card">
+                    <h3>基线实现</h3>
+                    <div class="code-block">
+<span class="keyword">class</span> <span class="function">BaselineFlashSDP</span>:<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="comment"># 标准注意力实现</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;Q, K, V = <span class="function">project</span>(x)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;attn = Q @ K.T / sqrt(d)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;attn = <span class="function">softmax</span>(attn)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">return</span> attn @ V
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>优化实现</h3>
+                    <div class="code-block">
+<span class="keyword">class</span> <span class="function">OptimizedFlashSDP</span>:<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="comment"># Flash Attention 路径</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;Q, K, V = <span class="function">project</span>(x)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">return</span> <span class="function">F.scaled_dot_product_attention</span>(<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Q, K, V,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;is_causal=<span class="number">True</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;)
+                    </div>
+                </div>
+            </div>
+            <div class="highlight" style="margin-top: 20px;">
+                <strong>关键优势:</strong> 减少内存访问、更好的 tiling、硬件利用率提升
+            </div>
+        </div>
+        
+        <!-- Slide 5: Block Sparse Attention -->
+        <div class="slide" id="slide5">
+            <h2>块稀疏注意力 (Block Sparse Attention)</h2>
+            <div class="content">
+                <div class="grid">
+                    <div>
+                        <h3>3.94x 加速的秘密</h3>
+                        <ul>
+                            <li>结构化稀疏模式，跳过不重要的注意力块</li>
+                            <li>FlashInfer 内核优化</li>
+                            <li>适合长序列推理场景</li>
+                        </ul>
+                    </div>
+                    <div class="card">
+                        <h3>使用场景</h3>
+                        <div class="code-block">
+<span class="comment"># 块稀疏模式示例</span><br>
+block_size = <span class="number">64</span><br>
+sparse_mask = <span class="function">create_block_sparse_mask</span>(<br>
+&nbsp;&nbsp;&nbsp;&nbsp;seq_len, <br>
+&nbsp;&nbsp;&nbsp;&nbsp;block_size,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;sparsity_ratio=<span class="number">0.5</span><br>
+)<br>
+<span class="comment"># 仅计算非零块</span><br>
+output = <span class="function">flashinfer_block_sparse_attn</span>(<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Q, K, V, sparse_mask<br>
+)
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 6: Quantization -->
+        <div class="slide" id="slide6">
+            <h2>后训练量化 (PTQ)</h2>
+            <div class="grid">
+                <div class="card">
+                    <h3>AWQ</h3>
+                    <p>Activation-aware Weight Quantization</p>
+                    <ul>
+                        <li>基于激活分布保护重要权重</li>
+                        <li>4-bit 权重量化</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>GPTQ</h3>
+                    <p>Generalized PTQ</p>
+                    <ul>
+                        <li>逐层量化，最小化重建误差</li>
+                        <li>Hessian 信息引导</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>SmoothQuant</h3>
+                    <p>平滑量化</p>
+                    <ul>
+                        <li>迁移量化难度到权重</li>
+                        <li>W8A8 混合精度</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>NVFP4</h3>
+                    <p>NVIDIA FP4 格式</p>
+                    <ul>
+                        <li>Blackwell 原生支持</li>
+                        <li>极致压缩比</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 7: NVFP4 MLP -->
+        <div class="slide" id="slide7">
+            <h2>NVFP4 MLP 对比</h2>
+            <div class="grid">
+                <div class="card">
+                    <h3>Baseline (BF16)</h3>
+                    <div class="code-block">
+config = <span class="function">NVFP4MLPConfig</span>(<br>
+&nbsp;&nbsp;&nbsp;&nbsp;batch_size=<span class="number">512</span>,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;d_model=<span class="number">8192</span>,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;d_ff=<span class="number">32768</span>,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;num_layers=<span class="number">2</span>,<br>
+)<br>
+<span class="keyword">return</span> <span class="function">NVFP4MLPBenchmark</span>(<br>
+&nbsp;&nbsp;&nbsp;&nbsp;config, use_nvfp4=<span class="number">False</span>
+)
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Optimized (NVFP4)</h3>
+                    <div class="code-block">
+config = <span class="function">NVFP4MLPConfig</span>(<br>
+&nbsp;&nbsp;&nbsp;&nbsp;batch_size=<span class="number">512</span>,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;d_model=<span class="number">8192</span>,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;d_ff=<span class="number">32768</span>,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;num_layers=<span class="number">2</span>,<br>
+)<br>
+<span class="keyword">return</span> <span class="function">NVFP4MLPBenchmark</span>(<br>
+&nbsp;&nbsp;&nbsp;&nbsp;config, use_nvfp4=<span class="number">True</span>
+)
+                    </div>
+                </div>
+            </div>
+            <div class="highlight" style="margin-top: 20px;">
+                <strong>关键差异:</strong> <code>use_nvfp4=True/False</code> - 其他参数完全一致，确保公平对比
+            </div>
+        </div>
+        
+        <!-- Slide 8: Runtime Scheduler -->
+        <div class="slide" id="slide8">
+            <h2>运行时调度优化</h2>
+            <div class="content">
+                <div class="grid">
+                    <div class="card">
+                        <h3>1.78x 提升</h3>
+                        <p>从 112.762ms 降至 63.425ms</p>
+                    </div>
+                    <div class="card">
+                        <h3>优化策略</h3>
+                        <ul>
+                            <li>请求批处理优化</li>
+                            <li>动态批大小调整</li>
+                            <li>预填充/解码分离</li>
+                            <li>连续批处理</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="code-block" style="margin-top: 20px;">
+<span class="keyword">class</span> <span class="function">RuntimeScheduler</span>:<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">def</span> <span class="function">schedule</span>(self, requests):<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="comment"># 智能调度逻辑</span><br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;batch = self.<span class="function">create_optimal_batch</span>(requests)<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="keyword">return</span> self.<span class="function">execute_batch</span>(batch)
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 9: Graph Compilation -->
+        <div class="slide" id="slide9">
+            <h2>图编译优化</h2>
+            <div class="grid">
+                <div class="card">
+                    <h3>Piecewise Graph Capture</h3>
+                    <p>分段图捕获</p>
+                    <ul>
+                        <li>将模型分解为多个子图</li>
+                        <li>独立捕获每段</li>
+                        <li>减少重编译开销</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>Regional Compilation</h3>
+                    <p>区域编译</p>
+                    <ul>
+                        <li>按区域选择性编译</li>
+                        <li>稳态回放优化</li>
+                        <li>Graph bucket 管理</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="highlight" style="margin-top: 20px;">
+                <strong>关键指标:</strong> <code>capture_ms</code>, <code>graph_bucket_count</code>, <code>steady_state_only</code>
+            </div>
+        </div>
+        
+        <!-- Slide 10: Monitoring -->
+        <div class="slide" id="slide10">
+            <h2>监控与遥测</h2>
+            <div class="grid">
+                <div class="card">
+                    <h3>Cache Monitoring</h3>
+                    <div class="code-block">
+<span class="comment"># 缓存健康检查</span><br>
+python cache_monitoring.py<br>
+<span class="comment"># KV Cache 使用率</span><br>
+<span class="comment"># 内存碎片分析</span><br>
+<span class="comment"># 分配器状态</span>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>DCGM Prometheus Exporter</h3>
+                    <div class="code-block">
+<span class="comment"># GPU 指标导出</span><br>
+dcgm_prometheus_exporter.py<br>
+<span class="comment"># 每 GPU 指标</span><br>
+<span class="comment"># Prometheus 格式</span><br>
+<span class="comment"># Grafana 可视化</span>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Perplexity Evaluation</h3>
+                    <div class="code-block">
+<span class="comment"># 精度验证</span><br>
+python perplexity_eval.py<br>
+<span class="comment"># 量化后精度检查</span><br>
+<span class="comment"># 困惑度对比</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 11: Multi-GPU & MoE -->
+        <div class="slide" id="slide11">
+            <h2>多GPU & MoE 推理</h2>
+            <div class="grid">
+                <div class="card">
+                    <h3>Multi-GPU Inference</h3>
+                    <ul>
+                        <li>张量并行</li>
+                        <li>流水线并行</li>
+                        <li>NVLink 效率验证</li>
+                        <li>对称内存推理</li>
+                    </ul>
+                </div>
+                <div class="card">
+                    <h3>MoE Performance</h3>
+                    <ul>
+                        <li>专家路由优化</li>
+                        <li>专家批处理</li>
+                        <li>负载均衡</li>
+                        <li>合成 MoE 基准</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="code-block" style="margin-top: 20px;">
+<span class="comment"># 多GPU验证</span><br>
+python multi_gpu_validation.py<br><br>
+<span class="comment"># MoE 基准测试</span><br>
+python moe_performance_benchmark.py<br>
+python synthetic_moe_inference_benchmark.py
+            </div>
+        </div>
+        
+        <!-- Slide 12: Profiling -->
+        <div class="slide" id="slide12">
+            <h2>性能分析工具</h2>
+            <div class="content">
+                <div class="code-block">
+<span class="comment"># 深度分析命令</span><br>
+python -m cli.aisp bench run \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--targets ch16:flash_sdp \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--profile deep_dive \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--single-gpu<br><br>
+python -m cli.aisp bench run \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--targets ch16:flashinfer_block_sparse \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--profile deep_dive \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--single-gpu<br><br>
+python -m cli.aisp bench run \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--targets ch16:runtime_scheduler \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--profile deep_dive \<br>
+&nbsp;&nbsp;&nbsp;&nbsp;--single-gpu
+                </div>
+                <div class="grid" style="margin-top: 20px;">
+                    <div class="card">
+                        <h3>Flash SDP</h3>
+                        <p>注意力后端选择分析</p>
+                    </div>
+                    <div class="card">
+                        <h3>Block Sparse</h3>
+                        <p>结构化稀疏收益分析</p>
+                    </div>
+                    <div class="card">
+                        <h3>Runtime Scheduler</h3>
+                        <p>队列和调度开销分析</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 13: Quick Start -->
+        <div class="slide" id="slide13">
+            <h2>快速开始</h2>
+            <div class="content">
+                <div class="code-block">
+<span class="comment"># 1. 对比测试</span><br>
+python -m ch16.compare<br><br>
+<span class="comment"># 2. 列出所有目标</span><br>
+python -m cli.aisp bench list-targets --chapter ch16<br><br>
+<span class="comment"># 3. 运行最小配置</span><br>
+python -m cli.aisp bench run --targets ch16 --profile minimal<br><br>
+<span class="comment"># 4. 验证检查</span><br>
+python optimized_dense_attention_flash.py --profile minimal<br>
+python symmetric_memory_inference.py --validate<br>
+python inference_server_load_test.py --duration 120
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 14: Summary -->
+        <div class="slide" id="slide14">
+            <h2>总结</h2>
+            <div class="content">
+                <div class="grid">
+                    <div class="card">
+                        <h3>注意力优化</h3>
+                        <div class="metric">3.94x</div>
+                        <p>块稀疏注意力加速</p>
+                    </div>
+                    <div class="card">
+                        <h3>调度优化</h3>
+                        <div class="metric">1.78x</div>
+                        <p>运行时调度加速</p>
+                    </div>
+                    <div class="card">
+                        <h3>Flash SDP</h3>
+                        <div class="metric">1.63x</div>
+                        <p>注意力后端加速</p>
+                    </div>
+                </div>
+                <div class="highlight" style="margin-top: 30px;">
+                    <h3>核心理念</h3>
+                    <p>生产推理优化 = 延迟预算管理 + 可复现的基准测试 + 硬件感知的优化策略</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Navigation -->
+    <div class="nav-controls">
+        <button class="nav-btn" onclick="prevSlide()">← 上一页</button>
+        <button class="nav-btn" onclick="nextSlide()">下一页 →</button>
+    </div>
+    
+    <div class="slide-counter">
+        <span id="currentSlide">1</span> / <span id="totalSlides">14</span>
+    </div>
+    
+    <div class="progress" id="progress"></div>
+    
+    <script>
+        let currentSlide = 1;
+        const totalSlides = 14;
+        
+        function showSlide(n) {
+            const slides = document.querySelectorAll('.slide');
+            slides.forEach(slide => slide.classList.remove('active'));
+            
+            currentSlide = n;
+            if (currentSlide > totalSlides) currentSlide = 1;
+            if (currentSlide < 1) currentSlide = totalSlides;
+            
+            document.getElementById(`slide${currentSlide}`).classList.add('active');
+            document.getElementById('currentSlide').textContent = currentSlide;
+            document.getElementById('progress').style.width = `${(currentSlide / totalSlides) * 100}%`;
+        }
+        
+        function nextSlide() {
+            showSlide(currentSlide + 1);
+        }
+        
+        function prevSlide() {
+            showSlide(currentSlide - 1);
+        }
+        
+        // Keyboard navigation
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowRight' || e.key === ' ') {
+                e.preventDefault();
+                nextSlide();
+            } else if (e.key === 'ArrowLeft') {
+                e.preventDefault();
+                prevSlide();
+            }
+        });
+        
+        // Touch support
+        let touchStartX = 0;
+        document.addEventListener('touchstart', function(e) {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+        
+        document.addEventListener('touchend', function(e) {
+            const touchEndX = e.changedTouches[0].screenX;
+            if (touchStartX - touchEndX > 50) nextSlide();
+            if (touchEndX - touchStartX > 50) prevSlide();
+        });
+    </script>
+</body>
+</html>

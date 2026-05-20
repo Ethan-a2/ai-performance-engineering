@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch04 - 分布式通信与多GPU调度</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;900&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --bg:#0f1117;--card:#1a1d27;--accent:#6c5ce7;--accent2:#00cec9;
+    --green:#00b894;--red:#e17055;--yellow:#fdcb6e;--text:#dfe6e9;
+    --dim:#636e72;--white:#fff;
+  }
+  html,body{height:100%;font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);overflow:hidden}
+  .deck{display:flex;flex-direction:column;height:100vh;width:100vw}
+  .slide{display:none;flex-direction:column;justify-content:center;align-items:center;
+    padding:4vh 6vw;height:100%;overflow-y:auto;animation:fadeIn .4s ease}
+  .slide.active{display:flex}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:none}}
+
+  /* nav */
+  .nav{position:fixed;bottom:2vh;right:3vw;display:flex;gap:.6rem;z-index:99;align-items:center}
+  .nav button{background:var(--card);color:var(--text);border:1px solid #333;padding:.45rem .9rem;
+    border-radius:6px;cursor:pointer;font-size:.85rem;transition:.2s}
+  .nav button:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .nav .counter{color:var(--dim);font-size:.8rem;min-width:3.5rem;text-align:center}
+
+  /* progress bar */
+  .progress{position:fixed;top:0;left:0;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent2));
+    transition:width .35s ease;z-index:99}
+
+  /* slide typography */
+  h1{font-size:clamp(2rem,4.5vw,3.6rem);font-weight:900;line-height:1.15;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;
+    -webkit-text-fill-color:transparent;background-clip:text;text-align:center;max-width:90%}
+  h2{font-size:clamp(1.4rem,3vw,2.2rem);font-weight:700;color:var(--white);margin-bottom:1.2rem;text-align:center}
+  h3{font-size:clamp(1rem,2vw,1.4rem);font-weight:600;color:var(--accent2);margin:1rem 0 .5rem}
+  p,.desc{font-size:clamp(.85rem,1.4vw,1.1rem);color:var(--dim);line-height:1.7;max-width:52rem;text-align:center}
+  .subtitle{font-size:clamp(.9rem,1.6vw,1.2rem);color:var(--accent2);margin-top:.6rem;font-weight:300;letter-spacing:.03em}
+  .small{font-size:.8rem;color:var(--dim)}
+
+  /* cards row */
+  .cards{display:flex;gap:1.2rem;flex-wrap:wrap;justify-content:center;margin-top:1.4rem;width:100%;max-width:60rem}
+  .card{background:var(--card);border:1px solid #2d2f3a;border-radius:10px;padding:1.2rem 1.4rem;flex:1 1 15rem;max-width:18rem;
+    display:flex;flex-direction:column;gap:.4rem;transition:.25s}
+  .card:hover{border-color:var(--accent);transform:translateY(-3px)}
+  .card .icon{font-size:1.6rem}
+  .card .label{font-size:.75rem;color:var(--accent);text-transform:uppercase;letter-spacing:.08em;font-weight:600}
+  .card .val{font-size:clamp(.82rem,1.1vw,.95rem);color:var(--text);line-height:1.55}
+
+  /* table */
+  table{border-collapse:collapse;margin-top:1rem;width:100%;max-width:54rem;font-size:clamp(.72rem,1.1vw,.88rem)}
+  th{background:var(--accent);color:#fff;padding:.55rem .7rem;text-align:left;font-weight:600}
+  td{padding:.5rem .7rem;border-bottom:1px solid #2d2f3a;color:var(--text)}
+  tr:hover td{background:rgba(108,92,231,.08)}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .win{color:var(--green);font-weight:600}
+  .loss{color:var(--red)}
+
+  /* code */
+  pre{background:#14161e;border:1px solid #2d2f3a;border-radius:8px;padding:1rem 1.2rem;
+    font-size:clamp(.68rem,1vw,.82rem);line-height:1.6;overflow-x:auto;max-width:54rem;width:100%;
+    font-family:'JetBrains Mono',monospace;color:#a0aec0;white-space:pre}
+  pre .kw{color:#6c5ce7}pre .fn{color:#00cec9}pre .str{color:#fdcb6e}pre .cmt{color:#636e72;font-style:italic}
+  code{font-family:'JetBrains Mono',monospace;font-size:.82em}
+
+  /* flow diagram */
+  .flow{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;justify-content:center;margin:1rem 0}
+  .flow .node{background:var(--card);border:1px solid #333;border-radius:8px;padding:.5rem .9rem;
+    font-size:.8rem;color:var(--text);text-align:center;min-width:6rem}
+  .flow .node.opt{border-color:var(--green);color:var(--green)}
+  .flow .node.bad{border-color:var(--red);color:var(--red)}
+  .flow .arrow{color:var(--dim);font-size:1.2rem}
+
+  /* bullet list */
+  ul.clean{list-style:none;max-width:48rem;width:100%}
+  ul.clean li{padding:.45rem 0;padding-left:1.4rem;position:relative;font-size:clamp(.82rem,1.2vw,.98rem);
+    color:var(--text);line-height:1.6}
+  ul.clean li::before{content:'';position:absolute;left:0;top:.75rem;width:.55rem;height:.55rem;
+    border-radius:50%;background:var(--accent)}
+
+  /* tag pills */
+  .tags{display:flex;gap:.4rem;flex-wrap:wrap;justify-content:center;margin-top:.8rem}
+  .tag{background:rgba(108,92,231,.15);color:var(--accent);border:1px solid rgba(108,92,231,.3);
+    padding:.2rem .65rem;border-radius:20px;font-size:.72rem;font-weight:600;letter-spacing:.02em}
+  .tag.g{background:rgba(0,206,201,.12);color:var(--accent2);border-color:rgba(0,206,201,.3)}
+
+  /* two column */
+  .cols{display:flex;gap:2rem;flex-wrap:wrap;justify-content:center;width:100%;max-width:58rem}
+  .cols .col{flex:1 1 22rem;max-width:28rem}
+
+  /* kv grid */
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:.3rem .9rem;max-width:44rem;font-size:.88rem}
+  .kv .k{color:var(--accent);font-weight:600;text-align:right}
+  .kv .v{color:var(--text)}
+
+  /* highlight box */
+  .hl{background:rgba(108,92,231,.1);border-left:3px solid var(--accent);padding:.7rem 1rem;
+    border-radius:0 6px 6px 0;margin:.6rem 0;font-size:.88rem;max-width:48rem}
+  .hl.green{background:rgba(0,184,148,.08);border-color:var(--green)}
+  .hl.yellow{background:rgba(253,203,110,.08);border-color:var(--yellow)}
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+
+<div class="deck" id="deck">
+
+<!-- ==================== SLIDE 0: TITLE ==================== -->
+<div class="slide active">
+  <h1>Ch04<br>分布式通信与多GPU调度</h1>
+  <p class="subtitle">Distributed Communication & Multi-GPU Distribution</p>
+  <div class="tags" style="margin-top:1.4rem">
+    <span class="tag">NVLink 5.0</span>
+    <span class="tag">NCCL 2.28</span>
+    <span class="tag">NVSHMEM</span>
+    <span class="tag">Symmetric Memory</span>
+    <span class="tag g">Blackwell B200</span>
+  </div>
+  <p class="small" style="margin-top:2rem">AI Systems Performance Engineering · 第四章</p>
+</div>
+
+<!-- ==================== SLIDE 1: PROBLEM ==================== -->
+<div class="slide">
+  <h2>核心问题</h2>
+  <p>多GPU扩展时，通信成本决定了真实性能天花板</p>
+  <div class="cards">
+    <div class="card">
+      <div class="icon">❓</div>
+      <div class="label">关键问题</div>
+      <div class="val">不是"能否扩展"<br>而是<b>哪些重叠/融合/拓扑选择</b><br>真正降低延迟与提升吞吐</div>
+    </div>
+    <div class="card">
+      <div class="icon">⚠️</div>
+      <div class="label">典型反模式</div>
+      <div class="val">CPU协调可见于设备驱动<br>拓扑无关执行付出全价<br>朴素集合通信无重叠</div>
+    </div>
+    <div class="card">
+      <div class="icon">✅</div>
+      <div class="label">优化方向</div>
+      <div class="val">计算-通信显式重叠<br>梯度融合减少集合开销<br>NVSHMEM/对称内存</div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 2: BENCHMARK RESULTS ==================== -->
+<div class="slide">
+  <h2>实测加速比</h2>
+  <p>Blackwell B200 实测结果 (artifacts/runs/20260303)</p>
+  <table>
+    <tr><th>基准测试</th><th class="num">Baseline</th><th class="num">Optimized</th><th class="num">加速比</th><th>优化手段</th></tr>
+    <tr><td>gradient_fusion</td><td class="num">3.791 ms</td><td class="num">0.055 ms</td><td class="num win">68.83×</td><td>融合梯度归约路径</td></tr>
+    <tr><td>grace_blackwell_locality</td><td class="num">5.082 ms</td><td class="num">0.317 ms</td><td class="num win">16.01×</td><td>亲和性感知放置</td></tr>
+    <tr><td>dataparallel</td><td class="num">7.601 ms</td><td class="num">0.968 ms</td><td class="num win">7.86×</td><td>直接GPU执行替代DataParallel</td></tr>
+    <tr><td>bandwidth_benchmark_suite</td><td class="num">4.704 ms</td><td class="num">2.685 ms</td><td class="num win">1.75×</td><td>更清洁的通信路径</td></tr>
+  </table>
+  <div class="hl green" style="margin-top:1rem">
+    既有"移除明显框架开销"的巨大收益，也有通信优化的较小但关键的提升——不应视为统一的缩放故事。
+  </div>
+</div>
+
+<!-- ==================== SLIDE 3: DATAPARALLEL ANTI-PATTERN ==================== -->
+<div class="slide">
+  <h2>DataParallel 反模式 → 直接GPU执行</h2>
+  <p>单GPU上 DataParallel 强制引入不必要的 CPU-GPU 拷贝与 GIL 竞争</p>
+  <div class="cols">
+    <div class="col">
+      <h3>❌ Baseline 反模式</h3>
+      <pre><span class="cmt"># 每次迭代都有 H2D 拷贝</span>
+model = nn.DataParallel(model)
+<span class="kw">for</span> data, target <span class="kw">in</span> loader:
+    output = model(data.to(device))
+    loss = criterion(output, target)
+    loss.backward()
+    optimizer.step()</pre>
+      <div class="hl" style="font-size:.78rem">GIL竞争 · H2D拷贝 · 设备协调Python开销</div>
+    </div>
+    <div class="col">
+      <h3>✅ Optimized 直接执行</h3>
+      <pre><span class="cmt"># 数据预置GPU，无DataParallel</span>
+<span class="cmt"># BF16 autocast加速Tensor Core</span>
+<span class="kw">with</span> torch.autocast(<span class="str">"cuda"</span>, dtype=torch.bfloat16):
+    output = model(inputs[step])
+    loss = criterion(output, targets[step])
+    loss.backward()
+optimizer.step()
+optimizer.zero_grad(set_to_none=<span class="kw">True</span>)</pre>
+      <div class="hl green" style="font-size:.78rem">7.86× 加速 · 消除框架开销</div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 4: GRADIENT FUSION ==================== -->
+<div class="slide">
+  <h2>梯度融合：68.83× 加速的秘密</h2>
+  <p>256个小张量逐一归约 vs 融合为一个大张量单次归约</p>
+  <div class="flow">
+    <div class="node bad">256× 小张量<br>逐个 sum()</div>
+    <div class="arrow">→</div>
+    <div class="node bad">256× kernel启动</div>
+    <div class="arrow">→</div>
+    <div class="node bad" style="font-size:.7rem">3.791 ms</div>
+  </div>
+  <div class="flow" style="margin-top:.4rem">
+    <div class="node opt">torch.cat → 融合张量</div>
+    <div class="arrow">→</div>
+    <div class="node opt">1× kernel启动</div>
+    <div class="arrow">→</div>
+    <div class="node opt" style="font-size:.7rem">0.055 ms</div>
+  </div>
+  <pre style="margin-top:1rem"><span class="cmt"># baseline: 逐张量归约 — 启动开销爆炸</span>
+<span class="kw">for</span> tensor <span class="kw">in</span> self.tensors:       <span class="cmt"># 256次</span>
+    accum.add_(tensor.sum())
+
+<span class="cmt"># optimized: 融合归约 — 单次启动</span>
+accum.add_(self.fused_tensor.sum())  <span class="cmt"># 1次</span></pre>
+</div>
+
+<!-- ==================== SLIDE 5: TOPOLOGY ==================== -->
+<div class="slide">
+  <h2>NVLink 拓扑感知</h2>
+  <p>NVLink 5.0 提供 900 GB/s 带宽，但拓扑放置决定了实际可用带宽</p>
+  <div class="cards">
+    <div class="card">
+      <div class="icon">🔀</div>
+      <div class="label">PCIe Host Staging</div>
+      <div class="val">CPU中转GPU数据<br>带宽受限于PCIe Gen5<br>适合异构环境</div>
+    </div>
+    <div class="card">
+      <div class="icon">⚡</div>
+      <div class="label">NVLink P2P</div>
+      <div class="val">GPU直接对等传输<br>900 GB/s (NVLink 5.0)<br>需拓扑感知调度</div>
+    </div>
+    <div class="card">
+      <div class="icon">🌐</div>
+      <div class="label">NVSwitch</div>
+      <div class="val">全互联非阻塞交换<br>所有GPU等价带宽<br>Blackwell DGX标配</div>
+    </div>
+    <div class="card">
+      <div class="icon">🏗️</div>
+      <div class="label">Grace-Blackwell C2C</div>
+      <div class="val">CPU-GPU芯片间直连<br>替代PCIe的低延迟路径<br>16.01× 亲和性收益</div>
+    </div>
+  </div>
+  <div class="hl yellow" style="margin-top:1rem">
+    关键工具: <code>nvidia-smi topo -m</code> 查看实际拓扑，<code>nccl_blackwell_config.py</code> 自动配置最优参数
+  </div>
+</div>
+
+<!-- ==================== SLIDE 6: NCCL CONFIG ==================== -->
+<div class="slide">
+  <h2>NCCL 2.28 Blackwell 配置</h2>
+  <p>NCCL 2.28 包含 Blackwell 专属优化，多GPU扩展可提升 20-30%</p>
+  <div class="cols">
+    <div class="col">
+      <h3>核心特性</h3>
+      <div class="kv">
+        <div class="k">NVLink 5.0</div><div class="v">900 GB/s / GPU pair</div>
+        <div class="k">NVLink-C2C</div><div class="v">CPU-GPU 直连</div>
+        <div class="k">TCE 引擎</div><div class="v">集合通信用Tensor Core</div>
+        <div class="k">算法选择</div><div class="v">Ring + Tree 自适应</div>
+        <div class="k">IB 映射</div><div class="v">自动检测 InfiniBand</div>
+      </div>
+    </div>
+    <div class="col">
+      <h3>配置方式</h3>
+      <pre><span class="kw">from</span> ch04.nccl_blackwell_config <span class="kw">import</span> \
+    configure_nccl_for_blackwell
+
+<span class="cmt"># 自动设置最优NCCL环境变量</span>
+env = configure_nccl_for_blackwell(
+    enable_nvlink_c2c=<span class="kw">True</span>,
+    enable_tce=<span class="kw">True</span>,
+    algo=<span class="str">"Ring,Tree"</span>,
+)
+<span class="cmt"># NCCL_MIN_NCHANNELS, NCCL_IB_HCA,</span>
+<span class="cmt"># NCCL_ALGO, ... 全部就绪</span></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 7: NVSHMEM ==================== -->
+<div class="slide">
+  <h2>NVSHMEM & 对称内存</h2>
+  <p>绕过CPU参与，GPU直接发起远程内存操作，减少同步开销</p>
+  <div class="flow">
+    <div class="node bad">传统: CPU协调 AllReduce</div>
+    <div class="arrow">→</div>
+    <div class="node bad">NCCL Launch Overhead</div>
+    <div class="arrow">→</div>
+    <div class="node bad">CPU同步等待</div>
+  </div>
+  <div class="flow" style="margin-top:.5rem">
+    <div class="node opt">NVSHMEM: GPU直接Put/Get</div>
+    <div class="arrow">→</div>
+    <div class="node opt">对称内存池</div>
+    <div class="arrow">→</div>
+    <div class="node opt">设备侧同步</div>
+  </div>
+  <div class="cards" style="margin-top:1rem">
+    <div class="card">
+      <div class="icon">📦</div>
+      <div class="label">Symmetric Memory</div>
+      <div class="val">跨GPU用户态内存池<br>KV-cache复制 · 优化器状态分片<br>无NVSwitch惩罚</div>
+    </div>
+    <div class="card">
+      <div class="icon">🔗</div>
+      <div class="label">Pipeline Parallel</div>
+      <div class="val">NVSHMEM驱动的流水线<br>设备侧编排替代CPU<br>减少气泡与同步点</div>
+    </div>
+    <div class="card">
+      <div class="icon">📊</div>
+      <div class="label">vs NCCL</div>
+      <div class="val">小消息场景延迟更低<br>大消息NCCL仍有优势<br>互补非替代关系</div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 8: PIPELINE / TENSOR PARALLEL ==================== -->
+<div class="slide">
+  <h2>流水线并行 & 张量并行</h2>
+  <p>两种核心多GPU并行策略的通信模式与优化</p>
+  <div class="cols">
+    <div class="col">
+      <h3>Pipeline Parallel (1F1B)</h3>
+      <pre><span class="cmt"># 朴素: 顺序前向→反向，气泡大</span>
+<span class="cmt"># 1F1B: 交错前向/反向，减小气泡</span>
+<span class="kw">for</span> step <span class="kw">in</span> range(num_microbatches):
+    <span class="kw">if</span> step < warmup:
+        output = forward(microbatch[step])
+    <span class="kw">else</span>:
+        loss.backward()          <span class="cmt"># 反向</span>
+        output = forward(...)    <span class="cmt"># 前向</span>
+    send_to_next_stage(output)</pre>
+      <div class="tags"><span class="tag">减小流水线气泡</span><span class="tag">设备侧编排</span></div>
+    </div>
+    <div class="col">
+      <h3>Tensor Parallel (Async TP)</h3>
+      <pre><span class="cmt"># 列切分: 权重按列分割</span>
+<span class="cmt"># AllGather替代AllReduce</span>
+<span class="cmt"># 计算与通信重叠</span>
+<span class="kw">with</span> async_tp_context():
+    local_out = linear(input, shard_W)
+    <span class="cmt"># AllGather与下一层计算重叠</span>
+    full_out = async_allgather(local_out)</pre>
+      <div class="tags"><span class="tag">AllGather重叠</span><span class="tag g">异步张量并行</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 9: GRADIENT COMPRESSION ==================== -->
+<div class="slide">
+  <h2>梯度压缩</h2>
+  <p>FP16 / INT8 量化压缩通信数据量，带宽换精度</p>
+  <table>
+    <tr><th>策略</th><th>数据量</th><th>精度损失</th><th>适用场景</th></tr>
+    <tr><td>FP32 原始</td><td class="num">100%</td><td>无</td><td>基线参考</td></tr>
+    <tr><td>FP16 压缩</td><td class="num win">50%</td><td>极小</td><td>带宽受限训练</td></tr>
+    <tr><td>INT8 量化</td><td class="num win">25%</td><td>可接受</td><td>大模型梯度通信</td></tr>
+    <tr><td>Comm-only INT8</td><td class="num win">25%</td><td>预量化</td><td>纯通信基准测试</td></tr>
+  </table>
+  <div class="flow" style="margin-top:1rem">
+    <div class="node">梯度张量 (FP32)</div>
+    <div class="arrow">→</div>
+    <div class="node opt">量化 (INT8/FP16)</div>
+    <div class="arrow">→</div>
+    <div class="node opt">AllReduce (小数据)</div>
+    <div class="arrow">→</div>
+    <div class="node">反量化 (FP32)</div>
+  </div>
+  <div class="hl" style="margin-top:.8rem">
+    小桶压缩 vs 全缓冲压缩：分桶可减小通信粒度，但增加同步点。全缓冲减少同步但增大首字节延迟。
+  </div>
+</div>
+
+<!-- ==================== SLIDE 10: NIXL & DISAGGREGATED ==================== -->
+<div class="slide">
+  <h2>NIXL 内存分层卸载 & 分离推理</h2>
+  <p>跨内存层级的数据搬运与远程KV-cache复用</p>
+  <div class="cards">
+    <div class="card">
+      <div class="icon">🔄</div>
+      <div class="label">NIXL Tier Handoff</div>
+      <div class="val">选择性块传输<br>GPU ↔ CPU ↔ 网络<br>内存层级感知调度</div>
+    </div>
+    <div class="card">
+      <div class="icon">🚀</div>
+      <div class="label">Continuous Batching</div>
+      <div class="val">动态请求池化<br>消除padding浪费<br>吞吐提升数倍</div>
+    </div>
+    <div class="card">
+      <div class="icon">📡</div>
+      <div class="label">Disaggregated Inference</div>
+      <div class="val">Prefill/Decode分离<br>远程KV-cache复用<br>P/D独立扩缩容</div>
+    </div>
+  </div>
+  <pre style="margin-top:1rem"><span class="cmt"># NIXL 探测命令</span>
+python -m cli.aisp tools ch04-nixl-tier-handoff -- --mode probe --json
+
+<span class="cmt"># 连续批处理 + 分离推理基准</span>
+python -m cli.aisp bench run --targets ch04:continuous_batching --profile minimal</pre>
+</div>
+
+<!-- ==================== SLIDE 11: DIRECTORY MAP ==================== -->
+<div class="slide">
+  <h2>目录结构一览</h2>
+  <p>151个文件，覆盖分布式通信全栈</p>
+  <table style="font-size:.76rem">
+    <tr><th>模式</th><th>文件</th><th>说明</th></tr>
+    <tr><td>dataparallel</td><td><code>baseline_/optimized_*.py</code></td><td>DataParallel反模式 vs 直接GPU执行</td></tr>
+    <tr><td>gradient_fusion</td><td><code>gradient_fusion_common.py</code></td><td>梯度融合归约 (68.83×)</td></tr>
+    <tr><td>nvlink</td><td><code>baseline_/optimized_nvlink*.py</code></td><td>NVLink拓扑感知 + P2P带宽验证</td></tr>
+    <tr><td>nccl</td><td><code>nccl_benchmark.py</code>, <code>nccl_blackwell_config.py</code></td><td>NCCL 2.28配置与基准</td></tr>
+    <tr><td>nvshmem</td><td><code>*.cu</code> + <code>nvshmem_*.py</code></td><td>NVSHMEM集合通信 + 对称内存</td></tr>
+    <tr><td>pipeline/tensor</td><td><code>pipeline_parallel*</code>, <code>tensor_parallel*</code></td><td>1F1B流水线 / 异步TP</td></tr>
+    <tr><td>compression</td><td><code>gradient_compression_*</code></td><td>FP16/INT8梯度压缩</td></tr>
+    <tr><td>symmetric_mem</td><td><code>symmetric_memory*.py</code></td><td>KV-cache池 · 优化器分片</td></tr>
+    <tr><td>nixl</td><td><code>nixl_tier_handoff_tool.py</code></td><td>内存分层卸载探测</td></tr>
+    <tr><td>harness</td><td><code>compare.py</code>, <code>Makefile</code></td><td>基准驱动 + 期望基线</td></tr>
+  </table>
+</div>
+
+<!-- ==================== SLIDE 12: RUN ==================== -->
+<div class="slide">
+  <h2>运行指南</h2>
+  <div class="cols">
+    <div class="col">
+      <h3>快速对比</h3>
+      <pre><span class="cmt"># 运行所有baseline/optimized对比</span>
+python -m ch04.compare
+
+<span class="cmt"># 列出所有可运行目标</span>
+python -m cli.aisp bench list-targets \
+    --chapter ch04
+
+<span class="cmt"># 最小profile全量跑</span>
+python -m cli.aisp bench run \
+    --targets ch04 --profile minimal</pre>
+    </div>
+    <div class="col">
+      <h3>深度分析</h3>
+      <pre><span class="cmt"># Nsight Profiler 深度剖析</span>
+python -m cli.aisp bench run \
+    --targets ch04:gradient_fusion \
+    --profile deep_dive --single-gpu
+
+<span class="cmt"># NIXL探测</span>
+python -m cli.aisp tools \
+    ch04-nixl-tier-handoff \
+    -- --mode probe --json
+
+<span class="cmt"># 期望基线刷新</span>
+python -m cli.aisp bench run \
+    --targets ch04 --update-expectations</pre>
+    </div>
+  </div>
+  <div class="hl green" style="margin-top:1rem">
+    验证清单：gradient_fusion显示更少通信阶段 · dataparallel消除框架扇出开销 · grace_blackwell_locality改善数据放置
+  </div>
+</div>
+
+<!-- ==================== SLIDE 13: TAKEAWAYS ==================== -->
+<div class="slide">
+  <h2>学习目标 & 关键收获</h2>
+  <ul class="clean">
+    <li><b>基准测试 DataParallel / TensorParallel</b> — 量化有/无重叠时的训练循环差异</li>
+    <li><b>NVLink 带宽与拓扑效应</b> — 混合本地与远程GPU时的真实带宽测量</li>
+    <li><b>NVSHMEM 流水线</b> — 减少主机参与GPU同步，设备侧编排</li>
+    <li><b>对称内存池</b> — 跨GPU KV-cache复制与优化器状态分片的简化方案</li>
+    <li><b>梯度融合与压缩</b> — 减少kernel启动次数 + 压缩通信数据量</li>
+    <li><b>NCCL 2.28 Blackwell 专属</b> — NVLink 5.0, C2C, TCE引擎的配置与调优</li>
+    <li><b>分离推理架构</b> — Prefill/Decode分离 + 远程KV-cache复用</li>
+  </ul>
+  <div class="hl green" style="margin-top:1rem">
+    核心认知：通信优化不是单一缩放故事，而是框架开销移除、拓扑感知放置、计算-通信重叠、压缩量化等多维度的组合工程。
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<!-- navigation -->
+<div class="nav">
+  <button onclick="go(-1)" title="上一页">◀</button>
+  <span class="counter" id="counter"></span>
+  <button onclick="go(1)" title="下一页">▶</button>
+</div>
+
+<script>
+const slides=document.querySelectorAll('.slide');
+let cur=0;
+const total=slides.length;
+function render(){
+  slides.forEach((s,i)=>s.classList.toggle('active',i===cur));
+  document.getElementById('counter').textContent=(cur+1)+' / '+total;
+  document.getElementById('progress').style.width=((cur+1)/total*100)+'%';
+}
+function go(d){cur=Math.max(0,Math.min(total-1,cur+d));render()}
+document.addEventListener('keydown',e=>{
+  if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown'){e.preventDefault();go(1)}
+  if(e.key==='ArrowLeft'||e.key==='PageUp'){e.preventDefault();go(-1)}
+  if(e.key==='Home'){cur=0;render()}
+  if(e.key==='End'){cur=total-1;render()}
+});
+let sx=0;
+document.addEventListener('touchstart',e=>sx=e.touches[0].clientX);
+document.addEventListener('touchend',e=>{const dx=e.changedTouches[0].clientX-sx;if(Math.abs(dx)>50)go(dx<0?1:-1)});
+render();
+</script>
+</body>
+</html>

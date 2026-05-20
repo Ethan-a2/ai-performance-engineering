@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 3: System Tuning - Code Visualization</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        .presentation {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 40px;
+            opacity: 0;
+            transform: translateX(100%);
+            transition: all 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .slide.active {
+            opacity: 1;
+            transform: translateX(0);
+        }
+
+        .slide.prev {
+            opacity: 0;
+            transform: translateX(-100%);
+        }
+
+        .slide-title {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 30px;
+            text-align: center;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .slide-content {
+            max-width: 1200px;
+            width: 100%;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        .code-block {
+            background: #0d1117;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 15px 0;
+            overflow-x: auto;
+            font-family: 'Fira Code', 'Consolas', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            border-left: 4px solid #3a7bd5;
+        }
+
+        .code-block pre {
+            margin: 0;
+            white-space: pre-wrap;
+        }
+
+        .keyword {
+            color: #ff7b72;
+        }
+
+        .string {
+            color: #a5d6ff;
+        }
+
+        .comment {
+            color: #8b949e;
+            font-style: italic;
+        }
+
+        .function {
+            color: #d2a8ff;
+        }
+
+        .number {
+            color: #79c0ff;
+        }
+
+        .highlight {
+            background: rgba(58, 123, 213, 0.3);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 15px;
+            padding: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: transform 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+        }
+
+        .card h3 {
+            color: #00d2ff;
+            margin-bottom: 15px;
+            font-size: 1.3rem;
+        }
+
+        .card p {
+            color: #e0e0e0;
+            line-height: 1.6;
+        }
+
+        .metric {
+            display: inline-block;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            color: #fff;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            margin: 5px;
+        }
+
+        .comparison {
+            display: flex;
+            gap: 30px;
+            margin-top: 20px;
+        }
+
+        .comparison-item {
+            flex: 1;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .comparison-item h4 {
+            color: #00d2ff;
+            margin-bottom: 15px;
+            font-size: 1.2rem;
+        }
+
+        .baseline {
+            border-left: 4px solid #ff6b6b;
+        }
+
+        .optimized {
+            border-left: 4px solid #51cf66;
+        }
+
+        .nav-controls {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 20px;
+            z-index: 100;
+        }
+
+        .nav-btn {
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            color: #fff;
+            padding: 15px 25px;
+            border-radius: 50px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+
+        .nav-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: scale(1.05);
+        }
+
+        .slide-counter {
+            position: fixed;
+            top: 30px;
+            right: 30px;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 10px 20px;
+            border-radius: 50px;
+            font-size: 1rem;
+            backdrop-filter: blur(10px);
+        }
+
+        .diagram {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 30px;
+            margin: 20px 0;
+            text-align: center;
+        }
+
+        .flow-arrow {
+            color: #00d2ff;
+            font-size: 2rem;
+            margin: 0 20px;
+        }
+
+        .flow-step {
+            display: inline-block;
+            background: rgba(58, 123, 213, 0.3);
+            padding: 15px 25px;
+            border-radius: 10px;
+            margin: 10px;
+            border: 1px solid rgba(58, 123, 213, 0.5);
+        }
+
+        .performance-bar {
+            height: 30px;
+            background: linear-gradient(90deg, #ff6b6b, #51cf66);
+            border-radius: 15px;
+            margin: 10px 0;
+            position: relative;
+        }
+
+        .performance-bar::after {
+            content: attr(data-label);
+            position: absolute;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #fff;
+            font-weight: bold;
+        }
+
+        .architecture-diagram {
+            display: flex;
+            justify-content: space-around;
+            align-items: center;
+            margin: 30px 0;
+        }
+
+        .arch-component {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            min-width: 120px;
+            border: 2px solid rgba(0, 210, 255, 0.3);
+        }
+
+        .arch-component h5 {
+            color: #00d2ff;
+            margin-bottom: 10px;
+        }
+
+        .key-point {
+            background: linear-gradient(90deg, #ff6b6b, #ffd93d);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-weight: bold;
+        }
+
+        .subtitle {
+            color: #aaa;
+            font-size: 1.2rem;
+            margin-bottom: 30px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="presentation">
+        <!-- Slide 1: Title -->
+        <div class="slide active" id="slide1">
+            <h1 class="slide-title">Chapter 3: System Tuning</h1>
+            <p class="subtitle">Host-Level Optimizations for GPU Performance</p>
+            <div class="slide-content">
+                <div class="grid">
+                    <div class="card">
+                        <h3>Problem Statement</h3>
+                        <p>"The GPU is slow" often turns out to be a host problem. CPU affinity, container defaults, or orchestration choices can quietly cap the work that later CUDA kernels can ever see.</p>
+                    </div>
+                    <div class="card">
+                        <h3>Key Focus Areas</h3>
+                        <p>NUMA pinning, governor tweaks, container settings, and Kubernetes manifests that keep GPU workloads fed before kernel-level optimization begins.</p>
+                    </div>
+                    <div class="card">
+                        <h3>Measured Impact</h3>
+                        <p><span class="metric">3.64x</span> speedup with pinned-memory prefetch<br>
+                        <span class="metric">2.90x</span> speedup with optimized GEMM<br>
+                        <span class="metric">1.61x</span> speedup with double-buffered provisioning</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 2: Directory Overview -->
+        <div class="slide" id="slide2">
+            <h1 class="slide-title">Directory Structure</h1>
+            <div class="slide-content">
+                <div class="grid">
+                    <div class="card">
+                        <h3>Host-Transfer & NUMA</h3>
+                        <p><code>baseline_pageable_copy.py</code><br>
+                        <code>optimized_pageable_copy.py</code><br>
+                        <code>bind_numa_affinity.py</code><br>
+                        <code>numa_topology_script.sh</code></p>
+                    </div>
+                    <div class="card">
+                        <h3>Topology-Aware Staging</h3>
+                        <p><code>baseline_rack_prep.py</code><br>
+                        <code>optimized_rack_prep.py</code><br>
+                        <code>grace_blackwell_topology.py</code></p>
+                    </div>
+                    <div class="card">
+                        <h3>Pinned-Memory Prefetch</h3>
+                        <p><code>baseline_pinned_prefetch_mlp.py</code><br>
+                        <code>optimized_pinned_prefetch_mlp.py</code><br>
+                        <code>docker_gpu_optimized.dockerfile</code><br>
+                        <code>system_tuning.sh</code></p>
+                    </div>
+                    <div class="card">
+                        <h3>Batch Provisioning</h3>
+                        <p><code>baseline_double_buffered_batch_provisioning.py</code><br>
+                        <code>optimized_double_buffered_batch_provisioning.py</code><br>
+                        <code>kubernetes_mig_pod.yaml</code><br>
+                        <code>kubernetes_topology_pod.yaml</code></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 3: NUMA Topology Script -->
+        <div class="slide" id="slide3">
+            <h1 class="slide-title">NUMA Topology Binding</h1>
+            <div class="slide-content">
+                <div class="code-block">
+                    <pre><span class="comment">#!/bin/bash</span>
+<span class="comment"># NUMA topology binding script</span>
+<span class="comment"># Binds only when the platform exposes an authoritative GPU NUMA node.</span>
+
+<span class="keyword">mapfile</span> -t GPUS &lt; &lt;(<span class="function">nvidia-smi</span> --query-gpu=index --format=csv,noheader)
+
+<span class="keyword">for</span> GPU <span class="keyword">in</span> "${GPUS[@]}"; <span class="keyword">do</span>
+    PCI_BUS=$(<span class="function">nvidia-smi</span> -i "$GPU" --query-gpu=pci.bus_id --format=csv,noheader | <span class="function">head</span> -<span class="number">1</span> | <span class="function">tr</span> -d '[:space:]' | <span class="function">tr</span> '[:upper:]' '[:lower:]')
+    SYSFS_BUS="$PCI_BUS"
+    <span class="keyword">if</span> [[ "$SYSFS_BUS" == <span class="string">00000000:</span>* ]]; <span class="keyword">then</span>
+        SYSFS_BUS="${SYSFS_BUS:<span class="number">4</span>}"
+    <span class="keyword">fi</span>
+
+    NODE=""
+    NUMA_PATH=<span class="string">"/sys/bus/pci/devices/${SYSFS_BUS}/numa_node"</span>
+    <span class="keyword">if</span> [[ -r "$NUMA_PATH" ]]; <span class="keyword">then</span>
+        NODE=$(<span class="function">cat</span> "$NUMA_PATH")
+    <span class="keyword">fi</span>
+
+    <span class="keyword">if</span> [[ "$NODE" =~ ^[<span class="number">0</span>-<span class="number">9</span>]+$ ]]; <span class="keyword">then</span>
+        <span class="function">numactl</span> --cpunodebind="$NODE" --membind="$NODE" \
+                <span class="function">bash</span> -c "CUDA_VISIBLE_DEVICES=$GPU <span class="function">python</span> train.py --gpu $GPU" &amp;
+    <span class="keyword">else</span>
+        <span class="function">echo</span> "GPU $GPU NUMA node unavailable; running without numactl binding" &gt;&amp;<span class="number">2</span>
+        <span class="function">bash</span> -c "CUDA_VISIBLE_DEVICES=$GPU <span class="function">python</span> train.py --gpu $GPU" &amp;
+    <span class="keyword">fi</span>
+<span class="keyword">done</span>
+
+<span class="comment"># Wait for all background processes to complete</span>
+<span class="function">wait</span></pre>
+                </div>
+                <div class="diagram">
+                    <div class="flow-step">GPU Detection</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">PCI Bus ID</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">NUMA Node</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">CPU/Memory Binding</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 4: System Tuning Script -->
+        <div class="slide" id="slide4">
+            <h1 class="slide-title">System-Wide Performance Tuning</h1>
+            <div class="slide-content">
+                <div class="code-block">
+                    <pre><span class="comment">#!/bin/bash</span>
+<span class="comment"># System-wide performance tuning for GPU environments</span>
+<span class="comment"># Run as root or with sudo</span>
+
+<span class="function">echo</span> "Applying system-wide GPU performance optimizations..."
+
+<span class="comment"># 1. CPU Governor and C-states</span>
+<span class="function">echo</span> "Setting CPU governor to performance mode..."
+<span class="function">cpupower</span> frequency-set -g performance
+
+<span class="comment"># 2. Virtual Memory and Swapping</span>
+<span class="function">echo</span> "Disabling swap and setting swappiness to 0..."
+<span class="function">swapoff</span> -a
+<span class="function">echo</span> <span class="number">0</span> &gt; /proc/sys/vm/swappiness
+
+<span class="comment"># 3. Transparent Huge Pages</span>
+<span class="function">echo</span> "Configuring Transparent Huge Pages..."
+<span class="function">echo</span> always &gt; /sys/kernel/mm/transparent_hugepage/enabled
+
+<span class="comment"># 4. GPU-specific optimizations</span>
+<span class="function">echo</span> "Configuring GPU settings..."
+<span class="comment"># Enable persistence mode for all GPUs</span>
+<span class="function">nvidia-smi</span> -pm <span class="number">1</span>
+
+<span class="comment"># 5. NUMA balancing</span>
+<span class="function">echo</span> "Disabling automatic NUMA balancing..."
+<span class="function">echo</span> <span class="number">0</span> &gt; /proc/sys/kernel/numa_balancing</pre>
+                </div>
+                <div class="grid">
+                    <div class="card">
+                        <h3>CPU Optimizations</h3>
+                        <p>• Performance governor<br>• Disable deep C-states<br>• CPU isolation for compute</p>
+                    </div>
+                    <div class="card">
+                        <h3>Memory Optimizations</h3>
+                        <p>• Disable swap<br>• Configure huge pages<br>• Tune filesystem cache</p>
+                    </div>
+                    <div class="card">
+                        <h3>GPU Optimizations</h3>
+                        <p>• Enable persistence mode<br>• Configure MPS<br>• NUMA balancing</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 5: Baseline vs Optimized MLP -->
+        <div class="slide" id="slide5">
+            <h1 class="slide-title">Pinned-Memory Prefetch MLP</h1>
+            <div class="slide-content">
+                <div class="comparison">
+                    <div class="comparison-item baseline">
+                        <h4>Baseline: Blocking Copies</h4>
+                        <div class="code-block">
+                            <pre><span class="keyword">def</span> <span class="function">benchmark_fn</span>(self):
+    idx = self.batch_idx % len(self.host_batches)
+    host_x = self.host_batches[idx]
+    host_y = self.targets[idx]
+    
+    <span class="comment"># Blocking copy (tensor not pinned)</span>
+    x = self.<span class="function">to_device</span>(host_x)
+    y = self.<span class="function">to_device</span>(host_y)
+    out = self.model(x)
+    loss = <span class="function">mse_loss</span>(out, y)
+    loss.<span class="function">backward</span>()
+    self.optimizer.<span class="function">step</span>()</pre>
+                        </div>
+                        <p class="key-point">Problem: Synchronous H2D copies block the GPU</p>
+                    </div>
+                    <div class="comparison-item optimized">
+                        <h4>Optimized: Pinned + Prefetch</h4>
+                        <div class="code-block">
+                            <pre><span class="keyword">class</span> <span class="function">Prefetcher</span>:
+    <span class="keyword">def</span> <span class="function">_prefetch</span>(self):
+        <span class="keyword">with</span> torch.cuda.<span class="function">stream</span>(self.copy_stream):
+            self.buffers[self.next_slot].<span class="function">copy_</span>(
+                self.host_batches[host_idx], 
+                non_blocking=<span class="keyword">True</span>)
+    
+    <span class="keyword">def</span> <span class="function">next</span>(self):
+        torch.cuda.<span class="function">current_stream</span>().<span class="function">wait_stream</span>(
+            self.copy_stream)
+        <span class="comment"># Swap buffers and prefetch next</span>
+        self.cur_slot, self.next_slot = self.next_slot, self.cur_slot
+        self.<span class="function">_prefetch</span>()
+        <span class="keyword">return</span> self.buffers[self.cur_slot]</pre>
+                        </div>
+                        <p class="key-point">Solution: Pinned memory + async prefetch + double buffering</p>
+                    </div>
+                </div>
+                <div class="diagram">
+                    <div class="flow-step">Host Batch 1</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Pinned Memory</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Async H2D</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">GPU Compute</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Overlap Next Batch</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 6: Double-Buffered Batch Provisioning -->
+        <div class="slide" id="slide6">
+            <h1 class="slide-title">Double-Buffered Batch Provisioning</h1>
+            <div class="slide-content">
+                <div class="comparison">
+                    <div class="comparison-item baseline">
+                        <h4>Baseline: Sequential Processing</h4>
+                        <div class="code-block">
+                            <pre><span class="keyword">def</span> <span class="function">benchmark_fn</span>(self):
+    <span class="comment"># Get next batch</span>
+    batch = self.batches[self.batch_idx]
+    
+    <span class="comment"># Process sequentially</span>
+    result = self.<span class="function">process_batch</span>(batch)
+    
+    <span class="comment"># Wait for completion</span>
+    torch.cuda.<span class="function">synchronize</span>()
+    
+    self.batch_idx += <span class="number">1</span>
+    <span class="keyword">return</span> result</pre>
+                        </div>
+                        <p class="key-point">Problem: No overlap between batches</p>
+                    </div>
+                    <div class="comparison-item optimized">
+                        <h4>Optimized: Double Buffering</h4>
+                        <div class="code-block">
+                            <pre><span class="keyword">class</span> <span class="function">DoubleBuffer</span>:
+    <span class="keyword">def</span> <span class="function">__init__</span>(self):
+        self.buffer = [
+            torch.<span class="function">empty</span>(...),
+            torch.<span class="function">empty</span>(...)
+        ]
+        self.current = <span class="number">0</span>
+    
+    <span class="keyword">def</span> <span class="function">next_batch</span>(self):
+        <span class="comment"># Process current buffer</span>
+        result = self.<span class="function">process</span>(self.buffer[self.current])
+        
+        <span class="comment"># Swap and prepare next</span>
+        self.current = <span class="number">1</span> - self.current
+        self.<span class="function">prepare_next</span>(self.buffer[self.current])
+        
+        <span class="keyword">return</span> result</pre>
+                        </div>
+                        <p class="key-point">Solution: Overlap copy with compute using double buffers</p>
+                    </div>
+                </div>
+                <div class="performance-bar" data-label="1.61x Speedup" style="width: 60%;"></div>
+            </div>
+        </div>
+
+        <!-- Slide 7: Docker Optimization -->
+        <div class="slide" id="slide7">
+            <h1 class="slide-title">Docker GPU Optimization</h1>
+            <div class="slide-content">
+                <div class="code-block">
+                    <pre><span class="comment"># Multi-stage Docker build for optimized GPU performance</span>
+<span class="keyword">FROM</span> nvcr.io/nvidia/pytorch:<span class="number">25.11</span>-py3 AS base
+
+<span class="comment"># Install additional dependencies for performance optimization</span>
+<span class="keyword">RUN</span> apt-get update && apt-get install -y \
+    numactl \
+    libnuma-dev \
+    htop \
+    iotop \
+    tcmalloc-minimal \
+    jemalloc \
+    && rm -rf /var/lib/apt/lists/*
+
+<span class="comment"># Set environment variables for optimized memory allocation</span>
+<span class="keyword">ENV</span> MALLOC_CONF=<span class="string">"narenas:8,dirty_decay_ms:10000,muzzy_decay_ms:10000,background_thread:true"</span>
+<span class="keyword">ENV</span> TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=<span class="number">536870912</span>
+<span class="keyword">ENV</span> TCMALLOC_RELEASE_RATE=<span class="number">16</span>
+
+<span class="comment"># Set CUDA environment variables</span>
+<span class="keyword">ENV</span> PYTORCH_ALLOC_CONF=<span class="string">max_split_size_mb:512</span>
+<span class="keyword">ENV</span> TORCH_CUDA_ARCH_LIST=<span class="string">"10.0;10.3;12.0;12.1+PTX"</span>
+<span class="keyword">ENV</span> CUDA_DEVICE_ORDER=<span class="string">PCI_BUS_ID</span>
+
+<span class="comment"># Runtime stage for smaller final image</span>
+<span class="keyword">FROM</span> base AS runtime
+
+<span class="comment"># Set up runtime environment</span>
+<span class="keyword">ENV</span> PYTHONPATH=/app
+<span class="keyword">ENV</span> OMP_NUM_THREADS=<span class="number">1</span>
+<span class="keyword">ENV</span> MKL_NUM_THREADS=<span class="number">1</span>
+
+<span class="comment"># Entry point with NUMA awareness</span>
+<span class="keyword">ENTRYPOINT</span> [<span class="string">"numactl"</span>, <span class="string">"--interleave=all"</span>, <span class="string">"python"</span>]
+<span class="keyword">CMD</span> [<span class="string">"train.py"</span>]</pre>
+                </div>
+                <div class="grid">
+                    <div class="card">
+                        <h3>Memory Allocators</h3>
+                        <p>• tcmalloc with optimized settings<br>• jemalloc for multi-threaded workloads<br>• PyTorch memory configuration</p>
+                    </div>
+                    <div class="card">
+                        <h3>CUDA Configuration</h3>
+                        <p>• Target GPU architectures<br>• PCI bus ID ordering<br>• Memory split optimization</p>
+                    </div>
+                    <div class="card">
+                        <h3>Runtime Settings</h3>
+                        <p>• NUMA-aware execution<br>• Thread control<br>• Non-root user security</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 8: Performance Results -->
+        <div class="slide" id="slide8">
+            <h1 class="slide-title">Performance Results</h1>
+            <div class="slide-content">
+                <div class="grid">
+                    <div class="card">
+                        <h3>Pinned-Memory Prefetch</h3>
+                        <p>Baseline: <span class="metric">4.456 ms</span><br>
+                        Optimized: <span class="metric">1.225 ms</span><br>
+                        Speedup: <span class="metric">3.64x</span></p>
+                        <div class="performance-bar" data-label="3.64x" style="width: 90%;"></div>
+                    </div>
+                    <div class="card">
+                        <h3>GEMM Comparison</h3>
+                        <p>Baseline: <span class="metric">0.548 ms</span><br>
+                        Optimized: <span class="metric">0.189 ms</span><br>
+                        Speedup: <span class="metric">2.90x</span></p>
+                        <div class="performance-bar" data-label="2.90x" style="width: 72%;"></div>
+                    </div>
+                    <div class="card">
+                        <h3>Double-Buffered Provisioning</h3>
+                        <p>Baseline: <span class="metric">1.734 ms</span><br>
+                        Optimized: <span class="metric">1.076 ms</span><br>
+                        Speedup: <span class="metric">1.61x</span></p>
+                        <div class="performance-bar" data-label="1.61x" style="width: 40%;"></div>
+                    </div>
+                </div>
+                <div class="diagram">
+                    <p class="key-point">Host tuning changes are often prerequisite wins, not optional polish.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 9: Architecture Diagram -->
+        <div class="slide" id="slide9">
+            <h1 class="slide-title">System Architecture</h1>
+            <div class="slide-content">
+                <div class="architecture-diagram">
+                    <div class="arch-component">
+                        <h5>CPU</h5>
+                        <p>NUMA Node 0<br>Cores 0-15</p>
+                    </div>
+                    <div class="arch-component">
+                        <h5>Memory</h5>
+                        <p>DDR4<br>256 GB</p>
+                    </div>
+                    <div class="arch-component">
+                        <h5>PCIe</h5>
+                        <p>Gen4 x16<br>32 GB/s</p>
+                    </div>
+                    <div class="arch-component">
+                        <h5>GPU</h5>
+                        <p>NVIDIA A100<br>80GB HBM2e</p>
+                    </div>
+                </div>
+                <div class="grid">
+                    <div class="card">
+                        <h3>NUMA Pinning</h3>
+                        <p>Bind GPU to nearest NUMA node for minimal memory access latency</p>
+                    </div>
+                    <div class="card">
+                        <h3>Memory Optimization</h3>
+                        <p>Pinned memory for async transfers, huge pages for TLB efficiency</p>
+                    </div>
+                    <div class="card">
+                        <h3>CPU Governor</h3>
+                        <p>Performance mode to prevent frequency scaling during GPU workloads</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Slide 10: Key Takeaways -->
+        <div class="slide" id="slide10">
+            <h1 class="slide-title">Key Takeaways</h1>
+            <div class="slide-content">
+                <div class="grid">
+                    <div class="card">
+                        <h3>1. Host is the Bottleneck</h3>
+                        <p>Before optimizing kernels, ensure host configuration isn't limiting GPU throughput. NUMA, memory, and CPU settings matter.</p>
+                    </div>
+                    <div class="card">
+                        <h3>2. Pinned Memory is Critical</h3>
+                        <p>For async H2D transfers, pinned memory enables non-blocking copies that overlap with compute.</p>
+                    </div>
+                    <div class="card">
+                        <h3>3. Double Buffering Overlaps</h3>
+                        <p>Use double buffers to overlap data transfer with computation, hiding latency.</p>
+                    </div>
+                    <div class="card">
+                        <h3>4. Container Matters</h3>
+                        <p>Docker and Kubernetes settings can silently limit GPU performance. Configure memory allocators and NUMA awareness.</p>
+                    </div>
+                </div>
+                <div class="diagram">
+                    <div class="flow-step">Host Tuning</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Memory Optimization</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">Async Transfers</div>
+                    <span class="flow-arrow">→</span>
+                    <div class="flow-step">GPU Utilization</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Navigation Controls -->
+        <div class="nav-controls">
+            <button class="nav-btn" onclick="prevSlide()">← Previous</button>
+            <button class="nav-btn" onclick="nextSlide()">Next →</button>
+        </div>
+
+        <div class="slide-counter">
+            <span id="currentSlide">1</span> / <span id="totalSlides">10</span>
+        </div>
+    </div>
+
+    <script>
+        let currentSlide = 1;
+        const totalSlides = 10;
+
+        function showSlide(n) {
+            const slides = document.querySelectorAll('.slide');
+            slides.forEach(slide => {
+                slide.classList.remove('active', 'prev');
+            });
+
+            if (n > totalSlides) currentSlide = 1;
+            if (n < 1) currentSlide = totalSlides;
+
+            const current = document.getElementById(`slide${currentSlide}`);
+            current.classList.add('active');
+
+            document.getElementById('currentSlide').textContent = currentSlide;
+        }
+
+        function nextSlide() {
+            currentSlide++;
+            showSlide(currentSlide);
+        }
+
+        function prevSlide() {
+            currentSlide--;
+            showSlide(currentSlide);
+        }
+
+        // Keyboard navigation
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowRight' || e.key === ' ') {
+                nextSlide();
+            } else if (e.key === 'ArrowLeft') {
+                prevSlide();
+            }
+        });
+
+        // Initialize
+        showSlide(1);
+    </script>
+</body>
+</html>

@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 11 - Streams & Concurrency</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg-dark: #0a0e1a;
+    --bg-card: #111827;
+    --bg-card-alt: #1a2332;
+    --accent-cyan: #22d3ee;
+    --accent-blue: #3b82f6;
+    --accent-purple: #a855f7;
+    --accent-green: #10b981;
+    --accent-orange: #f59e0b;
+    --accent-red: #ef4444;
+    --accent-pink: #ec4899;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --border: #1e293b;
+    --glow-cyan: 0 0 30px rgba(34,211,238,0.15);
+    --glow-blue: 0 0 30px rgba(59,130,246,0.15);
+  }
+
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: var(--bg-dark);
+    color: var(--text-primary);
+    font-family: 'Inter', -apple-system, sans-serif;
+    overflow: hidden;
+  }
+
+  /* ── Slide Container ── */
+  .deck {
+    width: 100%; height: 100%;
+    position: relative;
+  }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    padding: 60px 80px;
+    opacity: 0;
+    transform: translateX(60px);
+    transition: opacity 0.5s ease, transform 0.5s ease;
+    pointer-events: none;
+    overflow-y: auto;
+  }
+
+  .slide.active {
+    opacity: 1;
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  .slide.prev {
+    opacity: 0;
+    transform: translateX(-60px);
+  }
+
+  /* ── Typography ── */
+  h1 {
+    font-size: 3.2rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+    margin-bottom: 16px;
+    background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  h2 {
+    font-size: 2.4rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+    margin-bottom: 12px;
+    color: var(--text-primary);
+  }
+
+  h3 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--accent-cyan);
+    margin-bottom: 10px;
+  }
+
+  .subtitle {
+    font-size: 1.35rem;
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-bottom: 32px;
+    max-width: 700px;
+    text-align: center;
+    line-height: 1.6;
+  }
+
+  p, li {
+    font-size: 1.15rem;
+    line-height: 1.7;
+    color: var(--text-secondary);
+  }
+
+  /* ── Layout Helpers ── */
+  .content { max-width: 1100px; width: 100%; }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 40px;
+    width: 100%;
+    max-width: 1100px;
+  }
+
+  .three-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 28px;
+    width: 100%;
+    max-width: 1100px;
+  }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px 32px;
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+
+  .card:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--glow-cyan);
+  }
+
+  .card.baseline { border-left: 4px solid var(--accent-orange); }
+  .card.optimized { border-left: 4px solid var(--accent-green); }
+
+  /* ── Code Block ── */
+  pre {
+    background: #0d1117;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 28px;
+    overflow-x: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.92rem;
+    line-height: 1.65;
+    color: #c9d1d9;
+    max-width: 100%;
+  }
+
+  code {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .kw  { color: #ff7b72; }
+  .fn  { color: #d2a8ff; }
+  .str { color: #a5d6ff; }
+  .cmt { color: #8b949e; font-style: italic; }
+  .num { color: #79c0ff; }
+  .op  { color: #ff7b72; }
+  .var { color: #ffa657; }
+  .cls { color: #7ee787; }
+
+  /* ── Timeline / Pipeline ── */
+  .pipeline {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    width: 100%;
+    max-width: 1000px;
+    margin: 20px 0;
+  }
+
+  .pipe-stage {
+    flex: 1;
+    text-align: center;
+    padding: 18px 12px;
+    border-radius: 10px;
+    font-weight: 600;
+    font-size: 1rem;
+    position: relative;
+  }
+
+  .pipe-arrow {
+    font-size: 1.6rem;
+    color: var(--text-muted);
+    flex-shrink: 0;
+    width: 40px;
+    text-align: center;
+  }
+
+  /* ── Metric Bar ── */
+  .metric-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    margin: 12px 0;
+  }
+
+  .metric-label {
+    width: 220px;
+    font-weight: 600;
+    font-size: 1rem;
+    color: var(--text-primary);
+    text-align: right;
+  }
+
+  .metric-bar-bg {
+    flex: 1;
+    height: 36px;
+    background: var(--bg-card-alt);
+    border-radius: 8px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .metric-bar {
+    height: 100%;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    padding-left: 14px;
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: #fff;
+    transition: width 1s ease;
+  }
+
+  .metric-bar.baseline-bar {
+    background: linear-gradient(90deg, var(--accent-orange), #d97706);
+  }
+
+  .metric-bar.optimized-bar {
+    background: linear-gradient(90deg, var(--accent-green), #059669);
+  }
+
+  /* ── Diagram: Timeline ── */
+  .timeline-diagram {
+    width: 100%;
+    max-width: 1000px;
+    margin: 16px 0;
+  }
+
+  .timeline-row {
+    display: flex;
+    align-items: center;
+    margin: 6px 0;
+  }
+
+  .timeline-label {
+    width: 160px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    color: var(--text-primary);
+    text-align: right;
+    padding-right: 16px;
+  }
+
+  .timeline-blocks {
+    flex: 1;
+    display: flex;
+    gap: 3px;
+    height: 42px;
+    align-items: center;
+  }
+
+  .tblock {
+    height: 100%;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #fff;
+    white-space: nowrap;
+  }
+
+  .tblock.h2d   { background: var(--accent-blue); }
+  .tblock.comp  { background: var(--accent-purple); }
+  .tblock.sync  { background: var(--accent-red); opacity: 0.7; }
+  .tblock.idle  { background: #1e293b; border: 1px dashed #334155; }
+  .tblock.d2h   { background: var(--accent-orange); }
+  .tblock.kv    { background: var(--accent-pink); }
+  .tblock.ws    { background: var(--accent-cyan); }
+
+  /* ── Speedup Badge ── */
+  .speedup-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 24px;
+    border-radius: 50px;
+    font-weight: 800;
+    font-size: 2rem;
+    margin: 8px 0;
+  }
+
+  .speedup-badge.good {
+    background: rgba(16,185,129,0.12);
+    border: 2px solid var(--accent-green);
+    color: var(--accent-green);
+  }
+
+  /* ── Bullet List ── */
+  ul.clean {
+    list-style: none;
+    padding: 0;
+  }
+
+  ul.clean li {
+    padding: 8px 0 8px 28px;
+    position: relative;
+    font-size: 1.1rem;
+  }
+
+  ul.clean li::before {
+    content: '▸';
+    position: absolute;
+    left: 0;
+    color: var(--accent-cyan);
+    font-weight: 700;
+  }
+
+  /* ── Nav ── */
+  .nav {
+    position: fixed;
+    bottom: 28px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    background: rgba(17,24,39,0.9);
+    backdrop-filter: blur(12px);
+    border: 1px solid var(--border);
+    border-radius: 50px;
+    padding: 10px 24px;
+    z-index: 100;
+  }
+
+  .nav button {
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-size: 1.3rem;
+    cursor: pointer;
+    padding: 4px 12px;
+    border-radius: 8px;
+    transition: all 0.2s;
+  }
+
+  .nav button:hover {
+    background: var(--bg-card-alt);
+    color: var(--accent-cyan);
+  }
+
+  .nav .page-info {
+    font-size: 0.95rem;
+    color: var(--text-muted);
+    font-weight: 500;
+    min-width: 80px;
+    text-align: center;
+  }
+
+  .progress-bar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue), var(--accent-purple));
+    transition: width 0.4s ease;
+    z-index: 200;
+  }
+
+  /* ── Tag / Chip ── */
+  .tag {
+    display: inline-block;
+    padding: 4px 14px;
+    border-radius: 20px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin: 4px 4px 4px 0;
+  }
+
+  .tag.cyan   { background: rgba(34,211,238,0.12); color: var(--accent-cyan); }
+  .tag.green  { background: rgba(16,185,129,0.12); color: var(--accent-green); }
+  .tag.orange { background: rgba(245,158,11,0.12); color: var(--accent-orange); }
+  .tag.purple { background: rgba(168,85,247,0.12); color: var(--accent-purple); }
+  .tag.red    { background: rgba(239,68,68,0.12); color: var(--accent-red); }
+  .tag.blue   { background: rgba(59,130,246,0.12); color: var(--accent-blue); }
+
+  /* ── Table ── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+  }
+
+  th, td {
+    padding: 14px 18px;
+    text-align: left;
+    font-size: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  th {
+    color: var(--accent-cyan);
+    font-weight: 600;
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  td { color: var(--text-secondary); }
+  tr:hover td { color: var(--text-primary); }
+
+  .val-good { color: var(--accent-green); font-weight: 700; }
+  .val-base { color: var(--accent-orange); font-weight: 600; }
+
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .slide { padding: 30px 24px; }
+    h1 { font-size: 2.2rem; }
+    h2 { font-size: 1.7rem; }
+    .two-col, .three-col { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="progress-bar" id="progress"></div>
+
+<div class="deck" id="deck">
+
+<!-- ═══════════════════════════════════════════════ SLIDE 0: Title ═══ -->
+<div class="slide active" data-slide="0">
+  <div style="text-align:center;">
+    <div style="font-size:4.5rem; margin-bottom:12px;">⚡</div>
+    <h1>Chapter 11<br>Streams & Concurrency</h1>
+    <p class="subtitle">
+      在 Blackwell 架构上利用 CUDA Streams 实现计算、内存与通信的重叠执行，
+      消除 GPU 空闲气泡，最大化硬件利用率
+    </p>
+    <div style="display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
+      <span class="tag cyan">CUDA Streams</span>
+      <span class="tag green">Double Buffering</span>
+      <span class="tag purple">Warp Specialization</span>
+      <span class="tag orange">Stream-Ordered Memory</span>
+      <span class="tag blue">Adaptive Scheduling</span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 1: Problem ═══ -->
+<div class="slide" data-slide="1">
+  <h2>🎯 核心问题：GPU 空闲气泡</h2>
+  <p class="subtitle" style="text-align:left; max-width:100%;">
+    串行执行模式下，GPU 计算单元在内存传输期间处于空闲状态，反之亦然
+  </p>
+
+  <div class="content">
+    <h3 style="margin-top:24px;">Baseline：顺序执行 (每段阻塞)</h3>
+    <div class="timeline-diagram">
+      <div class="timeline-row">
+        <div class="timeline-label">Host → Device</div>
+        <div class="timeline-blocks">
+          <div class="tblock h2d" style="width:14%;">H2D #0</div>
+          <div class="tblock idle" style="width:4%;"></div>
+          <div class="tblock h2d" style="width:14%;">H2D #1</div>
+          <div class="tblock idle" style="width:4%;"></div>
+          <div class="tblock h2d" style="width:14%;">H2D #2</div>
+          <div class="tblock idle" style="width:4%;"></div>
+          <div class="tblock h2d" style="width:14%;">H2D #3</div>
+        </div>
+      </div>
+      <div class="timeline-row">
+        <div class="timeline-label">GPU Compute</div>
+        <div class="timeline-blocks">
+          <div class="tblock idle" style="width:14%;"></div>
+          <div class="tblock sync" style="width:4%;">⏳</div>
+          <div class="tblock comp" style="width:14%;">Compute #0</div>
+          <div class="tblock sync" style="width:4%;">⏳</div>
+          <div class="tblock comp" style="width:14%;">Compute #1</div>
+          <div class="tblock sync" style="width:4%;">⏳</div>
+          <div class="tblock comp" style="width:14%;">Compute #2</div>
+          <div class="tblock sync" style="width:4%;">⏳</div>
+          <div class="tblock comp" style="width:14%;">Compute #3</div>
+        </div>
+      </div>
+    </div>
+
+    <h3 style="margin-top:32px;">Optimized：流水线重叠执行</h3>
+    <div class="timeline-diagram">
+      <div class="timeline-row">
+        <div class="timeline-label">Stream H2D</div>
+        <div class="timeline-blocks">
+          <div class="tblock h2d" style="width:16%;">H2D #0</div>
+          <div class="tblock h2d" style="width:16%;">H2D #1</div>
+          <div class="tblock h2d" style="width:16%;">H2D #2</div>
+          <div class="tblock h2d" style="width:16%;">H2D #3</div>
+        </div>
+      </div>
+      <div class="timeline-row">
+        <div class="timeline-label">Stream Compute</div>
+        <div class="timeline-blocks">
+          <div class="tblock idle" style="width:8%;"></div>
+          <div class="tblock comp" style="width:16%;">Compute #0</div>
+          <div class="tblock comp" style="width:16%;">Compute #1</div>
+          <div class="tblock comp" style="width:16%;">Compute #2</div>
+          <div class="tblock comp" style="width:10%;">#3</div>
+        </div>
+      </div>
+    </div>
+    <p style="margin-top:12px; color:var(--accent-green); font-weight:600;">
+      ✅ H2D 传输与 Compute 重叠执行 → 消除空闲气泡
+    </p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 2: Architecture ═══ -->
+<div class="slide" data-slide="2">
+  <h2>🏗️ CUDA Stream 基础架构</h2>
+
+  <div class="two-col" style="margin-top:20px;">
+    <div class="card">
+      <h3>什么是 CUDA Stream？</h3>
+      <ul class="clean">
+        <li>Stream 内的操作<strong>顺序执行</strong></li>
+        <li>不同 Stream 间的操作<strong>可以并行</strong></li>
+        <li>默认 Stream (Stream 0) 会阻塞其他 Stream</li>
+        <li>使用 <code>non_blocking=True</code> 实现异步传输</li>
+        <li>Pinned Memory 是异步传输的前提条件</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>关键 API</h3>
+      <pre><span class="cmt"># 创建非阻塞 Stream</span>
+<span class="var">stream</span> = torch.cuda.<span class="fn">Stream</span>()
+
+<span class="cmt"># 在指定 Stream 上执行</span>
+<span class="kw">with</span> torch.cuda.<span class="fn">stream</span>(<span class="var">stream</span>):
+    <span class="var">buf</span>.<span class="fn">copy_</span>(data, <span class="var">non_blocking</span>=<span class="num">True</span>)
+    <span class="var">result</span> = <span class="fn">compute</span>(<span class="var">buf</span>)
+
+<span class="cmt"># Stream 同步</span>
+<span class="var">stream</span>.<span class="fn">synchronize</span>()
+
+<span class="cmt"># 跨 Stream 等待</span>
+<span class="var">stream_b</span>.<span class="fn">wait_stream</span>(<span class="var">stream_a</span>)</pre>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 3: Baseline Code ═══ -->
+<div class="slide" data-slide="3">
+  <h2>📋 Baseline：顺序执行模式</h2>
+
+  <div class="two-col" style="margin-top:16px;">
+    <div class="card baseline">
+      <h3 style="color:var(--accent-orange);">baseline_streams.py</h3>
+      <pre><span class="kw">def</span> <span class="fn">benchmark_fn</span>(self):
+    <span class="cmt"># 逐段处理：H2D → Sync → Compute → Sync</span>
+    <span class="kw">for</span> <span class="var">i</span> <span class="kw">in</span> <span class="fn">range</span>(self.num_chunks):
+        <span class="cmt"># ❶ 阻塞式 H2D 传输</span>
+        self.device_data[i].<span class="fn">copy_</span>(
+            self.host_data[i]
+        )
+        <span class="cmt"># ❷ GPU 计算 (传输已完成)</span>
+        self.results[i] = self.<span class="fn">_compute</span>(
+            self.device_data[i]
+        )
+    <span class="cmt"># 每个 chunk 必须等待前一个完成</span>
+    <span class="cmt"># → 无重叠，大量 GPU 空闲</span></pre>
+    </div>
+    <div class="card">
+      <h3>执行时序分析</h3>
+      <ul class="clean">
+        <li><strong>20 个 chunk</strong> × (H2D + Compute)</li>
+        <li>每个 chunk 阻塞等待传输完成</li>
+        <li>GPU SM 在 H2D 期间 <span style="color:var(--accent-red);">完全空闲</span></li>
+        <li>内存控制器在计算期间 <span style="color:var(--accent-red);">完全空闲</span></li>
+        <li>总时间 ≈ Σ(H2D<sub>i</sub>) + Σ(Compute<sub>i</sub>)</li>
+      </ul>
+      <div style="margin-top:20px; padding:16px; background:rgba(245,158,11,0.08); border-radius:10px; border:1px solid rgba(245,158,11,0.2);">
+        <strong style="color:var(--accent-orange);">⚠️ 问题</strong>
+        <p style="margin-top:6px;">5M 元素/chunk × 20 chunks，串行执行使 GPU 利用率极低</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 4: Optimized Code ═══ -->
+<div class="slide" data-slide="4">
+  <h2>🚀 Optimized：双缓冲流水线</h2>
+
+  <div class="two-col" style="margin-top:16px;">
+    <div class="card optimized">
+      <h3 style="color:var(--accent-green);">optimized_streams.py</h3>
+      <pre><span class="kw">def</span> <span class="fn">benchmark_fn</span>(self):
+    <span class="cmt"># ❶ 启动首次 H2D 传输</span>
+    <span class="kw">with</span> torch.cuda.<span class="fn">stream</span>(self.stream_h2d):
+        self.device_data[<span class="num">0</span>].<span class="fn">copy_</span>(
+            self.host_data[<span class="num">0</span>],
+            <span class="var">non_blocking</span>=<span class="num">True</span>
+        )
+
+    <span class="kw">for</span> <span class="var">i</span> <span class="kw">in</span> <span class="fn">range</span>(self.num_chunks):
+        <span class="cmt"># ❷ 等待当前 chunk 传输完成</span>
+        self.stream_compute.<span class="fn">wait_stream</span>(
+            self.stream_h2d
+        )
+        <span class="cmt"># ❸ 提前启动下一 chunk 传输</span>
+        <span class="kw">if</span> <span class="var">i</span> + <span class="num">1</span> < <span class="fn">len</span>(self.chunks):
+            <span class="kw">with</span> torch.cuda.<span class="fn">stream</span>(self.stream_h2d):
+                self.device_data[<span class="var">i</span>+<span class="num">1</span>].<span class="fn">copy_</span>(
+                    self.host_data[<span class="var">i</span>+<span class="num">1</span>],
+                    <span class="var">non_blocking</span>=<span class="num">True</span>
+                )
+        <span class="cmt"># ❹ 在 Compute Stream 上计算</span>
+        <span class="kw">with</span> torch.cuda.<span class="fn">stream</span>(self.stream_compute):
+            self.results[<span class="var">i</span>] = self.<span class="fn">_compute</span>(
+                self.device_data[<span class="var">i</span>]
+            )</pre>
+    </div>
+    <div class="card">
+      <h3>流水线机制</h3>
+      <div class="timeline-diagram" style="margin-top:12px;">
+        <div class="timeline-row">
+          <div class="timeline-label" style="width:120px;">H2D Stream</div>
+          <div class="timeline-blocks">
+            <div class="tblock h2d" style="width:22%;">T₀</div>
+            <div class="tblock h2d" style="width:22%;">T₁</div>
+            <div class="tblock h2d" style="width:22%;">T₂</div>
+          </div>
+        </div>
+        <div class="timeline-row">
+          <div class="timeline-label" style="width:120px;">Compute Stream</div>
+          <div class="timeline-blocks">
+            <div class="tblock idle" style="width:10%;"></div>
+            <div class="tblock comp" style="width:22%;">C₀</div>
+            <div class="tblock comp" style="width:22%;">C₁</div>
+            <div class="tblock comp" style="width:18%;">C₂</div>
+          </div>
+        </div>
+      </div>
+      <ul class="clean" style="margin-top:16px;">
+        <li><strong>双缓冲</strong>：计算 chunk N 时传输 chunk N+1</li>
+        <li><strong>Stream 同步</strong>：只在数据依赖处等待</li>
+        <li><strong>Pinned Memory</strong>：启用真正的异步 DMA</li>
+        <li><strong>最终同步</strong>：合并所有 Stream 到主 Stream</li>
+      </ul>
+      <div style="margin-top:16px;">
+        <span class="tag green">1.86x 加速</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 5: Stream-Ordered ═══ -->
+<div class="slide" data-slide="5">
+  <h2>📦 Stream-Ordered 内存与 KV Cache</h2>
+  <p class="subtitle" style="text-align:left; max-width:100%;">
+    在保持正确性的同时实现 KV Cache 更新的流水线化
+  </p>
+
+  <div class="two-col" style="margin-top:16px;">
+    <div class="card baseline">
+      <h3 style="color:var(--accent-orange);">Baseline：单 Stream 串行更新</h3>
+      <div class="timeline-diagram">
+        <div class="timeline-row">
+          <div class="timeline-label" style="width:120px;">Single Stream</div>
+          <div class="timeline-blocks">
+            <div class="tblock h2d" style="width:12%;">H2D</div>
+            <div class="tblock kv" style="width:14%;">KV #0</div>
+            <div class="tblock sync" style="width:5%;">⏳</div>
+            <div class="tblock h2d" style="width:12%;">H2D</div>
+            <div class="tblock kv" style="width:14%;">KV #1</div>
+            <div class="tblock sync" style="width:5%;">⏳</div>
+            <div class="tblock h2d" style="width:12%;">H2D</div>
+            <div class="tblock kv" style="width:14%;">KV #2</div>
+          </div>
+        </div>
+      </div>
+      <ul class="clean">
+        <li>每段 KV 更新必须完成才能开始下一段</li>
+        <li>18M 元素 / 8 段，全串行</li>
+        <li>设备同步阻塞每个 segment</li>
+      </ul>
+    </div>
+    <div class="card optimized">
+      <h3 style="color:var(--accent-green);">Optimized：多 Stream 重叠更新</h3>
+      <div class="timeline-diagram">
+        <div class="timeline-row">
+          <div class="timeline-label" style="width:120px;">Stream A</div>
+          <div class="timeline-blocks">
+            <div class="tblock h2d" style="width:20%;">H2D seg0</div>
+            <div class="tblock kv" style="width:22%;">KV seg0</div>
+            <div class="tblock h2d" style="width:20%;">H2D seg4</div>
+            <div class="tblock kv" style="width:22%;">KV seg4</div>
+          </div>
+        </div>
+        <div class="timeline-row">
+          <div class="timeline-label" style="width:120px;">Stream B</div>
+          <div class="timeline-blocks">
+            <div class="tblock idle" style="width:8%;"></div>
+            <div class="tblock h2d" style="width:20%;">H2D seg1</div>
+            <div class="tblock kv" style="width:22%;">KV seg1</div>
+            <div class="tblock h2d" style="width:20%;">H2D seg5</div>
+          </div>
+        </div>
+      </div>
+      <ul class="clean">
+        <li>多 Stream 并行处理不同 segment</li>
+        <li>Stream-ordered 语义保证更新顺序</li>
+        <li>无需全局设备同步</li>
+        <li><span class="tag green">1.50x 加速</span></li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 6: Warp Specialization ═══ -->
+<div class="slide" data-slide="6">
+  <h2>🌀 Warp Specialization + Multi-Stream</h2>
+
+  <div class="two-col" style="margin-top:16px;">
+    <div class="card">
+      <h3>概念：Warp 级别的流水线分工</h3>
+      <ul class="clean">
+        <li><strong>Producer Warps</strong>：负责数据搬运 (TMA/UTCCP)</li>
+        <li><strong>Consumer Warps</strong>：负责 Tensor Core 计算</li>
+        <li>通过 <strong>DSMEM</strong> (Distributed SMEM) 在 Warp 间传递数据</li>
+        <li>Multi-Stream 放大：不同 Stream 上运行不同的 Warp 专业化 kernel</li>
+        <li>SM 级别的 overlap，而非仅 kernel 级别</li>
+      </ul>
+      <div style="margin-top:16px;">
+        <span class="tag cyan">DSMEM</span>
+        <span class="tag purple">Producer-Consumer</span>
+        <span class="tag green">1.67x 加速</span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>执行模型</h3>
+      <pre><span class="cmt">// Warp Specialized Kernel (CUDA)</span>
+<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">ws_kernel</span>() {
+  <span class="kw">if</span> (<span class="fn">threadIdx</span>.x < <span class="num">PRODUCER_THREADS</span>) {
+    <span class="cmt">// Producer: 数据搬运</span>
+    <span class="kw">while</span> (<span class="var">has_work</span>) {
+      <span class="fn">tma_load</span>(smem_buf, gmem_src);
+      <span class="fn">dsme_barrier_arrive</span>();
+    }
+  } <span class="kw">else</span> {
+    <span class="cmt">// Consumer: 计算</span>
+    <span class="kw">while</span> (<span class="var">has_work</span>) {
+      <span class="fn">dsme_barrier_wait</span>();
+      <span class="fn">tcgen05_mma</span>(acc, smem_buf);
+    }
+  }
+}</pre>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 7: Adaptive ═══ -->
+<div class="slide" data-slide="7">
+  <h2>🧠 自适应 Stream 调度</h2>
+  <p class="subtitle" style="text-align:left; max-width:100%;">
+    根据运行时遥测动态调整 Stream 使用策略，平衡 NCCL、计算与 IO 任务
+  </p>
+
+  <div class="three-col" style="margin-top:20px;">
+    <div class="card">
+      <h3 style="color:var(--accent-blue);">NCCL 通信</h3>
+      <p>分布式 AllReduce / AllGather 操作，需要高优先级 Stream 处理</p>
+      <div style="margin-top:12px;">
+        <div class="tblock h2d" style="width:100%; height:32px; font-size:0.85rem;">
+          NCCL AllReduce
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--accent-purple);">GPU 计算</h3>
+      <p>GEMM / Attention / LayerNorm 等计算密集型 kernel</p>
+      <div style="margin-top:12px;">
+        <div class="tblock comp" style="width:100%; height:32px; font-size:0.85rem;">
+          Compute Kernels
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--accent-orange);">IO 搬运</h3>
+      <p>H2D/D2H 数据传输、KV Cache 预取、权重加载</p>
+      <div style="margin-top:12px;">
+        <div class="tblock d2h" style="width:100%; height:32px; font-size:0.85rem;">
+          Memory Transfers
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="content" style="margin-top:28px;">
+    <div class="card" style="border-left:4px solid var(--accent-cyan);">
+      <h3>自适应策略</h3>
+      <pre><span class="kw">class</span> <span class="cls">AdaptiveStreamController</span>:
+    <span class="kw">def</span> <span class="fn">select_stream</span>(self, task_type, priority):
+        <span class="cmt"># 基于运行时 GPU 利用率动态分配 Stream</span>
+        <span class="kw">if</span> gpu_util > <span class="num">0.85</span>:
+            <span class="kw">return</span> self.<span class="var">low_priority_stream</span>  <span class="cmt"># 避免过载</span>
+        <span class="kw">elif</span> task_type == <span class="str">"nccl"</span>:
+            <span class="kw">return</span> self.<span class="var">nccl_stream</span>           <span class="cmt"># 专用 NCCL</span>
+        <span class="kw">else</span>:
+            <span class="kw">return</span> self.<span class="var">compute_streams</span>[idx]    <span class="cmt"># 轮询分配</span></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 8: Benchmark Results ═══ -->
+<div class="slide" data-slide="8">
+  <h2>📊 Benchmark 实测结果</h2>
+  <p class="subtitle" style="text-align:left; max-width:100%;">
+    Blackwell (B200) 上的代表性验证数据，对比 baseline 与 optimized 路径
+  </p>
+
+  <div class="content" style="margin-top:20px;">
+    <table>
+      <thead>
+        <tr>
+          <th>Benchmark Target</th>
+          <th>Baseline</th>
+          <th>Optimized</th>
+          <th>加速比</th>
+          <th>优化手段</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>streams</strong></td>
+          <td class="val-base">15.035 ms</td>
+          <td class="val-good">8.073 ms</td>
+          <td><span class="speedup-badge good" style="font-size:1.2rem; padding:4px 16px;">1.86×</span></td>
+          <td>基本重叠代替串行 launch</td>
+        </tr>
+        <tr>
+          <td><strong>stream_ordered_kv_cache</strong></td>
+          <td class="val-base">3.153 ms</td>
+          <td class="val-good">2.103 ms</td>
+          <td><span class="speedup-badge good" style="font-size:1.2rem; padding:4px 16px;">1.50×</span></td>
+          <td>有序 KV 更新，减少空闲</td>
+        </tr>
+        <tr>
+          <td><strong>warp_specialization_multistream</strong></td>
+          <td class="val-base">17.530 ms</td>
+          <td class="val-good">10.500 ms</td>
+          <td><span class="speedup-badge good" style="font-size:1.2rem; padding:4px 16px;">1.67×</span></td>
+          <td>多 Stream Warp 专业化</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div style="margin-top:28px;">
+      <h3>可视化对比</h3>
+      <div class="metric-row">
+        <div class="metric-label">streams</div>
+        <div class="metric-bar-bg">
+          <div class="metric-bar baseline-bar" style="width:86%;">15.035 ms</div>
+        </div>
+      </div>
+      <div class="metric-row">
+        <div class="metric-label"></div>
+        <div class="metric-bar-bg">
+          <div class="metric-bar optimized-bar" style="width:46%;">8.073 ms</div>
+        </div>
+      </div>
+
+      <div class="metric-row" style="margin-top:16px;">
+        <div class="metric-label">kv_cache</div>
+        <div class="metric-bar-bg">
+          <div class="metric-bar baseline-bar" style="width:55%;">3.153 ms</div>
+        </div>
+      </div>
+      <div class="metric-row">
+        <div class="metric-label"></div>
+        <div class="metric-bar-bg">
+          <div class="metric-bar optimized-bar" style="width:37%;">2.103 ms</div>
+        </div>
+      </div>
+
+      <div class="metric-row" style="margin-top:16px;">
+        <div class="metric-label">warp_spec</div>
+        <div class="metric-bar-bg">
+          <div class="metric-bar baseline-bar" style="width:95%;">17.530 ms</div>
+        </div>
+      </div>
+      <div class="metric-row">
+        <div class="metric-label"></div>
+        <div class="metric-bar-bg">
+          <div class="metric-bar optimized-bar" style="width:57%;">10.500 ms</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 9: File Layout ═══ -->
+<div class="slide" data-slide="9">
+  <h2>📁 代码目录结构</h2>
+
+  <div class="content" style="margin-top:16px;">
+    <table>
+      <thead>
+        <tr>
+          <th>文件分组</th>
+          <th>说明</th>
+          <th>标签</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>baseline_streams.py</code><br><code>optimized_streams.py</code></td>
+          <td>核心 Stream 重叠 Demo：串行 vs 流水线</td>
+          <td><span class="tag cyan">基础</span></td>
+        </tr>
+        <tr>
+          <td><code>stream_overlap_base.py</code></td>
+          <td>共享基类：StridedStreamBaseline / ConcurrentStreamOptimized</td>
+          <td><span class="tag blue">框架</span></td>
+        </tr>
+        <tr>
+          <td><code>baseline_stream_ordered*.py</code><br><code>optimized_stream_ordered*.py</code></td>
+          <td>Stream-ordered 分配器与 KV Cache 示例</td>
+          <td><span class="tag purple">KV Cache</span></td>
+        </tr>
+        <tr>
+          <td><code>baseline_gemm_streams.py</code><br><code>optimized_tensor_cores_streams.py</code></td>
+          <td>GEMM 流水线：Tensor Core 多 Stream 调度</td>
+          <td><span class="tag green">GEMM</span></td>
+        </tr>
+        <tr>
+          <td><code>baseline_distributed_streams.py</code><br><code>optimized_adaptive_streams.py</code></td>
+          <td>自适应控制器：NCCL + Compute + IO 动态平衡</td>
+          <td><span class="tag orange">分布式</span></td>
+        </tr>
+        <tr>
+          <td><code>streams_warp_specialized_demo.cu</code><br><code>warp_specialized_*.cu</code></td>
+          <td>Warp 专业化 CUDA kernel + DSMEM 流水线</td>
+          <td><span class="tag red">CUDA</span></td>
+        </tr>
+        <tr>
+          <td><code>compare.py</code></td>
+          <td>Benchmark 驱动器：baseline vs optimized 对比</td>
+          <td><span class="tag cyan">Harness</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 10: Profiler ═══ -->
+<div class="slide" data-slide="10">
+  <h2>🔬 Nsight Profiler 验证方法</h2>
+
+  <div class="two-col" style="margin-top:20px;">
+    <div class="card">
+      <h3>Profiler 命令</h3>
+      <pre><span class="cmt"># Deep-dive 分析每个 target</span>
+python -m cli.aisp bench run \
+  --targets ch11:streams \
+  --profile deep_dive \
+  --single-gpu
+
+python -m cli.aisp bench run \
+  --targets ch11:stream_ordered_kv_cache \
+  --profile deep_dive \
+  --single-gpu
+
+python -m cli.aisp bench run \
+  --targets ch11:warp_specialization_multistream \
+  --profile deep_dive \
+  --single-gpu</pre>
+    </div>
+    <div class="card">
+      <h3>Nsight 验证要点</h3>
+      <ul class="clean">
+        <li><strong>streams</strong>：确认 kernel 间 idle gap 减少</li>
+        <li><strong>kv_cache</strong>：确认无需全设备串行化</li>
+        <li><strong>warp_spec</strong>：确认 warp 级 overlap 生效</li>
+        <li>使用 NVTX range 标记关键区域</li>
+        <li>对比 timeline 中的 Stream 并发度</li>
+      </ul>
+      <div style="margin-top:16px;">
+        <pre style="font-size:0.85rem;"><span class="cmt"># 快速对比</span>
+python -m ch11.compare
+
+<span class="cmt"># 列出所有 target</span>
+python -m cli.aisp bench list-targets \
+  --chapter ch11</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 11: Validation ═══ -->
+<div class="slide" data-slide="11">
+  <h2>✅ 验证检查清单</h2>
+
+  <div class="content" style="margin-top:20px;">
+    <div class="card" style="margin-bottom:20px;">
+      <h3>1. 并发性验证 (NVTX)</h3>
+      <pre>python optimized_streams.py --trace
+<span class="cmt"># → Nsight Systems 中应看到重叠的 NVTX ranges</span>
+<span class="cmt"># → H2D 和 Compute 在时间线上交错出现</span></pre>
+    </div>
+
+    <div class="card" style="margin-bottom:20px;">
+      <h3>2. 正确性验证 (KV Cache)</h3>
+      <pre>python optimized_stream_ordered_kv_cache.py --validate
+<span class="cmt"># → 输出必须与 baseline 数值一致 (within tolerance)</span>
+<span class="cmt"># → 同时确认 idle gap 减少</span></pre>
+    </div>
+
+    <div class="card">
+      <h3>3. 硬件能力检查 (Warp Specialization)</h3>
+      <pre>python baseline_warp_specialized_multistream.py
+<span class="cmt"># → 不支持 DSMEM 的硬件立即报错</span>
+<span class="cmt"># → 不会静默 fallback 到非专业化路径</span></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════ SLIDE 12: Takeaways ═══ -->
+<div class="slide" data-slide="12">
+  <h2>💡 关键收获</h2>
+
+  <div class="three-col" style="margin-top:24px;">
+    <div class="card" style="border-top:3px solid var(--accent-cyan);">
+      <div style="font-size:2rem; margin-bottom:8px;">🌊</div>
+      <h3>Stream 流水线</h3>
+      <p>用双缓冲将 H2D 传输与计算重叠，消除空闲气泡。不是"能不能加 Stream"，而是"哪些工作图允许重叠"。</p>
+      <div style="margin-top:12px;"><span class="tag green">1.86×</span></div>
+    </div>
+    <div class="card" style="border-top:3px solid var(--accent-purple);">
+      <div style="font-size:2rem; margin-bottom:8px;">📦</div>
+      <h3>Stream-Ordered 语义</h3>
+      <p>KV Cache 更新用 stream-ordered 内存保证正确性，同时允许多 segment 并行更新，避免全局同步。</p>
+      <div style="margin-top:12px;"><span class="tag green">1.50×</span></div>
+    </div>
+    <div class="card" style="border-top:3px solid var(--accent-orange);">
+      <div style="font-size:2rem; margin-bottom:8px;">🌀</div>
+      <h3>Warp 专业化</h3>
+      <p>Producer-Consumer warp 分工 + DSMEM 数据传递 + Multi-Stream 放大，在 SM 级别实现深度 overlap。</p>
+      <div style="margin-top:12px;"><span class="tag green">1.67×</span></div>
+    </div>
+  </div>
+
+  <div class="content" style="margin-top:28px;">
+    <div class="card" style="border-left:4px solid var(--accent-cyan); text-align:center;">
+      <p style="font-size:1.3rem; color:var(--text-primary); font-weight:600;">
+        这些不是"大 baseline 错误"的胜利——而是更现实的并发收益：<br>
+        <span style="color:var(--accent-cyan);">重叠有帮助，但只有当工作图真正允许它时才有效。</span>
+      </p>
+    </div>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<!-- Navigation -->
+<div class="nav">
+  <button id="btnPrev" onclick="go(-1)">◀</button>
+  <span class="page-info" id="pageInfo">1 / 13</span>
+  <button id="btnNext" onclick="go(1)">▶</button>
+</div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  const total = slides.length;
+  let cur = 0;
+
+  function show(n) {
+    slides.forEach((s, i) => {
+      s.classList.remove('active', 'prev');
+      if (i === n) s.classList.add('active');
+      else if (i < n) s.classList.add('prev');
+    });
+    document.getElementById('pageInfo').textContent = `${n + 1} / ${total}`;
+    document.getElementById('progress').style.width = `${((n + 1) / total) * 100}%`;
+  }
+
+  function go(d) {
+    cur = Math.max(0, Math.min(total - 1, cur + d));
+    show(cur);
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); go(1); }
+    if (e.key === 'ArrowLeft')  { e.preventDefault(); go(-1); }
+    if (e.key === 'Home')       { e.preventDefault(); cur = 0; show(cur); }
+    if (e.key === 'End')        { e.preventDefault(); cur = total - 1; show(cur); }
+  });
+
+  // Touch support
+  let touchX = 0;
+  document.addEventListener('touchstart', e => { touchX = e.touches[0].clientX; });
+  document.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - touchX;
+    if (Math.abs(dx) > 50) go(dx < 0 ? 1 : -1);
+  });
+
+  show(0);
+</script>
+
+</body>
+</html>

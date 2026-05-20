@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch12 - CUDA Graphs & Dynamic Workloads</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --surface: #1e293b;
+    --accent: #38bdf8;
+    --accent2: #a78bfa;
+    --accent3: #34d399;
+    --accent4: #fb923c;
+    --text: #e2e8f0;
+    --dim: #94a3b8;
+    --red: #f87171;
+    --green: #4ade80;
+    --yellow: #facc15;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; overflow:hidden; font-family:'Inter','SF Pro Display',-apple-system,sans-serif; background:var(--bg); color:var(--text); }
+
+  .slide { display:none; width:100vw; height:100vh; padding:60px 80px; flex-direction:column; justify-content:center; }
+  .slide.active { display:flex; }
+
+  /* Navigation */
+  .nav { position:fixed; bottom:30px; right:40px; display:flex; gap:12px; z-index:99; }
+  .nav button { background:var(--surface); border:1px solid #334155; color:var(--text); padding:10px 20px; border-radius:8px; cursor:pointer; font-size:14px; transition:all .2s; }
+  .nav button:hover { background:#334155; border-color:var(--accent); }
+  .counter { position:fixed; bottom:34px; left:40px; color:var(--dim); font-size:13px; z-index:99; }
+
+  /* Typography */
+  h1 { font-size:52px; font-weight:800; line-height:1.15; margin-bottom:20px; }
+  h2 { font-size:38px; font-weight:700; margin-bottom:24px; color:var(--accent); }
+  h3 { font-size:24px; font-weight:600; margin-bottom:16px; color:var(--accent2); }
+  p, li { font-size:20px; line-height:1.7; color:var(--text); }
+  .dim { color:var(--dim); }
+  .subtitle { font-size:22px; color:var(--dim); margin-bottom:40px; }
+
+  /* Layout helpers */
+  .cols { display:grid; gap:40px; }
+  .cols-2 { grid-template-columns:1fr 1fr; }
+  .cols-3 { grid-template-columns:1fr 1fr 1fr; }
+  .cols-4 { grid-template-columns:1fr 1fr 1fr 1fr; }
+  .full-row { grid-column:1/-1; }
+
+  /* Cards */
+  .card { background:var(--surface); border-radius:14px; padding:28px 32px; border:1px solid #334155; }
+  .card h3 { margin-bottom:12px; }
+  .card ul { list-style:none; padding:0; }
+  .card li { padding:6px 0; font-size:17px; }
+  .card li::before { content:"→ "; color:var(--accent); font-weight:600; }
+
+  /* Metric boxes */
+  .metric { text-align:center; padding:30px 20px; }
+  .metric .num { font-size:56px; font-weight:800; line-height:1; }
+  .metric .label { font-size:15px; color:var(--dim); margin-top:8px; text-transform:uppercase; letter-spacing:1px; }
+  .metric.green .num { color:var(--green); }
+  .metric.blue .num { color:var(--accent); }
+  .metric.purple .num { color:var(--accent2); }
+  .metric.orange .num { color:var(--accent4); }
+
+  /* Code blocks */
+  .code-block { background:#0c1222; border:1px solid #1e3a5f; border-radius:10px; padding:20px 24px; font-family:'JetBrains Mono','Fira Code',monospace; font-size:14px; line-height:1.65; overflow-x:auto; color:#cbd5e1; white-space:pre; }
+  .code-block .kw { color:#c084fc; }
+  .code-block .fn { color:#38bdf8; }
+  .code-block .cm { color:#475569; }
+  .code-block .str { color:#34d399; }
+  .code-block .num { color:#fb923c; }
+  .code-block .op { color:#f472b6; }
+
+  /* Diagram / flow */
+  .flow { display:flex; align-items:center; justify-content:center; gap:16px; flex-wrap:wrap; margin:24px 0; }
+  .flow-box { background:var(--surface); border:2px solid #334155; border-radius:10px; padding:16px 24px; font-size:16px; font-weight:600; text-align:center; min-width:140px; }
+  .flow-box.highlight { border-color:var(--accent); box-shadow:0 0 20px rgba(56,189,248,.15); }
+  .flow-box.green { border-color:var(--green); }
+  .flow-box.red { border-color:var(--red); }
+  .flow-arrow { color:var(--dim); font-size:24px; }
+
+  /* Table */
+  table { width:100%; border-collapse:collapse; margin:16px 0; }
+  th { text-align:left; padding:12px 16px; background:#1a2744; color:var(--accent); font-size:15px; text-transform:uppercase; letter-spacing:.5px; border-bottom:2px solid #334155; }
+  td { padding:12px 16px; border-bottom:1px solid #1e293b; font-size:17px; }
+  tr:hover td { background:#1a2744; }
+  .win { color:var(--green); font-weight:700; }
+  .lose { color:var(--red); }
+
+  /* Bars */
+  .bar-container { margin:10px 0; }
+  .bar-label { font-size:14px; color:var(--dim); margin-bottom:4px; }
+  .bar-track { height:28px; background:#1a2744; border-radius:6px; overflow:hidden; position:relative; }
+  .bar-fill { height:100%; border-radius:6px; display:flex; align-items:center; padding-left:12px; font-size:13px; font-weight:700; color:#fff; transition:width .6s ease; }
+  .bar-fill.slow { background:linear-gradient(90deg,#ef4444,#f87171); }
+  .bar-fill.fast { background:linear-gradient(90deg,#059669,#34d399); }
+
+  /* Tag / badge */
+  .tag { display:inline-block; padding:4px 14px; border-radius:20px; font-size:13px; font-weight:600; margin:4px 4px 4px 0; }
+  .tag.cuda { background:#1a2744; color:var(--accent); border:1px solid #2563eb; }
+  .tag.python { background:#1a2744; color:var(--yellow); border:1px solid #ca8a04; }
+  .tag.perf { background:#1a2744; color:var(--green); border:1px solid #059669; }
+
+  /* Emphasis box */
+  .callout { border-left:4px solid var(--accent); padding:16px 24px; background:rgba(56,189,248,.06); border-radius:0 10px 10px 0; margin:16px 0; }
+  .callout.warn { border-color:var(--yellow); background:rgba(250,204,21,.06); }
+  .callout.success { border-color:var(--green); background:rgba(52,211,153,.06); }
+
+  /* Title slide special */
+  .title-slide h1 { font-size:64px; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }
+  .title-slide .big-icon { font-size:80px; margin-bottom:20px; }
+
+  /* Animations */
+  @keyframes fadeUp { from{opacity:0;transform:translateY(30px)} to{opacity:1;transform:translateY(0)} }
+  .slide.active > * { animation:fadeUp .5s ease both; }
+  .slide.active > *:nth-child(2) { animation-delay:.1s; }
+  .slide.active > *:nth-child(3) { animation-delay:.2s; }
+  .slide.active > *:nth-child(4) { animation-delay:.3s; }
+
+  /* Progress bar */
+  .progress { position:fixed; top:0; left:0; height:3px; background:linear-gradient(90deg,var(--accent),var(--accent2)); transition:width .3s; z-index:99; }
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+<div class="counter" id="counter"></div>
+<div class="nav">
+  <button onclick="prev()">← Prev</button>
+  <button onclick="next()">Next →</button>
+</div>
+
+<!-- ==================== SLIDE 1: Title ==================== -->
+<div class="slide title-slide" id="s1">
+  <div class="big-icon">⚡</div>
+  <h1>Chapter 12<br>CUDA Graphs &amp; Dynamic Workloads</h1>
+  <p class="subtitle">Launch Overhead Elimination · Graph Replay · Kernel Fusion · GPU-Resident Work Queues</p>
+  <div style="margin-top:30px;">
+    <span class="tag cuda">CUDA Graphs</span>
+    <span class="tag cuda">Dynamic Parallelism</span>
+    <span class="tag python">PyTorch</span>
+    <span class="tag perf">4.75× Speedup</span>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 2: Problem Statement ==================== -->
+<div class="slide" id="s2">
+  <h2>The Problem: Launch Overhead Dominates</h2>
+  <p style="margin-bottom:24px;">When kernels are small or frequent, CPU-side launch overhead becomes the bottleneck — not GPU compute.</p>
+  <div class="cols cols-2">
+    <div class="card">
+      <h3 style="color:var(--red);">❌ Eager Launch (Baseline)</h3>
+      <ul>
+        <li>Each kernel = CPU driver call</li>
+        <li>CUDA driver validation per launch</li>
+        <li>Command buffer submission overhead</li>
+        <li>CPU↔GPU synchronization stalls</li>
+        <li>~5–10 μs overhead per launch</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--green);">✅ Graph Replay (Optimized)</h3>
+      <ul>
+        <li>Capture workload once → replay many</li>
+        <li>Driver validates only during capture</li>
+        <li>Pre-built command buffer replayed</li>
+        <li>No per-launch CPU involvement</li>
+        <li>~0.1 μs overhead per replay</li>
+      </ul>
+    </div>
+  </div>
+  <div class="callout warn" style="margin-top:24px;">
+    <strong>Key Question:</strong> Not "can we capture a graph?" but "which graph or dynamic-work techniques actually reduce real runtime once correctness stays fixed?"
+  </div>
+</div>
+
+<!-- ==================== SLIDE 3: Measured Results ==================== -->
+<div class="slide" id="s3">
+  <h2>Measured Benchmark Results</h2>
+  <p class="dim" style="margin-bottom:24px;">Validated on B200 GPU · strict harness · 95 validity protections active</p>
+  <div class="cols cols-3">
+    <div class="card metric green">
+      <div class="num">4.21×</div>
+      <div class="label">CUDA Graphs</div>
+      <p style="font-size:14px;color:var(--dim);margin-top:12px;">529ms → 126ms<br>Graph replay vs eager launch</p>
+    </div>
+    <div class="card metric blue">
+      <div class="num">2.72×</div>
+      <div class="label">Kernel Fusion</div>
+      <p style="font-size:14px;color:var(--dim);margin-top:12px;">1.78ms → 0.65ms<br>Fused graph-friendly execution</p>
+    </div>
+    <div class="card metric purple">
+      <div class="num">4.75×</div>
+      <div class="label">Work Queue</div>
+      <p style="font-size:14px;color:var(--dim);margin-top:12px;">2.10ms → 0.44ms<br>GPU-resident dynamic dispatch</p>
+    </div>
+  </div>
+  <div style="margin-top:32px;">
+    <div class="bar-container">
+      <div class="bar-label">cuda_graphs — 32000 iterations, 1K elements</div>
+      <div class="bar-track"><div class="bar-fill slow" style="width:100%">Baseline: 529.5 ms</div></div>
+      <div class="bar-track" style="margin-top:4px;"><div class="bar-fill fast" style="width:23.8%">Optimized: 125.9 ms</div></div>
+    </div>
+    <div class="bar-container">
+      <div class="bar-label">kernel_fusion — 16M elements, 10 iterations</div>
+      <div class="bar-track"><div class="bar-fill slow" style="width:100%">Baseline: 1.776 ms</div></div>
+      <div class="bar-track" style="margin-top:4px;"><div class="bar-fill fast" style="width:36.8%">Optimized: 0.654 ms</div></div>
+    </div>
+    <div class="bar-container">
+      <div class="bar-label">work_queue — 1M elements, 5 iterations</div>
+      <div class="bar-track"><div class="bar-fill slow" style="width:100%">Baseline: 2.100 ms</div></div>
+      <div class="bar-track" style="margin-top:4px;"><div class="bar-fill fast" style="width:21.0%">Optimized: 0.442 ms</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 4: CUDA Graphs Deep Dive ==================== -->
+<div class="slide" id="s4">
+  <h2>CUDA Graphs: Capture → Instantiate → Replay</h2>
+  <div class="cols cols-2">
+    <div>
+      <h3>How It Works</h3>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;">
+        <div class="flow-box" style="width:100%;text-align:left;">① <strong>Capture</strong> — Record kernel dependencies on a stream</div>
+        <div class="flow-arrow" style="align-self:center;">↓</div>
+        <div class="flow-box" style="width:100%;text-align:left;">② <strong>Instantiate</strong> — Build optimized executable graph</div>
+        <div class="flow-arrow" style="align-self:center;">↓</div>
+        <div class="flow-box highlight" style="width:100%;text-align:left;">③ <strong>Replay</strong> — Launch entire graph with one CPU call</div>
+      </div>
+      <div class="callout" style="margin-top:16px;">
+        <strong>32,000 kernel launches</strong> become a single graph replay call — CPU overhead drops to near zero.
+      </div>
+    </div>
+    <div>
+      <h3>Baseline vs Optimized Code</h3>
+      <div class="code-block"><span class="cm">// BASELINE: 32K separate launches</span>
+<span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(<span class="num">32000</span>):
+    kernel<span class="op"><<<</span>grid, block<span class="op">>>>(</span>data<span class="op">)</span>  <span class="cm">// CPU call each time</span>
+
+<span class="cm">// OPTIMIZED: Capture once, replay 32K times</span>
+<span class="fn">cudaStreamBeginCapture</span>(stream)
+<span class="fn">kernel</span><span class="op"><<<</span>grid, block, <span class="num">0</span>, stream<span class="op">>>>(</span>data<span class="op">)</span>
+<span class="fn">cudaStreamEndCapture</span>(stream, <span class="op">&amp;</span>graph)
+<span class="fn">cudaGraphInstantiate</span>(<span class="op">&amp;</span>exec, graph)
+<span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(<span class="num">32000</span>):
+    <span class="fn">cudaGraphLaunch</span>(exec, stream)  <span class="cm">// 1 CPU call</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 5: Conditional Graphs ==================== -->
+<div class="slide" id="s5">
+  <h2>Conditional Graph Execution</h2>
+  <p style="margin-bottom:20px;">Graphs can include branches — the GPU decides which path to take, no CPU sync needed.</p>
+  <div class="cols cols-2">
+    <div class="card">
+      <h3 style="color:var(--red);">Baseline: Host-Side Dispatch</h3>
+      <div class="code-block" style="font-size:13px;"><span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(<span class="num">5000</span>):
+    <span class="cm">// Evaluate condition on GPU</span>
+    predicate_kernel<span class="op"><<<</span><span class="num">1</span>,<span class="num">1</span>< class="op">>>>(</span>d_cond, data<span class="op">)</span>
+
+    <span class="cm">// ⚠️ D2H copy = SYNC BOTTLENECK!</span>
+    <span class="fn">cudaMemcpy</span>(<span class="op">&amp;</span>h_cond, d_cond,
+               <span class="num">4</span>, DeviceToHost)
+
+    <span class="cm">// Host decides</span>
+    <span class="kw">if</span> h_cond:
+        expensive_kernel<span class="op"><<<...>>>(</span>data<span class="op">)</span>
+    <span class="kw">else</span>:
+        cheap_kernel<span class="op"><<<...>>>(</span>data<span class="op">)</span></div>
+      <p style="font-size:14px;color:var(--red);margin-top:10px;">5000 × D2H sync = massive stall</p>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--green);">Optimized: Device-Side Branching</h3>
+      <div class="code-block" style="font-size:13px;"><span class="cm">// Capture graph with device-side branch</span>
+<span class="fn">cudaStreamBeginCapture</span>(stream)
+predicate_kernel<span class="op"><<<</span><span class="num">1</span>,<span class="num">1</span>,<span class="num">0</span>,stream<span class="op">>>>(</span>
+    d_cond, data, threshold<span class="op">)</span>
+<span class="cm">// Single kernel reads condition & branches</span>
+conditional_dispatch_kernel<span class="op"><<<</span>grid,block,
+    <span class="num">0</span>,stream<span class="op">>>>(</span>d_cond, data, N,
+    <span class="num">1.01f</span>, <span class="num">0.99f</span><span class="op">)</span>
+<span class="fn">cudaStreamEndCapture</span>(stream, <span class="op">&amp;</span>graph)
+<span class="cm">// ✅ No D2H sync — GPU decides internally</span>
+<span class="kw">for</span> i <span class="kw">in</span> <span class="fn">range</span>(<span class="num">5000</span>):
+    <span class="fn">cudaGraphLaunch</span>(exec, stream)</div>
+      <p style="font-size:14px;color:var(--green);margin-top:10px;">Zero CPU↔GPU synchronization per iteration</p>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 6: Kernel Fusion ==================== -->
+<div class="slide" id="s6">
+  <h2>Kernel Fusion: Fewer Launches, Fewer Memory Round-Trips</h2>
+  <div class="cols cols-2">
+    <div>
+      <h3>The Memory Wall Problem</h3>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;gap:12px;">
+        <div class="flow-box red" style="width:100%;text-align:left;">Kernel A: read → compute → <strong>write back to DRAM</strong></div>
+        <div class="flow-box red" style="width:100%;text-align:left;">Kernel B: <strong>read from DRAM</strong> → compute → <strong>write back</strong></div>
+        <div class="flow-box red" style="width:100%;text-align:left;">Kernel C: <strong>read from DRAM</strong> → compute → write back</div>
+      </div>
+      <p style="margin:16px 0;font-size:16px;color:var(--red);">3 kernels = 3 memory round-trips (BW limited)</p>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;gap:12px;">
+        <div class="flow-box green" style="width:100%;text-align:left;">Fused: read → A → B → C → <strong>single write back</strong></div>
+      </div>
+      <p style="margin:16px 0;font-size:16px;color:var(--green);">1 kernel = 1 memory round-trip — 2.72× faster</p>
+    </div>
+    <div>
+      <h3>Benchmark: 16M Elements</h3>
+      <table>
+        <tr><th>Metric</th><th>Baseline</th><th>Optimized</th></tr>
+        <tr><td>Kernels per iter</td><td>3</td><td class="win">1</td></tr>
+        <tr><td>Memory round-trips</td><td>3</td><td class="win">1</td></tr>
+        <tr><td>Wall-clock</td><td>1.776 ms</td><td class="win">0.654 ms</td></tr>
+        <tr><td>Speedup</td><td>—</td><td class="win">2.72×</td></tr>
+      </table>
+      <div class="callout success" style="margin-top:16px;">
+        <strong>Key insight:</strong> Fusion removes intermediate DRAM traffic. When the workload is memory-bound, fewer round-trips = proportionally less time.
+      </div>
+      <div style="margin-top:16px;">
+        <span class="tag cuda">CUDA Extension</span>
+        <span class="tag python">PyTorch JIT</span>
+        <span class="tag perf">Memory-Bound</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 7: Work Queue ==================== -->
+<div class="slide" id="s7">
+  <h2>GPU-Resident Work Queues</h2>
+  <p style="margin-bottom:20px;">Static partitioning leaves threads idle when work is uneven. Dynamic queues let fast threads steal work.</p>
+  <div class="cols cols-2">
+    <div class="card">
+      <h3 style="color:var(--red);">Static Distribution (Baseline)</h3>
+      <div class="code-block" style="font-size:13px;"><span class="cm">// Each thread gets fixed indices</span>
+<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">static_work</span>(
+    <span class="kw">float</span>* in, <span class="kw">float</span>* out, <span class="kw">int</span> N) {
+  <span class="kw">int</span> idx <span class="op">=</span> blockIdx.x <span class="op">*</span> blockDim.x
+         <span class="op">+</span> threadIdx.x;
+  <span class="kw">if</span> (idx <span class="op"><</span> N) {
+    <span class="cm">// Fixed assignment — stragglers</span>
+    <span class="cm">// block if work is uneven</span>
+    out[idx] <span class="op">=</span> <span class="fn">process</span>(in[idx]);
+  }
+}</div>
+      <div style="margin-top:12px;padding:12px;background:#2a1515;border-radius:8px;">
+        <p style="font-size:14px;">CTA 0 ████████████░░ (done early, idle)<br>
+        CTA 1 ████████████████████ (straggler)<br>
+        CTA 2 ██████████░░░░░░ (idle)<br>
+        CTA 3 ██████████████░░ (idle)</p>
+      </div>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--green);">Dynamic Queue (Optimized)</h3>
+      <div class="code-block" style="font-size:13px;"><span class="cm">// Atomic fetch-next from global counter</span>
+<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">dynamic_work_queue</span>(
+    <span class="kw">float</span>* in, <span class="kw">float</span>* out,
+    <span class="kw">int</span> N, <span class="kw">int</span>* counter) {
+  <span class="kw">int</span> idx;
+  <span class="kw">while</span> ((idx <span class="op">=</span>
+    <span class="fn">atomicAdd</span>(counter, <span class="num">1</span>)) <span class="op"><</span> N) {
+    <span class="cm">// Fast threads grab more work</span>
+    out[idx] <span class="op">=</span> <span class="fn">process</span>(in[idx]);
+  }
+}</div>
+      <div style="margin-top:12px;padding:12px;background:#152a1a;border-radius:8px;">
+        <p style="font-size:14px;">CTA 0 ██████████████████ (grabs more)<br>
+        CTA 1 █████████████████ (balanced)<br>
+        CTA 2 ██████████████████ (balanced)<br>
+        CTA 3 ████████████████ (balanced)</p>
+      </div>
+    </div>
+  </div>
+  <div class="cols cols-3" style="margin-top:20px;">
+    <div class="card metric green"><div class="num">4.75×</div><div class="label">Speedup</div></div>
+    <div class="card metric blue"><div class="num">1M</div><div class="label">Elements</div></div>
+    <div class="card metric purple"><div class="num">Zero</div><div class="label">Idle CTAs</div></div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 8: Dynamic Parallelism ==================== -->
+<div class="slide" id="s8">
+  <h2>Dynamic Parallelism: Device-Side Launches</h2>
+  <p style="margin-bottom:20px;">GPU kernels can launch child kernels — useful when workload structure is data-dependent.</p>
+  <div class="cols cols-2">
+    <div>
+      <h3>Host-Side Dispatch</h3>
+      <div class="code-block" style="font-size:13px;"><span class="cm">// CPU decides what to launch</span>
+<span class="kw">void</span> <span class="fn">host_dispatch</span>(<span class="kw">float</span>* data, <span class="kw">int</span> N) {
+  <span class="fn">analyze</span><span class="op"><<<</span><span class="num">1</span>,<span class="num">1</span><span class="op">>>>(</span>data, <span class="op">&amp;</span>result<span class="op">)</span>;
+  <span class="fn">cudaMemcpy</span>(<span class="op">&amp;</span>h_result, result, <span class="op">...</span>);
+
+  <span class="kw">if</span> (h_result <span class="op">></span> threshold) {
+    <span class="fn">heavy_kernel</span><span class="op"><<<</span>grid,block<span class="op">>>>(</span>data<span class="op">)</span>;
+  } <span class="kw">else</span> {
+    <span class="fn">light_kernel</span><span class="op"><<<</span>grid,block<span class="op">>>>(</span>data<span class="op">)</span>;
+  }
+  <span class="cm">// ⚠️ CPU round-trip per decision</span>
+}</div>
+    </div>
+    <div>
+      <h3>Device-Side Launch (Dynamic Parallelism)</h3>
+      <div class="code-block" style="font-size:13px;"><span class="cm">// GPU decides and launches children</span>
+<span class="kw">__global__</span> <span class="kw">void</span> <span class="fn">parent_kernel</span>(
+    <span class="kw">float</span>* data, <span class="kw">int</span> N) {
+  <span class="kw">float</span> result <span class="op">=</span> <span class="fn">analyze</span>(data, N);
+
+  <span class="kw">if</span> (result <span class="op">></span> threshold) {
+    <span class="fn">heavy_kernel</span><span class="op"><<<</span>grid,block<span class="op">>>>(</span>data<span class="op">)</span>;
+  } <span class="kw">else</span> {
+    <span class="fn">light_kernel</span><span class="op"><<<</span>grid,block<span class="op">>>>(</span>data<span class="op">)</span>;
+  }
+  <span class="cm">// ✅ No CPU involvement</span>
+  cudaDeviceSynchronize<span class="op">()</span>;
+}</div>
+    </div>
+  </div>
+  <div class="callout warn" style="margin-top:20px;">
+    <strong>When to use:</strong> Dynamic parallelism shines when child-kernel count/shape depends on data. For fixed patterns, CUDA Graphs are faster (no device-side launch overhead). Requires SM 3.5+ and <code>-rdc=true</code>.
+  </div>
+</div>
+
+<!-- ==================== SLIDE 9: Uneven Partition ==================== -->
+<div class="slide" id="s9">
+  <h2>Uneven Workload Partitioning</h2>
+  <p style="margin-bottom:20px;">When work varies across data regions, static CTA assignments create stragglers. Runtime rebalancing fixes this.</p>
+  <div class="cols cols-2">
+    <div class="card">
+      <h3 style="color:var(--red);">Static Partition</h3>
+      <div class="code-block" style="font-size:13px;"><span class="cm">// Fixed tile assignment</span>
+<span class="kw">int</span> tile_id <span class="op">=</span> blockIdx.x;
+<span class="kw">int</span> start <span class="op">=</span> tile_id <span class="op">*</span> tile_size;
+<span class="kw">int</span> end   <span class="op">=</span> start <span class="op">+</span> tile_size;
+
+<span class="kw">for</span> (<span class="kw">int</span> i <span class="op">=</span> start; i <span class="op"><</span> end; i<span class="op">++</span>) {
+  <span class="fn">process</span>(data[i]);  <span class="cm">// variable cost</span>
+}
+<span class="cm">// Some CTAs finish early, some late</span></div>
+      <p style="font-size:14px;color:var(--red);margin-top:10px;">Performance = slowest CTA (straggler)</p>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--green);">Dynamic Rebalance</h3>
+      <div class="code-block" style="font-size:13px;"><span class="cm">// Atomic work-stealing counter</span>
+<span class="kw">__shared__</span> <span class="kw">int</span> next_tile;
+<span class="kw">if</span> (threadIdx.x <span class="op">==</span> <span class="num">0</span>)
+  next_tile <span class="op">=</span> <span class="fn">atomicAdd</span>(global, <span class="num">1</span>);
+<span class="fn">__syncthreads</span>();
+
+<span class="kw">while</span> (next_tile <span class="op"><</span> num_tiles) {
+  <span class="fn">process_tile</span>(data, next_tile);
+  <span class="kw">if</span> (threadIdx.x <span class="op">==</span> <span class="num">0</span>)
+    next_tile <span class="op">=</span> <span class="fn">atomicAdd</span>(global, <span class="num">1</span>);
+  <span class="fn">__syncthreads</span>();
+}
+<span class="cm">// ✅ Fast CTAs take more work</span></div>
+      <p style="font-size:14px;color:var(--green);margin-top:10px;">Performance ≈ average CTA (balanced)</p>
+    </div>
+  </div>
+  <div class="callout" style="margin-top:16px;">
+    <strong>Requires:</strong> <code>-rdc=true</code> (relocatable device code) for device-side atomics on global counters. Uses <code>helper_*.cu</code> host/device glue files.
+  </div>
+</div>
+
+<!-- ==================== SLIDE 10: NVFP4 MLP ==================== -->
+<div class="slide" id="s10">
+  <h2>Bonus: NVFP4 MLP Throughput</h2>
+  <p style="margin-bottom:20px;">Chapter 12 also includes an NVFP4 (4-bit floating point) MLP benchmark comparing BF16 vs NVFP4 precision.</p>
+  <div class="cols cols-2">
+    <div class="card">
+      <h3>Configuration</h3>
+      <table>
+        <tr><td>Batch Size</td><td><strong>512</strong></td></tr>
+        <tr><td>d_model</td><td><strong>8192</strong></td></tr>
+        <tr><td>d_ff</td><td><strong>32768</strong></td></tr>
+        <tr><td>Layers</td><td><strong>2</strong></td></tr>
+        <tr><td>Precision</td><td><strong>BF16 → NVFP4</strong></td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Why NVFP4?</h3>
+      <ul>
+        <li>4× memory reduction vs BF16</li>
+        <li>Higher throughput per SM</li>
+        <li>Group-wise quantization for accuracy</li>
+        <li>Blackwell (SM100) native support</li>
+        <li>Pairs with graph capture for max perf</li>
+      </ul>
+      <div style="margin-top:16px;">
+        <span class="tag cuda">SM100</span>
+        <span class="tag perf">4-bit</span>
+        <span class="tag python">PyTorch</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 11: Architecture ==================== -->
+<div class="slide" id="s11">
+  <h2>Code Architecture</h2>
+  <div class="cols cols-2">
+    <div>
+      <h3>Directory Layout</h3>
+      <div class="code-block" style="font-size:13px;line-height:1.8;">ch12/
+├── <span class="fn">baseline_cuda_graphs.py</span>         <span class="cm"># eager launch</span>
+├── <span class="fn">optimized_cuda_graphs.py</span>        <span class="cm"># graph replay</span>
+├── <span class="fn">baseline_cuda_graphs_conditional*</span> <span class="cm"># host dispatch</span>
+├── <span class="fn">optimized_cuda_graphs_conditional*</span> <span class="cm"># device branch</span>
+├── <span class="fn">baseline_kernel_fusion.py</span>       <span class="cm"># 3 round-trips</span>
+├── <span class="fn">optimized_kernel_fusion.py</span>      <span class="cm"># fused single</span>
+├── <span class="fn">baseline_work_queue.py</span>          <span class="cm"># static dist</span>
+├── <span class="fn">optimized_work_queue.py</span>         <span class="cm"># atomic queue</span>
+├── <span class="fn">baseline_dynamic_parallelism*</span>   <span class="cm"># host launch</span>
+├── <span class="fn">optimized_dynamic_parallelism*</span>  <span class="cm"># device launch</span>
+├── <span class="fn">baseline_uneven_partition*</span>      <span class="cm"># fixed tiles</span>
+├── <span class="fn">optimized_uneven_partition*</span>     <span class="cm"># work-stealing</span>
+├── <span class="fn">cuda_extensions/</span>                <span class="cm"># .cu kernels</span>
+├── <span class="fn">compare.py</span>                      <span class="cm"># harness entry</span>
+└── <span class="str">Makefile</span>                        <span class="cm"># auto-build</span></div>
+    </div>
+    <div>
+      <h3>Harness Integration</h3>
+      <div class="card" style="margin-bottom:16px;">
+        <h3 style="font-size:16px;">Benchmark Pattern</h3>
+        <ul>
+          <li><code>BaselineXxx</code> / <code>OptimizedXxx</code> pairs</li>
+          <li><code>VerificationPayloadMixin</code> for correctness</li>
+          <li><code>CudaBinaryBenchmark</code> for .cu binaries</li>
+          <li>NVTX ranges for profiler correlation</li>
+        </ul>
+      </div>
+      <div class="card" style="margin-bottom:16px;">
+        <h3 style="font-size:16px;">Run Commands</h3>
+        <div class="code-block" style="font-size:12px;"><span class="cm"># Quick compare</span>
+python -m ch12.compare
+
+<span class="cm"># Full harness</span>
+python -m cli.aisp bench run <span class="op">\</span>
+  --targets ch12 --profile minimal
+
+<span class="cm"># Deep profiling</span>
+python -m cli.aisp bench run <span class="op">\</span>
+  --targets ch12:cuda_graphs <span class="op">\</span>
+  --profile deep_dive</div>
+      </div>
+      <div class="card">
+        <h3 style="font-size:16px;">Build System</h3>
+        <ul>
+          <li>Auto-detects all <code>*.cu</code> files</li>
+          <li>Separates helper vs standalone</li>
+          <li><code>-rdc=true</code> for dynamic parallelism</li>
+          <li>Architecture targets: <code>sm_100</code>, <code>sm_103</code>, <code>sm_121</code></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 12: Key Takeaways ==================== -->
+<div class="slide" id="s12">
+  <h2>Key Takeaways</h2>
+  <div class="cols cols-2">
+    <div>
+      <div class="card" style="margin-bottom:16px;border-left:4px solid var(--green);">
+        <h3 style="color:var(--green);">When Graphs Help</h3>
+        <ul>
+          <li>Workload is <strong>stable enough</strong> to capture</li>
+          <li>Launch overhead &gt; compute time</li>
+          <li>Many small kernels in sequence</li>
+          <li>Repetitive steady-state patterns</li>
+        </ul>
+      </div>
+      <div class="card" style="margin-bottom:16px;border-left:4px solid var(--accent);">
+        <h3 style="color:var(--accent);">When Fusion Helps</h3>
+        <ul>
+          <li>Memory-bound pipelines</li>
+          <li>Multiple kernels touching same data</li>
+          <li>Intermediate results not needed</li>
+          <li>DRAM bandwidth is the bottleneck</li>
+        </ul>
+      </div>
+      <div class="card" style="border-left:4px solid var(--accent2);">
+        <h3 style="color:var(--accent2);">When Dynamic Dispatch Helps</h3>
+        <ul>
+          <li>Work depends on runtime data</li>
+          <li>Irregular batch sizes</li>
+          <li>Uneven per-element cost</li>
+          <li>Static partitioning → stragglers</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="background:linear-gradient(135deg,#1a2744,#0f172a);border:2px solid var(--accent);">
+        <h3>Decision Framework</h3>
+        <div class="code-block" style="font-size:13px;line-height:1.9;">
+<span class="cm">1.</span> Is workload <span class="str">stable/repetitive</span>?
+   → <span class="fn">CUDA Graphs</span> (4× speedup)
+
+<span class="cm">2.</span> Are kernels <span class="str">memory-bound</span>?
+   → <span class="fn">Kernel Fusion</span> (2.7× speedup)
+
+<span class="cm">3.</span> Is work <span class="str">data-dependent</span>?
+   → <span class="fn">Dynamic Parallelism</span>
+
+<span class="cm">4.</span> Are batches <span class="str">irregular/uneven</span>?
+   → <span class="fn">Work Queues</span> (4.75× speedup)
+
+<span class="cm">5.</span> None of the above?
+   → Eager launches may be fine.</div>
+      </div>
+      <div class="callout success" style="margin-top:16px;">
+        <strong>Bottom line:</strong> The chapter separates "graphs help" from "graphs help on a workload stable enough to benefit." The work-queue target keeps the chapter from being only about graph replay.
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 13: End ==================== -->
+<div class="slide title-slide" id="s13">
+  <div class="big-icon">🎯</div>
+  <h1>Chapter 12 Complete</h1>
+  <p class="subtitle">CUDA Graphs · Kernel Fusion · Work Queues · Dynamic Parallelism · Uneven Partitioning</p>
+  <div style="margin-top:30px;">
+    <p style="font-size:18px;color:var(--dim);">Profiling commands:</p>
+    <div class="code-block" style="text-align:left;max-width:700px;margin:16px auto;">
+python -m cli.aisp bench run --targets ch12 --profile minimal
+python -m cli.aisp bench run --targets ch12:cuda_graphs --profile deep_dive
+python -m cli.aisp bench run --targets ch12:kernel_fusion --profile deep_dive
+python -m cli.aisp bench run --targets ch12:work_queue --profile deep_dive</div>
+  </div>
+</div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  let current = 0;
+
+  function show(n) {
+    slides[current].classList.remove('active');
+    current = (n + slides.length) % slides.length;
+    slides[current].classList.add('active');
+    document.getElementById('counter').textContent = `${current+1} / ${slides.length}`;
+    document.getElementById('progress').style.width = `${((current+1)/slides.length)*100}%`;
+  }
+
+  function next() { show(current+1); }
+  function prev() { show(current-1); }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'Enter') { e.preventDefault(); next(); }
+    if (e.key === 'ArrowLeft' || e.key === 'Backspace') { e.preventDefault(); prev(); }
+    if (e.key === 'Home') { e.preventDefault(); show(0); }
+    if (e.key === 'End') { e.preventDefault(); show(slides.length-1); }
+  });
+
+  // Touch support
+  let touchStartX = 0;
+  document.addEventListener('touchstart', e => { touchStartX = e.touches[0].clientX; });
+  document.addEventListener('touchend', e => {
+    const diff = touchStartX - e.changedTouches[0].clientX;
+    if (Math.abs(diff) > 50) { diff > 0 ? next() : prev(); }
+  });
+
+  show(0);
+</script>
+</body>
+</html>

@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 2 - GPU Hardware Architecture</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            overflow: hidden;
+            height: 100vh;
+        }
+        
+        .slide-container {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 40px;
+            position: relative;
+        }
+        
+        .slide {
+            display: none;
+            width: 100%;
+            max-width: 1200px;
+            height: 100%;
+            max-height: 800px;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 60px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            overflow-y: auto;
+        }
+        
+        .slide.active {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        
+        .slide-number {
+            position: absolute;
+            bottom: 20px;
+            right: 30px;
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.5);
+        }
+        
+        .nav-controls {
+            position: fixed;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            z-index: 100;
+        }
+        
+        .nav-btn {
+            padding: 12px 24px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 14px;
+        }
+        
+        .nav-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            transform: translateY(-2px);
+        }
+        
+        .progress-bar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            transition: width 0.3s ease;
+            z-index: 100;
+        }
+        
+        h1 {
+            font-size: 3.5em;
+            margin-bottom: 20px;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+        }
+        
+        h2 {
+            font-size: 2.5em;
+            margin-bottom: 30px;
+            color: #00d2ff;
+            text-align: center;
+        }
+        
+        h3 {
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            color: #3a7bd5;
+        }
+        
+        p, li {
+            font-size: 1.2em;
+            line-height: 1.6;
+            margin-bottom: 15px;
+        }
+        
+        ul {
+            margin-left: 30px;
+            margin-bottom: 20px;
+        }
+        
+        li {
+            margin-bottom: 10px;
+        }
+        
+        .highlight {
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: bold;
+        }
+        
+        .code-block {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 1.1em;
+            overflow-x: auto;
+            border-left: 4px solid #00d2ff;
+        }
+        
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        
+        .comparison-table th,
+        .comparison-table td {
+            padding: 15px 20px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .comparison-table th {
+            background: rgba(0, 210, 255, 0.2);
+            color: #00d2ff;
+            font-weight: bold;
+        }
+        
+        .comparison-table tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .metric-card {
+            background: linear-gradient(135deg, rgba(0, 210, 255, 0.1), rgba(58, 123, 213, 0.1));
+            border-radius: 15px;
+            padding: 25px;
+            margin: 15px;
+            text-align: center;
+            border: 1px solid rgba(0, 210, 255, 0.3);
+            flex: 1;
+            min-width: 200px;
+        }
+        
+        .metric-value {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #00d2ff;
+            margin-bottom: 10px;
+        }
+        
+        .metric-label {
+            font-size: 1.1em;
+            color: rgba(255, 255, 255, 0.8);
+        }
+        
+        .metrics-container {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 20px;
+            margin: 30px 0;
+        }
+        
+        .feature-list {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin: 30px 0;
+        }
+        
+        .feature-item {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+            padding: 20px;
+            border-left: 4px solid #00d2ff;
+        }
+        
+        .feature-title {
+            font-size: 1.3em;
+            color: #00d2ff;
+            margin-bottom: 10px;
+        }
+        
+        .icon {
+            font-size: 2em;
+            margin-bottom: 15px;
+            display: block;
+        }
+        
+        .center-content {
+            text-align: center;
+        }
+        
+        .subtitle {
+            font-size: 1.5em;
+            color: rgba(255, 255, 255, 0.7);
+            margin-bottom: 30px;
+        }
+        
+        .two-column {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 40px;
+            margin: 30px 0;
+        }
+        
+        .column {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 15px;
+            padding: 30px;
+        }
+        
+        .column h3 {
+            color: #00d2ff;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        
+        .baseline {
+            border-left: 4px solid #ff6b6b;
+        }
+        
+        .optimized {
+            border-left: 4px solid #51cf66;
+        }
+        
+        .speedup-badge {
+            display: inline-block;
+            background: linear-gradient(90deg, #51cf66, #20c997);
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 1.2em;
+            margin: 10px 0;
+        }
+        
+        .warning {
+            background: rgba(255, 107, 107, 0.1);
+            border-left: 4px solid #ff6b6b;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 5px;
+        }
+        
+        .success {
+            background: rgba(81, 207, 102, 0.1);
+            border-left: 4px solid #51cf66;
+            padding: 15px;
+            margin: 20px 0;
+            border-radius: 5px;
+        }
+        
+        .keyboard-hint {
+            position: fixed;
+            bottom: 80px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.4);
+        }
+    </style>
+</head>
+<body>
+    <div class="progress-bar" id="progressBar"></div>
+    
+    <div class="slide-container">
+        <!-- Slide 1: Title -->
+        <div class="slide active" id="slide1">
+            <div class="center-content">
+                <span class="icon">⚡</span>
+                <h1>Chapter 2</h1>
+                <h2>GPU Hardware Architecture</h2>
+                <p class="subtitle">Know Your Machine: Architecture-Aware Performance Engineering</p>
+                <div class="metrics-container">
+                    <div class="metric-card">
+                        <div class="metric-value">23.14x</div>
+                        <div class="metric-label">Grace Coherent Memory</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value">5.20x</div>
+                        <div class="metric-label">Memory Transfer</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-value">5.17x</div>
+                        <div class="metric-label">cuBLAS GEMM</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 2: Problem Statement -->
+        <div class="slide" id="slide2">
+            <h2>🎯 The Problem</h2>
+            <p>Optimization decisions must be grounded in <span class="highlight">measured hardware behavior</span>, not marketing specs.</p>
+            
+            <div class="warning">
+                <strong>❌ Baseline Path:</strong>
+                <ul>
+                    <li>Generic transfer paths ignoring topology</li>
+                    <li>Untuned cuBLAS defaults</li>
+                    <li>Hardware assumptions based on specs</li>
+                </ul>
+            </div>
+            
+            <div class="success">
+                <strong>✅ Optimized Path:</strong>
+                <ul>
+                    <li>Topology-aware transfer and coherency choices</li>
+                    <li>Tuned cuBLAS invocation parameters</li>
+                    <li>System bring-up driven by measured bandwidth ceilings</li>
+                </ul>
+            </div>
+            
+            <p>This chapter is the <span class="highlight">hardware sanity anchor</span> for later claims.</p>
+        </div>
+        
+        <!-- Slide 3: Memory Transfer Comparison -->
+        <div class="slide" id="slide3">
+            <h2>💾 Memory Transfer: PCIe vs Pinned</h2>
+            
+            <div class="two-column">
+                <div class="column baseline">
+                    <h3>Baseline: Pageable Memory</h3>
+                    <div class="code-block">
+                        <code>self.host_data = torch.randn(<br>
+                        &nbsp;&nbsp;self.N, dtype=torch.float32,<br>
+                        &nbsp;&nbsp;pin_memory=False<br>
+                        )<br><br>
+                        # Synchronous copy<br>
+                        self.device_data.copy_(<br>
+                        &nbsp;&nbsp;self.host_data, non_blocking=False<br>
+                        )</code>
+                    </div>
+                    <p><strong>Result:</strong> 18.901 ms</p>
+                </div>
+                
+                <div class="column optimized">
+                    <h3>Optimized: Pinned Memory</h3>
+                    <div class="code-block">
+                        <code>self.host_data = torch.randn(<br>
+                        &nbsp;&nbsp;self.N, dtype=torch.float32,<br>
+                        &nbsp;&nbsp;pin_memory=True<br>
+                        )<br><br>
+                        # Asynchronous copy<br>
+                        self.device_data.copy_(<br>
+                        &nbsp;&nbsp;self.host_data, non_blocking=True<br>
+                        )</code>
+                    </div>
+                    <p><strong>Result:</strong> 3.637 ms</p>
+                    <span class="speedup-badge">5.20x Speedup</span>
+                </div>
+            </div>
+            
+            <p><strong>Why?</strong> Pinned memory enables DMA transfers without CPU staging, and async copy overlaps computation.</p>
+        </div>
+        
+        <!-- Slide 4: cuBLAS Optimization -->
+        <div class="slide" id="slide4">
+            <h2>🔢 cuBLAS: FP32 vs TF32</h2>
+            
+            <div class="two-column">
+                <div class="column baseline">
+                    <h3>Baseline: Pure FP32</h3>
+                    <div class="code-block">
+                        <code># Disable TF32<br>
+                        torch.backends.cuda<br>
+                        &nbsp;&nbsp;.matmul.allow_tf32 = False<br><br>
+                        # Standard FP32 matmul<br>
+                        C = torch.matmul(A, B)</code>
+                    </div>
+                    <p><strong>Result:</strong> 0.590 ms</p>
+                    <p>Precision: FP32 only</p>
+                </div>
+                
+                <div class="column optimized">
+                    <h3>Optimized: TF32 Enabled</h3>
+                    <div class="code-block">
+                        <code># Enable TF32 via backend policy<br>
+                        backend_policy="performance"<br><br>
+                        # cuBLAS routes through<br>
+                        # tensor cores (TF32)<br>
+                        C = torch.matmul(A, B)</code>
+                    </div>
+                    <p><strong>Result:</strong> 0.114 ms</p>
+                    <span class="speedup-badge">5.17x Speedup</span>
+                    <p>Precision: TF32 (tensor cores)</p>
+                </div>
+            </div>
+            
+            <p><strong>Key Insight:</strong> TF32 uses tensor cores with 10-bit mantissa, providing FP32 range with sufficient precision for most ML workloads.</p>
+        </div>
+        
+        <!-- Slide 5: Grace-Blackwell Coherency -->
+        <div class="slide" id="slide5">
+            <h2>🔗 Grace-Blackwell Coherent Memory</h2>
+            
+            <div class="center-content">
+                <span class="icon">🚀</span>
+                <h3>23.14x Speedup on GB200/GB300</h3>
+            </div>
+            
+            <div class="feature-list">
+                <div class="feature-item">
+                    <div class="feature-title">🎯 Zero-Copy Buffers</div>
+                    <p>Sub-MB transfers benefit from shared memory mappings without explicit copies.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">⚡ NVLink-C2C</div>
+                    <p>Direct coherent link between Grace CPU and Blackwell GPU eliminates PCIe bottlenecks.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">🔄 Cache Coherency</div>
+                    <p>Hardware-managed coherency ensures consistent views across CPU and GPU caches.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">⚠️ Platform Requirement</div>
+                    <p>Only available on Grace-Blackwell systems. PCIe-only hosts fail fast with SKIPPED diagnostic.</p>
+                </div>
+            </div>
+            
+            <div class="warning">
+                <strong>Important:</strong> On non-Grace hosts, the benchmark stops immediately with an explicit unsupported-capability diagnostic instead of emitting fallback numbers.
+            </div>
+        </div>
+        
+        <!-- Slide 6: Hardware Inspection Tools -->
+        <div class="slide" id="slide6">
+            <h2>🔍 Hardware Inspection Tools</h2>
+            
+            <div class="code-block">
+                <code># System capabilities detection<br>
+                python -m ch02.hardware_info<br><br>
+                # NVLink/C2C bandwidth measurement<br>
+                python -m ch02.nvlink_c2c_bandwidth_benchmark<br><br>
+                # Baseline vs optimized comparison<br>
+                python -m ch02.compare<br><br>
+                # Benchmark harness<br>
+                python -m cli.aisp bench run --targets ch02 --profile minimal</code>
+            </div>
+            
+            <div class="feature-list">
+                <div class="feature-item">
+                    <div class="feature-title">GPU Capabilities</div>
+                    <p>SM count, memory bandwidth, tensor cores, TMA support, NVLink-C2C</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">Topology Detection</div>
+                    <p>NUMA layout, NVLink/NVSwitch connectivity, affinity hints</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">Memory Hierarchy</div>
+                    <p>Registers → Shared Memory → L1 → L2 → HBM3e → CPU Memory</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">Profiling Integration</div>
+                    <p>Nsight Systems, Nsight Compute, PyTorch Profiler, HTA</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 7: Blackwell Features -->
+        <div class="slide" id="slide7">
+            <h2>🖥️ Blackwell B200/B300 Features</h2>
+            
+            <div class="metrics-container">
+                <div class="metric-card">
+                    <div class="metric-value">7.8 TB/s</div>
+                    <div class="metric-label">HBM3e Bandwidth</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">30 TB</div>
+                    <div class="metric-label">Unified Memory</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">5th Gen</div>
+                    <div class="metric-label">Tensor Cores</div>
+                </div>
+            </div>
+            
+            <div class="feature-list">
+                <div class="feature-item">
+                    <div class="feature-title">🚀 HBM3e Memory</div>
+                    <ul>
+                        <li>High-bandwidth memory (7.8 TB/s)</li>
+                        <li>Optimized memory access patterns</li>
+                        <li>Unified memory architecture</li>
+                    </ul>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">⚡ Tensor Memory Accelerator (TMA)</div>
+                    <ul>
+                        <li>Efficient data movement</li>
+                        <li>Reduced memory latency</li>
+                        <li>Optimized memory bandwidth</li>
+                    </ul>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">🔗 NVLink-C2C</div>
+                    <ul>
+                        <li>Direct GPU-to-GPU communication</li>
+                        <li>High-speed data transfer</li>
+                        <li>Reduced communication overhead</li>
+                    </ul>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">🎯 FP8/FP4 Precision</div>
+                    <ul>
+                        <li>5th Generation Tensor Cores</li>
+                        <li>Enhanced matrix operations</li>
+                        <li>ML-optimized precision</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 8: Performance Results -->
+        <div class="slide" id="slide8">
+            <h2>📊 Measured Performance Delta</h2>
+            
+            <table class="comparison-table">
+                <thead>
+                    <tr>
+                        <th>Target</th>
+                        <th>Baseline</th>
+                        <th>Optimized</th>
+                        <th>Speedup</th>
+                        <th>What Changed</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>grace_coherent_memory</td>
+                        <td>22468.299 ms</td>
+                        <td>970.890 ms</td>
+                        <td><span class="speedup-badge">23.14x</span></td>
+                        <td>Coherent-memory placement stops fighting the platform</td>
+                    </tr>
+                    <tr>
+                        <td>memory_transfer</td>
+                        <td>18.901 ms</td>
+                        <td>3.637 ms</td>
+                        <td><span class="speedup-badge">5.20x</span></td>
+                        <td>Optimized transfer path fits the actual link behavior</td>
+                    </tr>
+                    <tr>
+                        <td>cublas</td>
+                        <td>0.590 ms</td>
+                        <td>0.114 ms</td>
+                        <td><span class="speedup-badge">5.17x</span></td>
+                        <td>Tuned cuBLAS settings match the hardware better</td>
+                    </tr>
+                </tbody>
+            </table>
+            
+            <div class="success">
+                <strong>Key Insight:</strong> These numbers are the hardware sanity anchor. If they drift, everything that depends on them deserves scrutiny.
+            </div>
+            
+            <p><strong>Validation:</strong> Results from <code>artifacts/runs/20260303_163946__bench__profile_minimal_targets_20/</code></p>
+        </div>
+        
+        <!-- Slide 9: Learning Goals -->
+        <div class="slide" id="slide9">
+            <h2>🎯 Learning Goals</h2>
+            
+            <div class="feature-list">
+                <div class="feature-item">
+                    <div class="feature-title">1. Hardware Capabilities</div>
+                    <p>Query and log GPU, CPU, and fabric capabilities before running performance studies.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">2. Bandwidth Measurement</div>
+                    <p>Measure NVLink, PCIe, and memory-bandwidth ceilings using purpose-built microbenchmarks.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">3. Coherency Validation</div>
+                    <p>Validate Grace-Blackwell coherency paths to know when zero-copy buffers help or hurt.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">4. Architecture Tuning</div>
+                    <p>Contrast baseline vs optimized cuBLAS invocations to highlight architecture-specific tuning levers.</p>
+                </div>
+            </div>
+            
+            <div class="center-content" style="margin-top: 30px;">
+                <p><strong>Remember:</strong> This chapter ties optimization decisions to <span class="highlight">measured fabric, memory, and coherency behavior</span> on the actual target system.</p>
+            </div>
+        </div>
+        
+        <!-- Slide 10: Directory Layout -->
+        <div class="slide" id="slide10">
+            <h2>📁 Directory Layout</h2>
+            
+            <table class="comparison-table">
+                <thead>
+                    <tr>
+                        <th>Path</th>
+                        <th>Description</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>hardware_info.py</code></td>
+                        <td>System scanners for GPU capabilities, NUMA layout, NVLink/NVSwitch connectivity</td>
+                    </tr>
+                    <tr>
+                        <td><code>nvlink_c2c_bandwidth_benchmark.py</code></td>
+                        <td>Peer-to-peer and zero-copy experiments for NVLink, PCIe, coherent memory</td>
+                    </tr>
+                    <tr>
+                        <td><code>baseline_memory_transfer.py</code></td>
+                        <td>Traditional PCIe memory transfer (pageable memory)</td>
+                    </tr>
+                    <tr>
+                        <td><code>optimized_memory_transfer.py</code></td>
+                        <td>Pinned-host-memory H2D transfer with async copy</td>
+                    </tr>
+                    <tr>
+                        <td><code>baseline_cublas.py</code></td>
+                        <td>Naive FP32 matmul without TF32 tensor-core acceleration</td>
+                    </tr>
+                    <tr>
+                        <td><code>optimized_cublas.py</code></td>
+                        <td>Pure cuBLAS matmul with TF32 via backend policy</td>
+                    </tr>
+                    <tr>
+                        <td><code>cpu_gpu_grace_blackwell_coherency.cu</code></td>
+                        <td>Grace-Blackwell cache-coherent samples</td>
+                    </tr>
+                    <tr>
+                        <td><code>compare.py</code></td>
+                        <td>Harness driver for baseline/optimized comparisons</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- Slide 11: Validation Checklist -->
+        <div class="slide" id="slide11">
+            <h2>✅ Validation Checklist</h2>
+            
+            <div class="feature-list">
+                <div class="feature-item">
+                    <div class="feature-title">1. Hardware Info Validation</div>
+                    <div class="code-block">
+                        <code>python -m ch02.hardware_info</code>
+                    </div>
+                    <p>Records correct device name, SM count, and HBM size for every GPU.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">2. NVLink Bandwidth</div>
+                    <div class="code-block">
+                        <code>python -m ch02.nvlink_c2c_bandwidth_benchmark</code>
+                    </div>
+                    <p>Reports host↔device and bidirectional bandwidth table for active topology.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">3. Coherency Test</div>
+                    <div class="code-block">
+                        <code>python -m cli.aisp bench run<br>--targets ch02:grace_coherent_memory</code>
+                    </div>
+                    <p>On GB200/GB300: zero-copy benefits sub-MB transfers. On non-Grace: fails fast with SKIPPED.</p>
+                </div>
+                
+                <div class="feature-item">
+                    <div class="feature-title">4. Benchmark Comparison</div>
+                    <div class="code-block">
+                        <code>python -m ch02.compare</code>
+                    </div>
+                    <p>Runs all baseline/optimized pairs and reports measured deltas.</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 12: Summary -->
+        <div class="slide" id="slide12">
+            <div class="center-content">
+                <span class="icon">🎓</span>
+                <h2>Chapter 2 Summary</h2>
+                
+                <p style="font-size: 1.3em; margin-bottom: 30px;">
+                    <strong>"Know the Machine First"</strong>
+                </p>
+                
+                <div class="feature-list">
+                    <div class="feature-item">
+                        <div class="feature-title">🔍 Inspect</div>
+                        <p>Detect GPU capabilities, topology, and memory hierarchy before optimizing.</p>
+                    </div>
+                    
+                    <div class="feature-item">
+                        <div class="feature-title">📏 Measure</div>
+                        <p>Use microbenchmarks to quantify actual bandwidth and latency ceilings.</p>
+                    </div>
+                    
+                    <div class="feature-item">
+                        <div class="feature-title">⚡ Optimize</div>
+                        <p>Apply architecture-specific optimizations (pinned memory, TF32, coherency).</p>
+                    </div>
+                    
+                    <div class="feature-item">
+                        <div class="feature-title">✅ Validate</div>
+                        <p>Verify improvements with measured deltas, not assumptions.</p>
+                    </div>
+                </div>
+                
+                <div class="success" style="margin-top: 30px;">
+                    <strong>Next:</strong> Chapter 3 - Profiling and Tracing Tools
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="nav-controls">
+        <button class="nav-btn" onclick="prevSlide()">← Previous</button>
+        <button class="nav-btn" onclick="nextSlide()">Next →</button>
+    </div>
+    
+    <div class="keyboard-hint">
+        Use arrow keys ← → or click buttons to navigate
+    </div>
+    
+    <script>
+        let currentSlide = 1;
+        const totalSlides = 12;
+        
+        function showSlide(n) {
+            const slides = document.querySelectorAll('.slide');
+            slides.forEach(slide => slide.classList.remove('active'));
+            
+            currentSlide = n;
+            if (currentSlide > totalSlides) currentSlide = 1;
+            if (currentSlide < 1) currentSlide = totalSlides;
+            
+            document.getElementById(`slide${currentSlide}`).classList.add('active');
+            updateProgress();
+        }
+        
+        function nextSlide() {
+            showSlide(currentSlide + 1);
+        }
+        
+        function prevSlide() {
+            showSlide(currentSlide - 1);
+        }
+        
+        function updateProgress() {
+            const progress = (currentSlide / totalSlides) * 100;
+            document.getElementById('progressBar').style.width = `${progress}%`;
+        }
+        
+        // Keyboard navigation
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') {
+                e.preventDefault();
+                nextSlide();
+            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                prevSlide();
+            }
+        });
+        
+        // Touch navigation
+        let touchStartX = 0;
+        let touchEndX = 0;
+        
+        document.addEventListener('touchstart', function(e) {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+        
+        document.addEventListener('touchend', function(e) {
+            touchEndX = e.changedTouches[0].screenX;
+            handleSwipe();
+        });
+        
+        function handleSwipe() {
+            const swipeThreshold = 50;
+            const diff = touchStartX - touchEndX;
+            
+            if (Math.abs(diff) > swipeThreshold) {
+                if (diff > 0) {
+                    nextSlide();
+                } else {
+                    prevSlide();
+                }
+            }
+        }
+        
+        // Initialize
+        updateProgress();
+    </script>
+</body>
+</html>

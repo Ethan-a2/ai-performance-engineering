@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chapter 13 - PyTorch Profiling & Memory Tuning</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            overflow: hidden;
+            height: 100vh;
+        }
+        
+        .presentation {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        .slide {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            padding: 2rem;
+            opacity: 0;
+            transform: translateX(100%);
+            transition: all 0.6s ease-in-out;
+        }
+        
+        .slide.active {
+            opacity: 1;
+            transform: translateX(0);
+        }
+        
+        .slide-title {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        .slide-content {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            max-width: 1200px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        
+        h1 {
+            font-size: 3.5rem;
+            margin-bottom: 1rem;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+        
+        h2 {
+            font-size: 2.5rem;
+            margin-bottom: 1.5rem;
+            color: #64b5f6;
+        }
+        
+        h3 {
+            font-size: 1.8rem;
+            margin-bottom: 1rem;
+            color: #81c784;
+        }
+        
+        p, li {
+            font-size: 1.2rem;
+            line-height: 1.6;
+            margin-bottom: 1rem;
+        }
+        
+        ul {
+            margin-left: 2rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        li {
+            margin-bottom: 0.5rem;
+        }
+        
+        .highlight {
+            background: linear-gradient(90deg, #ff6b6b, #feca57);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: bold;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+            margin: 2rem 0;
+        }
+        
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 1.5rem;
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .card h3 {
+            color: #64b5f6;
+            margin-bottom: 1rem;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1.5rem 0;
+        }
+        
+        th, td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        th {
+            background: rgba(255, 255, 255, 0.1);
+            font-weight: bold;
+        }
+        
+        tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .code-block {
+            background: #2d2d2d;
+            padding: 1.5rem;
+            border-radius: 10px;
+            font-family: 'Courier New', monospace;
+            overflow-x: auto;
+            margin: 1rem 0;
+            border-left: 4px solid #64b5f6;
+        }
+        
+        .command {
+            background: #1e1e1e;
+            padding: 0.5rem 1rem;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            display: inline-block;
+            margin: 0.5rem 0;
+        }
+        
+        .controls {
+            position: fixed;
+            bottom: 2rem;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 1rem;
+            z-index: 1000;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            color: white;
+            padding: 1rem 2rem;
+            border-radius: 50px;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: bold;
+            transition: transform 0.3s ease;
+        }
+        
+        .btn:hover {
+            transform: scale(1.05);
+        }
+        
+        .progress {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            transition: width 0.3s ease;
+        }
+        
+        .slide-counter {
+            position: fixed;
+            top: 2rem;
+            right: 2rem;
+            font-size: 1.2rem;
+            opacity: 0.7;
+        }
+        
+        .emoji {
+            font-size: 2rem;
+            margin-right: 1rem;
+        }
+        
+        .two-column {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+        
+        .baseline {
+            border-left: 4px solid #ff6b6b;
+            padding-left: 1rem;
+        }
+        
+        .optimized {
+            border-left: 4px solid #81c784;
+            padding-left: 1rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="presentation">
+        <div class="progress" id="progress"></div>
+        <div class="slide-counter" id="slideCounter">1 / 10</div>
+        
+        <!-- Slide 1: Title -->
+        <div class="slide slide-title active" id="slide1">
+            <h1>Chapter 13</h1>
+            <h2>PyTorch Profiling & Memory Tuning</h2>
+            <p>High-level optimizations that actually improve workload performance</p>
+            <div style="margin-top: 2rem; font-size: 1.2rem; opacity: 0.8;">
+                AI Performance Engineering Book
+            </div>
+        </div>
+        
+        <!-- Slide 2: Overview -->
+        <div class="slide" id="slide2">
+            <div class="slide-content">
+                <h2><span class="emoji">📊</span>Chapter Overview</h2>
+                <p>Chapter 13 focuses on <span class="highlight">PyTorch-centric optimizations</span> that prove they do more than just rearrange framework overhead.</p>
+                
+                <div class="grid">
+                    <div class="card">
+                        <h3>Key Focus Areas</h3>
+                        <ul>
+                            <li>Compiled autograd</li>
+                            <li>Memory profiling</li>
+                            <li>FSDP/context/expert parallelism</li>
+                            <li>FP8/quantization workflows</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Core Question</h3>
+                        <p>"Which profiling, compilation, precision, and memory changes actually improve the workload under the shared harness?"</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 3: Problem Statement -->
+        <div class="slide" id="slide3">
+            <div class="slide-content">
+                <h2><span class="emoji">🎯</span>The Problem</h2>
+                <p>High-level PyTorch optimizations must prove they're doing more than just moving framework overhead around.</p>
+                
+                <div class="two-column">
+                    <div class="baseline">
+                        <h3>Baseline Path</h3>
+                        <ul>
+                            <li>Eager or less-optimized PyTorch execution</li>
+                            <li>Higher-overhead cache, precision, and dataloader paths</li>
+                            <li>Easier to debug, but often too expensive</li>
+                            <li>Memory and framework overhead dominate</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="optimized">
+                        <h3>Optimized Path</h3>
+                        <ul>
+                            <li>Compiled, quantized, or allocator-aware paths</li>
+                            <li>Lower-overhead cache and attention paths</li>
+                            <li>Same harness contract for comparable numbers</li>
+                            <li>Real measured benefits</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 4: Directory Structure -->
+        <div class="slide" id="slide4">
+            <div class="slide-content">
+                <h2><span class="emoji">📁</span>Directory Structure</h2>
+                <p>90 files organized by optimization category:</p>
+                
+                <div class="grid">
+                    <div class="card">
+                        <h3>Training & Autograd</h3>
+                        <ul>
+                            <li>baseline_training_standard.py</li>
+                            <li>optimized_training_standard.py</li>
+                            <li>compiled_autograd.py</li>
+                            <li>train.py, train_deepseek_*.py</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Memory & DataLoader</h3>
+                        <ul>
+                            <li>baseline_memory_profiling.py</li>
+                            <li>optimized_memory_profiling.py</li>
+                            <li>baseline_dataloader_default.py</li>
+                            <li>optimized_dataloader_default.py</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Attention & MatMul</h3>
+                        <ul>
+                            <li>baseline_attention_standard.py</li>
+                            <li>optimized_attention_standard.py</li>
+                            <li>baseline_long_context_attention.py</li>
+                            <li>baseline_arithmetic_intensity.py</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Precision & Quantization</h3>
+                        <ul>
+                            <li>baseline_precisionfp8*.py</li>
+                            <li>optimized_precisionfp8*.py</li>
+                            <li>baseline_quantization.py</li>
+                            <li>baseline_kv_cache_naive.py</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 5: Measured Results -->
+        <div class="slide" id="slide5">
+            <div class="slide-content">
+                <h2><span class="emoji">📈</span>Measured Results</h2>
+                <p>Representative validated results from real benchmark runs:</p>
+                
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Target</th>
+                            <th>Baseline</th>
+                            <th>Optimized</th>
+                            <th>Measured Delta</th>
+                            <th>What Changed</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>kv_cache_naive</td>
+                            <td>1664.672 ms / 1194.135 MB</td>
+                            <td>1739.080 ms / 370.394 MB</td>
+                            <td><span class="highlight">68.98% less memory</span></td>
+                            <td>Token-by-token paged allocation</td>
+                        </tr>
+                        <tr>
+                            <td>memory_profiling</td>
+                            <td>Allocator fragmentation baseline</td>
+                            <td>Gradient-checkpointed path</td>
+                            <td>Memory-goal benchmark</td>
+                            <td>Lower peak allocation</td>
+                        </tr>
+                        <tr>
+                            <td>autograd_standard</td>
+                            <td>1.644 ms</td>
+                            <td>0.204 ms</td>
+                            <td><span class="highlight">8.04x speedup</span></td>
+                            <td>Compiled/optimized autograd</td>
+                        </tr>
+                        <tr>
+                            <td>precisionfp8_te</td>
+                            <td>2.800 ms</td>
+                            <td>0.542 ms</td>
+                            <td><span class="highlight">5.17x speedup</span></td>
+                            <td>Transformer Engine FP8 path</td>
+                        </tr>
+                    </tbody>
+                </table>
+                
+                <p><em>Note: This chapter is one of the easiest places to fool yourself with framework overhead.</em></p>
+            </div>
+        </div>
+        
+        <!-- Slide 6: Optimization Categories -->
+        <div class="slide" id="slide6">
+            <div class="slide-content">
+                <h2><span class="emoji">🔧</span>Optimization Categories</h2>
+                
+                <div class="grid">
+                    <div class="card">
+                        <h3>1. Framework Overhead</h3>
+                        <p><strong>autograd_standard</strong>: Compiled autograd reduces Python overhead</p>
+                        <p><strong>training_standard</strong>: Eager vs compiled training paths</p>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>2. Memory Optimization</h3>
+                        <p><strong>kv_cache_naive</strong>: Paged cache allocation</p>
+                        <p><strong>memory_profiling</strong>: Gradient checkpointing</p>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>3. Precision Management</h3>
+                        <p><strong>precisionfp8_te</strong>: Transformer Engine FP8</p>
+                        <p><strong>quantization</strong>: Various quantization recipes</p>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>4. Parallelism</h3>
+                        <p><strong>context_parallel</strong>: Context-parallel attention</p>
+                        <p><strong>sequence_parallel</strong>: Sequence-parallel TP+SP</p>
+                        <p><strong>expert_parallel</strong>: Expert-parallel all-to-all</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 7: Profiler Evidence -->
+        <div class="slide" id="slide7">
+            <div class="slide-content">
+                <h2><span class="emoji">🔍</span>Profiler Evidence</h2>
+                <p>Deep-dive runs to understand optimization gains:</p>
+                
+                <div class="code-block">
+                    <pre>python -m cli.aisp bench run --targets ch13:kv_cache_naive --profile deep_dive --single-gpu
+python -m cli.aisp bench run --targets ch13:autograd_standard --profile deep_dive --single-gpu
+python -m cli.aisp bench run --targets ch13:precisionfp8_te --profile deep_dive --single-gpu</pre>
+                </div>
+                
+                <div class="grid">
+                    <div class="card">
+                        <h3>kv_cache_naive</h3>
+                        <p>Cache-path and memory behavior</p>
+                        <p>Memory reduction as primary win</p>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>autograd_standard</h3>
+                        <p>Framework/compile overhead</p>
+                        <p>Python overhead reduction</p>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>precisionfp8_te</h3>
+                        <p>Lower-precision execution</p>
+                        <p>Real library support (Transformer Engine)</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 8: Learning Goals -->
+        <div class="slide" id="slide8">
+            <div class="slide-content">
+                <h2><span class="emoji">🎓</span>Learning Goals</h2>
+                
+                <ul>
+                    <li><span class="highlight">Profile PyTorch training loops end-to-end</span>, capturing goodput, memory, and kernel traces.</li>
+                    <li><span class="highlight">Apply torch.compile, regional compilation, and custom allocators</span> to reduce overhead.</li>
+                    <li><span class="highlight">Tune DataLoader, KV-cache, and optimizer states</span> to eliminate fragmentation.</li>
+                    <li><span class="highlight">Exercise FP8/quantized training recipes</span> with Transformer Engine integration.</li>
+                </ul>
+                
+                <div class="grid" style="margin-top: 2rem;">
+                    <div class="card">
+                        <h3>Key Insight</h3>
+                        <p>The benchmark contract and side-by-side baseline/optimized structure matter here more than almost anywhere else.</p>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Validation</h3>
+                        <p>Use the shared harness infrastructure to ensure numbers stay comparable to lower-level chapters.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 9: Running Benchmarks -->
+        <div class="slide" id="slide9">
+            <div class="slide-content">
+                <h2><span class="emoji">🚀</span>Running Benchmarks</h2>
+                
+                <div class="code-block">
+                    <pre># Quick comparison
+python -m ch13.compare
+
+# List all targets
+python -m cli.aisp bench list-targets --chapter ch13
+
+# Run all benchmarks
+python -m cli.aisp bench run --targets ch13 --profile minimal
+
+# Specific target with deep profiling
+python -m cli.aisp bench run --targets ch13:precisionfp8_te --profile deep_dive --single-gpu</pre>
+                </div>
+                
+                <div class="grid">
+                    <div class="card">
+                        <h3>Configuration</h3>
+                        <ul>
+                            <li>Validity profile: strict (default)</li>
+                            <li>Virtualization: warning-only</li>
+                            <li>Use <code>--validity-profile portable</code> for hardware-limited environments</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Expectations</h3>
+                        <ul>
+                            <li>Baselines in <code>expectations_{hardware_key}.json</code></li>
+                            <li>Refresh with <code>--update-expectations</code></li>
+                            <li>Portable mode: <code>--allow-portable-expectations-update</code></li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Slide 10: Summary -->
+        <div class="slide" id="slide10">
+            <div class="slide-content">
+                <h2><span class="emoji">✨</span>Summary</h2>
+                
+                <div class="grid">
+                    <div class="card">
+                        <h3>Key Takeaways</h3>
+                        <ul>
+                            <li>PyTorch optimizations must prove real workload improvement</li>
+                            <li>Framework overhead can hide actual gains</li>
+                            <li>Memory optimization is as important as speed</li>
+                            <li>Precision management (FP8) offers significant speedups</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="card">
+                        <h3>Best Practices</h3>
+                        <ul>
+                            <li>Use the shared harness for comparable results</li>
+                            <li>Profile deep-dive runs to understand gains</li>
+                            <li>Validate with real benchmark contracts</li>
+                            <li>Consider both speed and memory metrics</li>
+                        </ul>
+                    </div>
+                </div>
+                
+                <div style="text-align: center; margin-top: 3rem;">
+                    <p style="font-size: 1.5rem; color: #64b5f6;">Chapter 13 provides the tools and techniques for effective PyTorch performance optimization.</p>
+                    <p style="margin-top: 1rem; opacity: 0.8;">Remember: The goal is measurable improvement, not just code rearrangement.</p>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Navigation Controls -->
+        <div class="controls">
+            <button class="btn" id="prevBtn" onclick="prevSlide()">← Previous</button>
+            <button class="btn" id="nextBtn" onclick="nextSlide()">Next →</button>
+        </div>
+    </div>
+
+    <script>
+        let currentSlide = 1;
+        const totalSlides = 10;
+        
+        function showSlide(n) {
+            // Hide all slides
+            document.querySelectorAll('.slide').forEach(slide => {
+                slide.classList.remove('active');
+            });
+            
+            // Show the target slide
+            const targetSlide = document.getElementById(`slide${n}`);
+            if (targetSlide) {
+                targetSlide.classList.add('active');
+            }
+            
+            // Update progress bar
+            const progress = document.getElementById('progress');
+            progress.style.width = `${(n / totalSlides) * 100}%`;
+            
+            // Update slide counter
+            document.getElementById('slideCounter').textContent = `${n} / ${totalSlides}`;
+            
+            // Update button states
+            document.getElementById('prevBtn').disabled = (n === 1);
+            document.getElementById('nextBtn').disabled = (n === totalSlides);
+        }
+        
+        function nextSlide() {
+            if (currentSlide < totalSlides) {
+                currentSlide++;
+                showSlide(currentSlide);
+            }
+        }
+        
+        function prevSlide() {
+            if (currentSlide > 1) {
+                currentSlide--;
+                showSlide(currentSlide);
+            }
+        }
+        
+        // Keyboard navigation
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'ArrowRight' || e.key === ' ') {
+                e.preventDefault();
+                nextSlide();
+            } else if (e.key === 'ArrowLeft') {
+                e.preventDefault();
+                prevSlide();
+            }
+        });
+        
+        // Touch navigation
+        let touchStartX = 0;
+        let touchEndX = 0;
+        
+        document.addEventListener('touchstart', function(e) {
+            touchStartX = e.changedTouches[0].screenX;
+        });
+        
+        document.addEventListener('touchend', function(e) {
+            touchEndX = e.changedTouches[0].screenX;
+            handleSwipe();
+        });
+        
+        function handleSwipe() {
+            const swipeThreshold = 50;
+            const diff = touchStartX - touchEndX;
+            
+            if (Math.abs(diff) > swipeThreshold) {
+                if (diff > 0) {
+                    // Swipe left - next slide
+                    nextSlide();
+                } else {
+                    // Swipe right - previous slide
+                    prevSlide();
+                }
+            }
+        }
+        
+        // Initialize first slide
+        showSlide(1);
+    </script>
+</body>
+</html>

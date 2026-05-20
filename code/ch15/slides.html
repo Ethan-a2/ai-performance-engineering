@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch15 - Disaggregated Inference & KV Management</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --card: #232733;
+    --accent: #6c8cff;
+    --accent2: #00d4aa;
+    --accent3: #ff6c8c;
+    --accent4: #ffc46c;
+    --text: #e2e4ea;
+    --dim: #8b8fa4;
+    --code-bg: #151821;
+    --border: #2d3144;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'SF Pro Display', -apple-system, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+    height: 100vh;
+  }
+  .slide {
+    display: none;
+    width: 100vw;
+    height: 100vh;
+    padding: 60px 80px;
+    position: relative;
+    overflow: hidden;
+  }
+  .slide.active { display: flex; flex-direction: column; }
+
+  /* Navigation */
+  .nav {
+    position: fixed; bottom: 30px; right: 40px; z-index: 100;
+    display: flex; gap: 12px; align-items: center;
+  }
+  .nav button {
+    background: var(--card); border: 1px solid var(--border); color: var(--text);
+    width: 44px; height: 44px; border-radius: 10px; cursor: pointer;
+    font-size: 18px; display: flex; align-items: center; justify-content: center;
+    transition: all .2s;
+  }
+  .nav button:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .page-num {
+    color: var(--dim); font-size: 14px; font-variant-numeric: tabular-nums;
+    min-width: 60px; text-align: center;
+  }
+
+  /* Progress bar */
+  .progress {
+    position: fixed; top: 0; left: 0; height: 3px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    transition: width .3s ease; z-index: 100;
+  }
+
+  /* Typography */
+  h1 {
+    font-size: 52px; font-weight: 700; line-height: 1.15;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 16px;
+  }
+  h2 {
+    font-size: 38px; font-weight: 700; margin-bottom: 24px;
+    color: var(--text);
+  }
+  h3 {
+    font-size: 24px; font-weight: 600; color: var(--accent); margin-bottom: 12px;
+  }
+  p, li { font-size: 20px; line-height: 1.7; color: var(--dim); }
+  .subtitle { font-size: 22px; color: var(--dim); margin-bottom: 40px; }
+
+  /* Layout helpers */
+  .center { justify-content: center; align-items: center; text-align: center; }
+  .top-left { justify-content: flex-start; }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 50px; flex: 1; align-items: start; }
+  .split-60-40 { display: grid; grid-template-columns: 3fr 2fr; gap: 50px; flex: 1; align-items: start; }
+  .split-40-60 { display: grid; grid-template-columns: 2fr 3fr; gap: 50px; flex: 1; align-items: start; }
+
+  /* Cards */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 24px 28px; margin-bottom: 16px;
+  }
+  .card-accent { border-left: 4px solid var(--accent); }
+  .card-green { border-left: 4px solid var(--accent2); }
+  .card-red { border-left: 4px solid var(--accent3); }
+  .card-yellow { border-left: 4px solid var(--accent4); }
+
+  /* Code blocks */
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px 24px; overflow-x: auto;
+    font-size: 15px; line-height: 1.6; font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    color: var(--text);
+  }
+  code {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 15px;
+  }
+  .kw { color: #c792ea; }
+  .fn { color: #82aaff; }
+  .str { color: #c3e88d; }
+  .cm { color: #546e7a; }
+  .num { color: #f78c6c; }
+  .tp { color: #ffcb6b; }
+  .op { color: #89ddff; }
+
+  /* Tables */
+  table {
+    width: 100%; border-collapse: collapse;
+    font-size: 17px; margin: 12px 0;
+  }
+  th {
+    background: var(--surface); color: var(--accent);
+    padding: 12px 16px; text-align: left; font-weight: 600;
+    border-bottom: 2px solid var(--border);
+  }
+  td {
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    color: var(--text);
+  }
+  tr:hover td { background: rgba(108,140,255,0.05); }
+
+  /* Tags */
+  .tag {
+    display: inline-block; padding: 4px 12px; border-radius: 6px;
+    font-size: 13px; font-weight: 600; margin-right: 8px;
+  }
+  .tag-blue { background: rgba(108,140,255,0.15); color: var(--accent); }
+  .tag-green { background: rgba(0,212,170,0.15); color: var(--accent2); }
+  .tag-red { background: rgba(255,108,140,0.15); color: var(--accent3); }
+  .tag-yellow { background: rgba(255,196,108,0.15); color: var(--accent4); }
+
+  /* Metric box */
+  .metric {
+    text-align: center; padding: 20px;
+  }
+  .metric .val {
+    font-size: 56px; font-weight: 800;
+    background: linear-gradient(135deg, var(--accent2), var(--accent));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .metric .label { font-size: 15px; color: var(--dim); margin-top: 4px; }
+
+  /* Flow diagram via CSS */
+  .flow {
+    display: flex; align-items: center; gap: 0; margin: 20px 0;
+    flex-wrap: wrap; justify-content: center;
+  }
+  .flow-box {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 22px; font-size: 16px;
+    font-weight: 600; color: var(--text); text-align: center;
+    min-width: 140px;
+  }
+  .flow-arrow {
+    font-size: 28px; color: var(--accent); padding: 0 8px;
+  }
+
+  /* Icon bullets */
+  .icon-list { list-style: none; padding: 0; }
+  .icon-list li {
+    padding: 8px 0; font-size: 19px; display: flex; align-items: flex-start; gap: 12px;
+  }
+  .icon-list .icon {
+    width: 28px; height: 28px; border-radius: 7px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px; margin-top: 2px;
+  }
+
+  /* Animations */
+  @keyframes fadeInUp {
+    from { opacity:0; transform:translateY(30px); }
+    to { opacity:1; transform:translateY(0); }
+  }
+  .slide.active > * {
+    animation: fadeInUp .5s ease forwards;
+  }
+  .slide.active > *:nth-child(2) { animation-delay: .08s; }
+  .slide.active > *:nth-child(3) { animation-delay: .16s; }
+  .slide.active > *:nth-child(4) { animation-delay: .24s; }
+
+  /* Responsive */
+  @media (max-width: 1024px) {
+    .slide { padding: 30px 40px; }
+    h1 { font-size: 36px; }
+    h2 { font-size: 28px; }
+    .split, .split-60-40, .split-40-60 { grid-template-columns: 1fr; gap: 20px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+
+<!-- ==================== SLIDE 1: Title ==================== -->
+<div class="slide active center" id="s1">
+  <div>
+    <div style="font-size:18px; color:var(--accent); letter-spacing:4px; margin-bottom:20px;">
+      CHAPTER 15
+    </div>
+    <h1>Disaggregated Inference<br>& KV Management</h1>
+    <p class="subtitle">Large-Scale Serving: Prefill/Decode 分离、KV 缓存池化、<br>连续批处理、投机解码与混合专家推理</p>
+    <div style="margin-top:30px;">
+      <span class="tag tag-blue">Disaggregation</span>
+      <span class="tag tag-green">KV Cache Pool</span>
+      <span class="tag tag-yellow">Continuous Batching</span>
+      <span class="tag tag-red">Speculative Decoding</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 2: Problem ==================== -->
+<div class="slide" id="s2">
+  <h2>The Core Problem</h2>
+  <p class="subtitle">推理系统级优化的关键问题：什么编排变化真正降低了延迟、提高了吞吐？</p>
+  <div class="split">
+    <div>
+      <div class="card card-red">
+        <h3>Monolithic Inference</h3>
+        <ul class="icon-list">
+          <li><span class="icon" style="background:rgba(255,108,140,0.15);">&#x2717;</span> Prefill 和 Decode 互相阻塞</li>
+          <li><span class="icon" style="background:rgba(255,108,140,0.15);">&#x2717;</span> KV 缓存管理简单但昂贵</li>
+          <li><span class="icon" style="background:rgba(255,108,140,0.15);">&#x2717;</span> 队列排空策略效率低</li>
+          <li><span class="icon" style="background:rgba(255,108,140,0.15);">&#x2717;</span> 单机推理吞吐受限</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="card card-green">
+        <h3>Disaggregated Inference</h3>
+        <ul class="icon-list">
+          <li><span class="icon" style="background:rgba(0,212,170,0.15);">&#x2713;</span> Prefill/Decode 分离到不同池</li>
+          <li><span class="icon" style="background:rgba(0,212,170,0.15);">&#x2713;</span> NVLink 池化 KV 缓存</li>
+          <li><span class="icon" style="background:rgba(0,212,170,0.15);">&#x2713;</span> 连续批处理调度</li>
+          <li><span class="icon" style="background:rgba(0,212,170,0.15);">&#x2713;</span> 投机解码加速生成</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="card card-accent" style="margin-top:20px;">
+    <p style="color:var(--text); font-size:18px;">
+      <strong>关键问题：</strong>KV 移动和调度开销被包含在内时，哪些编排变化能真正降低延迟或提高吞吐？
+    </p>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 3: Architecture Overview ==================== -->
+<div class="slide" id="s3">
+  <h2>Architecture Overview</h2>
+  <p class="subtitle">Chapter 15 覆盖的六大优化领域</p>
+  <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:18px; flex:1;">
+    <div class="card card-accent">
+      <h3>1. Prefill/Decode 分离</h3>
+      <p>将计算密集的 prefill 和访存密集的 decode 分配到不同 GPU 池，避免互相阻塞</p>
+      <div style="margin-top:10px;">
+        <span class="tag tag-blue">disagg_inference</span>
+      </div>
+    </div>
+    <div class="card card-green">
+      <h3>2. KV Cache 管理</h3>
+      <p>本地 HBM 溢出到主机 vs NVLink 对等池化，6.11x 加速</p>
+      <div style="margin-top:10px;">
+        <span class="tag tag-green">kv_nvlink_pool</span>
+      </div>
+    </div>
+    <div class="card card-yellow">
+      <h3>3. 连续批处理</h3>
+      <p>动态批处理调度，TTFT 感知的队列管理，4.16x 加速</p>
+      <div style="margin-top:10px;">
+        <span class="tag tag-yellow">batching</span>
+      </div>
+    </div>
+    <div class="card card-accent">
+      <h3>4. 投机解码</h3>
+      <p>Draft model 快速猜测 + Target model 并行验证，3.86x 加速</p>
+      <div style="margin-top:10px;">
+        <span class="tag tag-blue">speculative</span>
+      </div>
+    </div>
+    <div class="card card-green">
+      <h3>5. 引导解码</h3>
+      <p>GPU 端 mask 复用 vs CPU 每步重建，5.96x 加速</p>
+      <div style="margin-top:10px;">
+        <span class="tag tag-green">guided</span>
+      </div>
+    </div>
+    <div class="card card-red">
+      <h3>6. MoE 推理优化</h3>
+      <p>Expert 并行通信重叠、拓扑感知路由、Wide EP all-to-all</p>
+      <div style="margin-top:10px;">
+        <span class="tag tag-red">moe</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 4: Monolithic vs Disaggregated ==================== -->
+<div class="slide" id="s4">
+  <h2>Monolithic vs Disaggregated Inference</h2>
+  <div class="split-60-40">
+    <div>
+      <h3>Baseline: 单体推理</h3>
+      <pre><span class="kw">class</span> <span class="tp">BaselineInferenceMonolithicBenchmark</span>:
+    <span class="cm">"""单一服务同时处理 prefill 和 decode"""</span>
+    
+    <span class="kw">def</span> <span class="fn">benchmark_fn</span>(self):
+        <span class="cm"># Prefill: 处理整个 prompt (compute-bound)</span>
+        logits, kv_cache = self.<span class="fn">model</span>(self.prompt)
+        next_token = logits[:, -<span class="num">1</span>].<span class="fn">argmax</span>(dim=-<span class="num">1</span>)
+        
+        <span class="cm"># Decode: 逐 token 生成 (memory-bound)</span>
+        <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(self.num_tokens):
+            logits, kv_cache = self.<span class="fn">model</span>(
+                next_token.unsqueeze(<span class="num">0</span>), kv_cache
+            )
+            next_token = logits[:, -<span class="num">1</span>].<span class="fn">argmax</span>(dim=-<span class="num">1</span>)</pre>
+      <div class="card card-red" style="margin-top:16px;">
+        <p><strong>问题：</strong>Prefill (compute-bound) 和 Decode (memory-bound) 共享同一 GPU，互相阻塞，资源利用率低</p>
+      </div>
+    </div>
+    <div>
+      <h3>Optimized: 分离推理</h3>
+      <div class="card card-green">
+        <h3>Prefill Pool</h3>
+        <p>高算力 GPU 组<br>处理 prompt 编码<br>生成 KV cache</p>
+      </div>
+      <div style="text-align:center; font-size:32px; color:var(--accent); padding:8px;">&#x2193; KV Transfer &#x2193;</div>
+      <div class="card card-accent">
+        <h3>Decode Pool</h3>
+        <p>高带宽 GPU 组<br>逐 token 解码<br>读取 KV cache</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 5: KV Cache Management ==================== -->
+<div class="slide" id="s5">
+  <h2>KV Cache 管理策略</h2>
+  <p class="subtitle">从本地溢出到 NVLink 池化：6.11x 加速</p>
+  <div class="split">
+    <div>
+      <h3>Baseline: 本地 HBM + 主机溢出</h3>
+      <pre><span class="kw">class</span> <span class="tp">BaselineKVCacheLocalOnlyBenchmark</span>:
+    <span class="cm">"""本地缓存满了就溢出到主机内存"""</span>
+    
+    local_cache_limit = <span class="num">32</span>  <span class="cm"># tokens</span>
+    
+    <span class="kw">def</span> <span class="fn">benchmark_fn</span>(self):
+        <span class="kw">for</span> step <span class="kw">in</span> <span class="fn">range</span>(self.seq_len):
+            <span class="kw">if</span> len(cache) >= self.local_cache_limit:
+                <span class="cm"># 溢出到 CPU — 慢!</span>
+                evicted = cache.<span class="fn">to</span>(<span class="str">'cpu'</span>)
+                host_cache.append(evicted)
+            
+            attn_out = self.<span class="fn">model</span>(q, k, v)
+            cache = <span class="fn">torch.cat</span>([cache, new_kv])</pre>
+      <div class="card card-red" style="margin-top:12px;">
+        <p><strong>1047.86 ms</strong> — PCIe 传输瓶颈，GPU 空闲等待</p>
+      </div>
+    </div>
+    <div>
+      <h3>Optimized: NVLink 对等池化</h3>
+      <pre><span class="kw">class</span> <span class="tp">OptimizedKVCacheNVLinkPoolBenchmark</span>:
+    <span class="cm">"""跨 GPU NVLink 直接访问对等 KV 缓存"""</span>
+    
+    peer_cache_limit = <span class="num">64</span>  <span class="cm"># tokens per peer</span>
+    
+    <span class="kw">def</span> <span class="fn">benchmark_fn</span>(self):
+        <span class="kw">for</span> step <span class="kw">in</span> <span class="fn">range</span>(self.seq_len):
+            <span class="kw">if</span> len(local_cache) >= limit:
+                <span class="cm"># NVLink P2P — 快!</span>
+                peer_gpu = self.<span class="fn">select_peer</span>()
+                evicted = cache.<span class="fn">to</span>(peer_gpu)
+            
+            attn_out = self.<span class="fn">model</span>(q, k, v)
+            <span class="cm"># 从对等 GPU 直接读取</span>
+            remote_kv = peer_cache.<span class="fn">to</span>(device)</pre>
+      <div class="card card-green" style="margin-top:12px;">
+        <p><strong>171.48 ms</strong> — NVLink P2P 直接访问，GPU 利用率高</p>
+      </div>
+    </div>
+  </div>
+  <div class="metric" style="margin-top:10px;">
+    <div class="val">6.11x</div>
+    <div class="label">KV Cache NVLink Pool 加速比</div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 6: Continuous Batching ==================== -->
+<div class="slide" id="s6">
+  <h2>连续批处理 (Continuous Batching)</h2>
+  <p class="subtitle">动态调度 vs 静态批处理：4.16x 加速</p>
+  <div class="split">
+    <div>
+      <h3>Baseline: 静态批处理</h3>
+      <pre><span class="kw">class</span> <span class="tp">BaselineContinuousBatchingBenchmark</span>:
+    <span class="cm">"""固定批次成员，padding 浪费"""</span>
+    
+    <span class="kw">def</span> <span class="fn">__init__</span>(self):
+        <span class="cm"># static=True: 批次内所有请求</span>
+        <span class="cm"># 必须同时完成</span>
+        super().__init__(
+            dynamic=<span class="num">False</span>,
+            multi_gpu=<span class="num">False</span>,
+        )</pre>
+      <div class="card card-red" style="margin-top:20px;">
+        <h3>问题</h3>
+        <ul style="font-size:16px;">
+          <li>短请求等待最长请求完成</li>
+          <li>Padding 浪费算力</li>
+          <li>GPU 利用率低</li>
+        </ul>
+        <p style="margin-top:8px;"><strong>52.96 ms</strong></p>
+      </div>
+    </div>
+    <div>
+      <h3>Optimized: 动态连续批处理</h3>
+      <pre><span class="kw">class</span> <span class="tp">OptimizedContinuousBatchingBenchmark</span>:
+    <span class="cm">"""请求完成即释放，新请求立即加入"""</span>
+    
+    <span class="kw">def</span> <span class="fn">__init__</span>(self):
+        <span class="cm"># dynamic=True: 流式调度</span>
+        <span class="cm"># TTFT 感知优先级</span>
+        super().__init__(
+            dynamic=<span class="num">True</span>,
+            multi_gpu=<span class="num">False</span>,
+        )</pre>
+      <div class="card card-green" style="margin-top:20px;">
+        <h3>优势</h3>
+        <ul style="font-size:16px;">
+          <li>请求完成即出队</li>
+          <li>新请求零等待加入</li>
+          <li>GPU 持续满载</li>
+        </ul>
+        <p style="margin-top:8px;"><strong>12.72 ms</strong></p>
+      </div>
+    </div>
+  </div>
+  <div class="metric">
+    <div class="val">4.16x</div>
+    <div class="label">Continuous Batching 加速比</div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 7: Speculative Decoding ==================== -->
+<div class="slide" id="s7">
+  <h2>投机解码 (Speculative Decoding)</h2>
+  <p class="subtitle">Draft-then-Verify 策略：3.86x 加速</p>
+  <div class="flow">
+    <div class="flow-box" style="border-color:var(--accent4);">Draft Model<br><small style="color:var(--dim);">快速猜测 N 个 token</small></div>
+    <div class="flow-arrow">&#x2192;</div>
+    <div class="flow-box" style="border-color:var(--accent);">Target Model<br><small style="color:var(--dim);">并行验证 N 个 token</small></div>
+    <div class="flow-arrow">&#x2192;</div>
+    <div class="flow-box" style="border-color:var(--accent2);">Accept/Reject<br><small style="color:var(--dim);">接受匹配的 token</small></div>
+    <div class="flow-arrow">&#x2192;</div>
+    <div class="flow-box" style="border-color:var(--accent3);">Output<br><small style="color:var(--dim);">多步一次生成</small></div>
+  </div>
+  <div class="split" style="margin-top:20px;">
+    <div>
+      <pre><span class="cm"># Baseline: 纯 target model 贪心解码</span>
+bench = <span class="tp">SpeculativeDecodingBenchmark</span>(
+    use_speculative=<span class="num">False</span>,
+    label=<span class="str">"baseline_speculative_decoding"</span>,
+)</pre>
+      <div class="card card-red" style="margin-top:12px;">
+        <p><strong>103.32 ms</strong> — 每步只生成 1 个 token</p>
+      </div>
+    </div>
+    <div>
+      <pre><span class="cm"># Optimized: Draft + Target 投机验证</span>
+bench = <span class="tp">SpeculativeDecodingBenchmark</span>(
+    use_speculative=<span class="num">True</span>,
+    label=<span class="str">"optimized_speculative_decoding"</span>,
+)</pre>
+      <div class="card card-green" style="margin-top:12px;">
+        <p><strong>26.76 ms</strong> — 每步可接受多个 token</p>
+      </div>
+    </div>
+  </div>
+  <div class="metric">
+    <div class="val">3.86x</div>
+    <div class="label">Speculative Decoding 加速比</div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 8: Guided Decoding ==================== -->
+<div class="slide" id="s8">
+  <h2>引导解码 (Guided Decoding)</h2>
+  <p class="subtitle">GPU 端 mask 复用 vs CPU 每步重建：5.96x 加速</p>
+  <div class="split">
+    <div>
+      <h3>Baseline: CPU Mask 重建</h3>
+      <pre><span class="cm"># 每个 decode step 在 CPU 上重建 mask</span>
+bench = <span class="tp">GuidedDecodingBenchmark</span>(
+    reuse_gpu_mask=<span class="num">False</span>,
+    label=<span class="str">"baseline_guided_decoding"</span>,
+)</pre>
+      <div class="card card-red" style="margin-top:16px;">
+        <ul style="font-size:16px;">
+          <li>每个 token: CPU 构建 grammar mask</li>
+          <li>CPU &#x2192; GPU 传输 mask</li>
+          <li>GPU 空闲等待</li>
+        </ul>
+        <p style="margin-top:8px;"><strong>12.70 ms</strong></p>
+      </div>
+    </div>
+    <div>
+      <h3>Optimized: GPU Mask 复用</h3>
+      <pre><span class="cm"># GPU 端缓存并复用 mask</span>
+bench = <span class="tp">GuidedDecodingBenchmark</span>(
+    reuse_gpu_mask=<span class="num">True</span>,
+    label=<span class="str">"optimized_guided_decoding"</span>,
+)</pre>
+      <div class="card card-green" style="margin-top:16px;">
+        <ul style="font-size:16px;">
+          <li>Mask 构建在 GPU 端完成</li>
+          <li>增量更新，避免重复传输</li>
+          <li>GPU 持续计算</li>
+        </ul>
+        <p style="margin-top:8px;"><strong>2.13 ms</strong></p>
+      </div>
+    </div>
+  </div>
+  <div class="metric">
+    <div class="val">5.96x</div>
+    <div class="label">Guided Decoding 加速比</div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 9: MoE Inference ==================== -->
+<div class="slide" id="s9">
+  <h2>Mixture of Experts (MoE) 推理</h2>
+  <p class="subtitle">稀疏激活 + Expert 并行通信优化</p>
+  <div class="split">
+    <div>
+      <div class="card card-accent">
+        <h3>MoE 核心思想</h3>
+        <ul class="icon-list">
+          <li>
+            <span class="icon" style="background:rgba(108,140,255,0.15);">R</span>
+            <span><strong>Router</strong>: 选择 top-k experts</span>
+          </li>
+          <li>
+            <span class="icon" style="background:rgba(0,212,170,0.15);">E</span>
+            <span><strong>Experts</strong>: 稀疏激活子网络</span>
+          </li>
+          <li>
+            <span class="icon" style="background:rgba(255,196,108,0.15);">C</span>
+            <span><strong>Communication</strong>: all-to-all 分发</span>
+          </li>
+        </ul>
+      </div>
+      <div class="card card-yellow">
+        <h3>Chapter 15 MoE 基准测试</h3>
+        <table>
+          <tr><th>Benchmark</th><th>优化点</th></tr>
+          <tr><td>moe_inference</td><td>Router + Comm 控制</td></tr>
+          <tr><td>moe_overlap</td><td>Shared/Routed 重叠</td></tr>
+          <tr><td>moe_dispatch</td><td>Dispatch 路径优化</td></tr>
+          <tr><td>moe_routing</td><td>拓扑感知路由</td></tr>
+          <tr><td>wide_ep</td><td>Wide EP all-to-all</td></tr>
+        </table>
+      </div>
+    </div>
+    <div>
+      <h3>MoE Overlap 优化</h3>
+      <pre><span class="cm"># Baseline: 串行执行</span>
+shared_out = <span class="fn">shared_expert</span>(x)      <span class="cm"># 先算 shared</span>
+routed_out = <span class="fn">routed_expert</span>(x)      <span class="cm"># 再算 routed</span>
+result = shared_out + routed_out
+
+<span class="cm"># Optimized: 流水线重叠</span>
+<span class="cm"># Stream 1: shared expert compute</span>
+<span class="cm"># Stream 2: all-to-all communication</span>
+<span class="cm"># 同时执行，隐藏通信延迟</span></pre>
+      <div class="card card-green" style="margin-top:16px;">
+        <h3>Wide Expert Parallelism</h3>
+        <pre><span class="cm"># 64-rank all-to-all</span>
+world_size = <span class="num">64</span>
+num_experts = world_size  <span class="cm"># 每 rank 1 expert</span>
+
+<span class="cm"># Baseline: Python loop + boolean mask</span>
+<span class="kw">for</span> rank <span class="kw">in</span> <span class="fn">range</span>(world_size):
+    mask = (dest == rank)
+    packed[mask] = tokens[mask]
+
+<span class="cm"># Optimized: sort + scatter (GPU native)</span>
+sorted_idx = dest.<span class="fn">argsort</span>()
+packed = tokens[sorted_idx]</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 10: Prefill/Decode Disaggregation ==================== -->
+<div class="slide" id="s10">
+  <h2>Prefill/Decode 分离架构</h2>
+  <p class="subtitle">从单 GPU 到多 GPU 的分离推理流水线</p>
+  <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:16px; margin-bottom:20px;">
+    <div class="card card-accent" style="text-align:center;">
+      <h3 style="font-size:16px;">Single GPU</h3>
+      <p style="font-size:14px;">prefill_decode_disagg</p>
+      <div style="color:var(--accent); font-size:24px; margin-top:8px;">&#x2193;</div>
+    </div>
+    <div class="card card-green" style="text-align:center;">
+      <h3 style="font-size:16px;">Multi GPU</h3>
+      <p style="font-size:14px;">prefill_decode_disagg_multigpu</p>
+      <div style="color:var(--accent2); font-size:24px; margin-top:8px;">&#x2193;</div>
+    </div>
+    <div class="card card-yellow" style="text-align:center;">
+      <h3 style="font-size:16px;">KV Handoff</h3>
+      <p style="font-size:14px;">single_gpu_kv_handoff</p>
+      <div style="color:var(--accent4); font-size:24px; margin-top:8px;">&#x2193;</div>
+    </div>
+    <div class="card card-red" style="text-align:center;">
+      <h3 style="font-size:16px;">Full Disagg</h3>
+      <p style="font-size:14px;">disaggregated_inference</p>
+      <div style="color:var(--accent3); font-size:24px; margin-top:8px;">&#x2713;</div>
+    </div>
+  </div>
+  <div class="split">
+    <div>
+      <pre><span class="cm"># Host-staged prefill/decode 分离</span>
+<span class="kw">class</span> <span class="tp">HostStagedPrefillDecodeDisaggBenchmark</span>:
+    <span class="kw">def</span> <span class="fn">benchmark_fn</span>(self):
+        <span class="cm"># Phase 1: Prefill (compute-bound)</span>
+        prefill_out = self.<span class="fn">prefill_model</span>(prompt)
+        kv_cache = prefill_out.kv_cache
+        
+        <span class="cm"># KV transfer: prefill GPU → decode GPU</span>
+        kv_on_decode = kv_cache.<span class="fn">to</span>(decode_device)
+        
+        <span class="cm"># Phase 2: Decode (memory-bound)</span>
+        <span class="kw">for</span> _ <span class="kw">in</span> <span class="fn">range</span>(num_tokens):
+            tok = self.<span class="fn">decode_model</span>(tok, kv_on_decode)</pre>
+    </div>
+    <div>
+      <div class="card card-accent">
+        <h3>多 GPU 分离要点</h3>
+        <ul style="font-size:16px;">
+          <li>Prefill 和 Decode 可在不同 GPU 上</li>
+          <li>KV Cache 通过 NVLink/PCIe 传输</li>
+          <li>可叠加投机解码进一步加速</li>
+          <li>支持 <code>--simulate-network</code> 模拟模式</li>
+        </ul>
+      </div>
+      <div class="card card-green" style="margin-top:16px;">
+        <h3>运行方式</h3>
+        <pre style="font-size:14px;">torchrun --nproc_per_node 4 \
+  ch15/disaggregated_inference_multigpu.py</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 11: NVFP4 MLP ==================== -->
+<div class="slide" id="s11">
+  <h2>NVFP4 低精度推理</h2>
+  <p class="subtitle">FP4 量化 vs BF16 基线：推理效率对比</p>
+  <div class="split">
+    <div>
+      <h3>Configuration</h3>
+      <table>
+        <tr><th>Parameter</th><th>Value</th></tr>
+        <tr><td>Batch Size</td><td>512</td></tr>
+        <tr><td>d_model</td><td>8192</td></tr>
+        <tr><td>d_ff</td><td>32768</td></tr>
+        <tr><td>Num Layers</td><td>2</td></tr>
+        <tr><td>Iterations</td><td>20</td></tr>
+        <tr><td>Warmup</td><td>10</td></tr>
+      </table>
+    </div>
+    <div>
+      <h3>Baseline vs Optimized</h3>
+      <pre><span class="cm"># Baseline: BF16 MLP</span>
+config = <span class="tp">NVFP4MLPConfig</span>(
+    batch_size=<span class="num">512</span>,
+    d_model=<span class="num">8192</span>,
+    d_ff=<span class="num">32768</span>,
+)
+bench = <span class="tp">NVFP4MLPBenchmark</span>(
+    config, use_nvfp4=<span class="num">False</span>  <span class="cm"># BF16</span>
+)
+
+<span class="cm"># Optimized: NVFP4 量化 MLP</span>
+bench = <span class="tp">NVFP4MLPBenchmark</span>(
+    config, use_nvfp4=<span class="num">True</span>   <span class="cm"># FP4</span>
+)</pre>
+      <div class="card card-yellow" style="margin-top:16px;">
+        <p>NVFP4 利用 Blackwell GPU 的原生 FP4 Tensor Core，显著降低内存占用和计算延迟</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 12: Placement Simulation ==================== -->
+<div class="slide" id="s12">
+  <h2>放置策略模拟器</h2>
+  <p class="subtitle">多节点推理的拓扑感知调度</p>
+  <div class="split-60-40">
+    <div>
+      <pre><span class="kw">@dataclass</span>
+<span class="kw">class</span> <span class="tp">PlacementConfig</span>:
+    <span class="cm">"""放置策略的可调参数"""</span>
+    prefill_tp_size: <span class="tp">int</span>       <span class="cm"># Prefill TP 并行度</span>
+    prefill_span_nodes: <span class="tp">bool</span>   <span class="cm"># Prefill 跨节点?</span>
+    decode_tp_size: <span class="tp">int</span>        <span class="cm"># Decode TP 并行度</span>
+    decode_span_nodes: <span class="tp">bool</span>    <span class="cm"># Decode 跨节点?</span>
+
+<span class="cm"># 核心启发式策略:</span>
+<span class="cm"># 1. MoE expert 并行限制在 NVLink 域内</span>
+<span class="cm"># 2. Prefill 用 TP, Decode 可降到 TP=1</span>
+<span class="cm"># 3. Session 路由保持 KV cache 亲和性</span>
+<span class="cm"># 4. 跨节点通信惩罚计入延迟</span></pre>
+    </div>
+    <div>
+      <div class="card card-accent">
+        <h3>模拟器目标</h3>
+        <ul style="font-size:16px;">
+          <li>量化 NVLink 域内 vs 跨节点开销</li>
+          <li>比较 TP/EP/PP 组合</li>
+          <li>评估 KV 迁移代价</li>
+          <li>发现尾延迟风险</li>
+        </ul>
+      </div>
+      <div class="card card-green" style="margin-top:16px;">
+        <h3>关键约束</h3>
+        <ul style="font-size:16px;">
+          <li>Expert 并行 &#x2264; NVLink 域</li>
+          <li>Decode 粘附 KV 所在节点</li>
+          <li>跨节点集体通信有惩罚</li>
+          <li>支持 B200/B300/GB200</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 13: Parallelism Demos ==================== -->
+<div class="slide" id="s13">
+  <h2>并行策略 Demo 工具集</h2>
+  <p class="subtitle">TP / PP / EP / CP 四种并行策略的可运行示例</p>
+  <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:18px;">
+    <div class="card card-accent">
+      <h3>Tensor Parallel (TP)</h3>
+      <pre style="font-size:13px;">torchrun --nproc_per_node 4 \
+  ch15/tensor_parallel_demo.py \
+  --batch 64 --in-features 4096 \
+  --out-features 4096</pre>
+      <p style="margin-top:8px;">列切分权重矩阵，all-reduce 聚合结果</p>
+    </div>
+    <div class="card card-green">
+      <h3>Pipeline Parallel (PP)</h3>
+      <pre style="font-size:13px;">torchrun --nproc_per_node 4 \
+  ch15/pipeline_parallel_demo.py \
+  --layers 16 --hidden 4096</pre>
+      <p style="margin-top:8px;">多阶段流水线，send/recv 传递激活</p>
+    </div>
+    <div class="card card-yellow">
+      <h3>Expert Parallel (EP)</h3>
+      <pre style="font-size:13px;">torchrun --nproc_per_node 4 \
+  ch15/expert_parallel_demo.py</pre>
+      <p style="margin-top:8px;">All-to-all 分发 token 到各 expert</p>
+    </div>
+    <div class="card card-red">
+      <h3>Context Parallel (CP)</h3>
+      <pre style="font-size:13px;">torchrun --nproc_per_node 4 \
+  ch15/context_parallel_demo.py</pre>
+      <p style="margin-top:8px;">序列维度切分，ring attention 通信</p>
+    </div>
+  </div>
+  <div class="card card-accent" style="margin-top:18px;">
+    <p style="font-size:17px;">
+      <strong>运行要求：</strong>所有 demo 均需 <code>torchrun</code> 启动，至少 2 GPU。
+      使用 NCCL 后端进行 GPU 间通信。
+    </p>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 14: Measured Results ==================== -->
+<div class="slide" id="s14">
+  <h2>Benchmark Results</h2>
+  <p class="subtitle">实测性能对比 (B200 GPU)</p>
+  <table style="font-size:19px;">
+    <tr>
+      <th>Benchmark</th>
+      <th>Baseline</th>
+      <th>Optimized</th>
+      <th>Speedup</th>
+      <th>优化手段</th>
+    </tr>
+    <tr>
+      <td><span class="tag tag-yellow">continuous_batching</span></td>
+      <td>52.955 ms</td>
+      <td>12.719 ms</td>
+      <td style="color:var(--accent2); font-weight:700;">4.16x</td>
+      <td>动态批处理调度</td>
+    </tr>
+    <tr>
+      <td><span class="tag tag-green">kv_cache_nvlink_pool</span></td>
+      <td>1047.860 ms</td>
+      <td>171.477 ms</td>
+      <td style="color:var(--accent2); font-weight:700;">6.11x</td>
+      <td>NVLink KV 池化</td>
+    </tr>
+    <tr>
+      <td><span class="tag tag-blue">guided_decoding</span></td>
+      <td>12.702 ms</td>
+      <td>2.131 ms</td>
+      <td style="color:var(--accent2); font-weight:700;">5.96x</td>
+      <td>GPU mask 复用</td>
+    </tr>
+    <tr>
+      <td><span class="tag tag-red">speculative_decoding</span></td>
+      <td>103.323 ms</td>
+      <td>26.761 ms</td>
+      <td style="color:var(--accent2); font-weight:700;">3.86x</td>
+      <td>投机解码编排</td>
+    </tr>
+  </table>
+  <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:16px; margin-top:30px;">
+    <div class="metric card" style="padding:16px;">
+      <div class="val" style="font-size:40px;">6.11x</div>
+      <div class="label">KV Pool</div>
+    </div>
+    <div class="metric card" style="padding:16px;">
+      <div class="val" style="font-size:40px;">5.96x</div>
+      <div class="label">Guided</div>
+    </div>
+    <div class="metric card" style="padding:16px;">
+      <div class="val" style="font-size:40px;">4.16x</div>
+      <div class="label">Batching</div>
+    </div>
+    <div class="metric card" style="padding:16px;">
+      <div class="val" style="font-size:40px;">3.86x</div>
+      <div class="label">Speculative</div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 15: Learning Goals ==================== -->
+<div class="slide" id="s15">
+  <h2>Learning Goals</h2>
+  <p class="subtitle">Chapter 15 的核心学习目标</p>
+  <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:20px; flex:1;">
+    <div class="card card-accent">
+      <h3>1. 分离推理基准测试</h3>
+      <p>Benchmark monolithic vs disaggregated inference paths，量化 fabric costs</p>
+    </div>
+    <div class="card card-green">
+      <h3>2. KV Cache 管理</h3>
+      <p>Design KV-cache managers that gracefully span local and remote HBM pools</p>
+    </div>
+    <div class="card card-yellow">
+      <h3>3. 连续批处理</h3>
+      <p>Implement continuous batching and queueing so decode throughput stays high</p>
+    </div>
+    <div class="card card-red">
+      <h3>4. MoE 高效服务</h3>
+      <p>Serve MoE models efficiently by pairing routing with optimized communication</p>
+    </div>
+  </div>
+  <div class="card" style="margin-top:20px; border:1px solid var(--accent);">
+    <h3>Repro Commands</h3>
+    <pre style="font-size:14px;">python -m ch15.compare
+python -m cli.aisp bench list-targets --chapter ch15
+python -m cli.aisp bench run --targets ch15 --profile minimal
+python -m cli.aisp bench run --targets ch15:kv_cache_nvlink_pool --profile deep_dive --single-gpu</pre>
+  </div>
+</div>
+
+<!-- ==================== SLIDE 16: Summary ==================== -->
+<div class="slide center" id="s16">
+  <div>
+    <h1>Chapter 15 Summary</h1>
+    <p class="subtitle" style="font-size:24px; max-width:700px; margin:0 auto 40px;">
+      推理系统优化 = 分离架构 + 缓存池化 + 动态调度 + 投机加速
+    </p>
+    <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:20px; max-width:900px; margin:0 auto;">
+      <div class="card" style="text-align:center; border-top:3px solid var(--accent);">
+        <div style="font-size:36px; margin-bottom:8px;">&#x26D3;</div>
+        <h3 style="font-size:16px;">Disaggregate</h3>
+        <p style="font-size:13px;">Prefill/Decode 分离</p>
+      </div>
+      <div class="card" style="text-align:center; border-top:3px solid var(--accent2);">
+        <div style="font-size:36px; margin-bottom:8px;">&#x1F4E6;</div>
+        <h3 style="font-size:16px;">Pool KV Cache</h3>
+        <p style="font-size:13px;">NVLink P2P 池化</p>
+      </div>
+      <div class="card" style="text-align:center; border-top:3px solid var(--accent4);">
+        <div style="font-size:36px; margin-bottom:8px;">&#x26A1;</div>
+        <h3 style="font-size:16px;">Batch Smart</h3>
+        <p style="font-size:13px;">连续动态批处理</p>
+      </div>
+      <div class="card" style="text-align:center; border-top:3px solid var(--accent3);">
+        <div style="font-size:36px; margin-bottom:8px;">&#x1F680;</div>
+        <h3 style="font-size:16px;">Speculate</h3>
+        <p style="font-size:13px;">投机解码加速</p>
+      </div>
+    </div>
+    <div style="margin-top:50px; color:var(--dim); font-size:16px;">
+      <span class="tag tag-blue">Ch15</span>
+      AI Performance Engineering &mdash; Disaggregated Inference & KV Management
+    </div>
+  </div>
+</div>
+
+<!-- Navigation -->
+<div class="nav">
+  <button onclick="prev()" title="Previous">&#x2190;</button>
+  <span class="page-num" id="pageNum">1 / 16</span>
+  <button onclick="next()" title="Next">&#x2192;</button>
+</div>
+
+<script>
+const slides = document.querySelectorAll('.slide');
+const total = slides.length;
+let current = 0;
+
+function show(n) {
+  slides[current].classList.remove('active');
+  current = (n + total) % total;
+  slides[current].classList.add('active');
+  document.getElementById('pageNum').textContent = (current+1) + ' / ' + total;
+  document.getElementById('progress').style.width = ((current+1)/total*100) + '%';
+}
+
+function next() { show(current + 1); }
+function prev() { show(current - 1); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prev(); }
+  if (e.key === 'Home') { e.preventDefault(); show(0); }
+  if (e.key === 'End') { e.preventDefault(); show(total-1); }
+});
+
+// Touch support
+let touchStartX = 0;
+document.addEventListener('touchstart', e => { touchStartX = e.touches[0].clientX; });
+document.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  if (Math.abs(dx) > 50) { dx < 0 ? next() : prev(); }
+});
+
+show(0);
+</script>
+</body>
+</html>

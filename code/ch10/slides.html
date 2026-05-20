@@ -1,0 +1,1463 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch10 - Tensor Core Pipelines & Cluster Features</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg-dark: #0a0a0f;
+    --bg-card: #12121a;
+    --bg-code: #1a1a2e;
+    --accent-cyan: #00d4ff;
+    --accent-green: #00ff88;
+    --accent-orange: #ff8c00;
+    --accent-purple: #a855f7;
+    --accent-pink: #ff2d78;
+    --accent-yellow: #ffd700;
+    --text-primary: #e8e8f0;
+    --text-secondary: #8888aa;
+    --text-dim: #555577;
+    --border: #2a2a3e;
+    --glow-cyan: 0 0 30px rgba(0,212,255,0.15);
+    --glow-green: 0 0 30px rgba(0,255,136,0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--bg-dark);
+    color: var(--text-primary);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  .deck {
+    width: 100vw;
+    height: 100vh;
+    position: relative;
+  }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    padding: 48px 64px;
+    opacity: 0;
+    transition: opacity 0.5s ease;
+  }
+
+  .slide.active {
+    display: flex;
+    opacity: 1;
+  }
+
+  /* Slide counter */
+  .slide-counter {
+    position: fixed;
+    bottom: 20px;
+    right: 32px;
+    font-size: 13px;
+    color: var(--text-dim);
+    font-family: 'JetBrains Mono', monospace;
+    z-index: 100;
+    letter-spacing: 1px;
+  }
+
+  /* Navigation hint */
+  .nav-hint {
+    position: fixed;
+    bottom: 20px;
+    left: 32px;
+    font-size: 12px;
+    color: var(--text-dim);
+    z-index: 100;
+  }
+
+  .nav-hint kbd {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  /* Typography */
+  h1 {
+    font-size: 52px;
+    font-weight: 800;
+    line-height: 1.1;
+    letter-spacing: -1.5px;
+    margin-bottom: 16px;
+  }
+
+  h2 {
+    font-size: 38px;
+    font-weight: 700;
+    line-height: 1.2;
+    letter-spacing: -0.5px;
+    margin-bottom: 20px;
+  }
+
+  h3 {
+    font-size: 24px;
+    font-weight: 600;
+    color: var(--accent-cyan);
+    margin-bottom: 12px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-size: 14px;
+  }
+
+  p, li {
+    font-size: 20px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+  }
+
+  .subtitle {
+    font-size: 22px;
+    color: var(--text-secondary);
+    font-weight: 400;
+    margin-bottom: 32px;
+  }
+
+  .highlight-cyan { color: var(--accent-cyan); }
+  .highlight-green { color: var(--accent-green); }
+  .highlight-orange { color: var(--accent-orange); }
+  .highlight-purple { color: var(--accent-purple); }
+  .highlight-pink { color: var(--accent-pink); }
+  .highlight-yellow { color: var(--accent-yellow); }
+
+  /* Code blocks */
+  pre {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    overflow-x: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    line-height: 1.7;
+    color: var(--text-primary);
+  }
+
+  code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.9em;
+  }
+
+  .inline-code {
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85em;
+    color: var(--accent-cyan);
+  }
+
+  .kw { color: var(--accent-purple); }
+  .fn { color: var(--accent-cyan); }
+  .str { color: var(--accent-green); }
+  .num { color: var(--accent-orange); }
+  .cmt { color: var(--text-dim); font-style: italic; }
+  .type { color: var(--accent-yellow); }
+  .op { color: var(--accent-pink); }
+
+  /* Cards / Grids */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
+  .grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 16px; }
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+
+  .card:hover {
+    border-color: var(--accent-cyan);
+    box-shadow: var(--glow-cyan);
+  }
+
+  .card h4 {
+    font-size: 16px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: var(--text-primary);
+  }
+
+  .card p {
+    font-size: 15px;
+    line-height: 1.5;
+  }
+
+  /* Metric cards */
+  .metric {
+    text-align: center;
+    padding: 28px 16px;
+  }
+
+  .metric-value {
+    font-size: 56px;
+    font-weight: 800;
+    letter-spacing: -2px;
+    line-height: 1;
+    margin-bottom: 8px;
+  }
+
+  .metric-label {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+    font-weight: 500;
+  }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 16px;
+  }
+
+  th {
+    text-align: left;
+    padding: 12px 16px;
+    font-weight: 600;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text-dim);
+    border-bottom: 2px solid var(--border);
+  }
+
+  td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+
+  tr:hover td {
+    background: rgba(0,212,255,0.03);
+  }
+
+  /* Lists */
+  ul, ol {
+    list-style: none;
+    padding: 0;
+  }
+
+  ul li {
+    position: relative;
+    padding-left: 24px;
+    margin-bottom: 10px;
+    font-size: 18px;
+  }
+
+  ul li::before {
+    content: '▸';
+    position: absolute;
+    left: 0;
+    color: var(--accent-cyan);
+    font-weight: 700;
+  }
+
+  /* Diagram boxes */
+  .arch-box {
+    background: var(--bg-card);
+    border: 2px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    text-align: center;
+    font-weight: 600;
+    font-size: 15px;
+    position: relative;
+  }
+
+  .arch-box.primary {
+    border-color: var(--accent-cyan);
+    box-shadow: var(--glow-cyan);
+  }
+
+  .arch-box.secondary {
+    border-color: var(--accent-purple);
+  }
+
+  .arch-box.accent {
+    border-color: var(--accent-green);
+    box-shadow: var(--glow-green);
+  }
+
+  .arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 28px;
+    color: var(--text-dim);
+  }
+
+  /* Section divider */
+  .section-divider {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    height: 100%;
+  }
+
+  .section-number {
+    font-size: 120px;
+    font-weight: 900;
+    color: var(--border);
+    line-height: 1;
+    margin-bottom: -20px;
+    letter-spacing: -5px;
+  }
+
+  /* Flow diagram */
+  .flow-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .flow-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  .flow-arrow {
+    color: var(--text-dim);
+    font-size: 18px;
+  }
+
+  /* Progress bar */
+  .progress-bar {
+    height: 6px;
+    background: var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 8px;
+  }
+
+  .progress-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s ease;
+  }
+
+  /* Responsive */
+  @media (max-width: 1200px) {
+    .slide { padding: 32px 40px; }
+    h1 { font-size: 40px; }
+    h2 { font-size: 30px; }
+    .metric-value { font-size: 44px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+<!-- ===================== SLIDE 1: Title ===================== -->
+<div class="slide active" id="slide-1">
+  <div style="flex:1; display:flex; flex-direction:column; justify-content:center;">
+    <h3 style="margin-bottom:24px;">Chapter 10</h3>
+    <h1>
+      Tensor Core Pipelines<br>
+      & <span class="highlight-cyan">Cluster Features</span>
+    </h1>
+    <p class="subtitle" style="max-width:700px;">
+      Blackwell 架构下的 Tensor Core 调度、Warp 特化、TMA 流水线、持久化内核与线程块集群
+    </p>
+    <div style="display:flex; gap:16px; margin-top:24px; flex-wrap:wrap;">
+      <span style="background:var(--bg-code);border:1px solid var(--border);border-radius:20px;padding:6px 16px;font-size:13px;color:var(--accent-cyan);">sm_100 Blackwell</span>
+      <span style="background:var(--bg-code);border:1px solid var(--border);border-radius:20px;padding:6px 16px;font-size:13px;color:var(--accent-green);">122 Source Files</span>
+      <span style="background:var(--bg-code);border:1px solid var(--border);border-radius:20px;padding:6px 16px;font-size:13px;color:var(--accent-orange);">CUDA + Python + Triton</span>
+      <span style="background:var(--bg-code);border:1px solid var(--border);border-radius:20px;padding:6px 16px;font-size:13px;color:var(--accent-purple);">Baseline ↔ Optimized Pairs</span>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 2: Problem Statement ===================== -->
+<div class="slide" id="slide-2">
+  <h3>The Problem</h3>
+  <h2>为什么需要这一章？</h2>
+  <div class="grid-2" style="flex:1; align-content:center;">
+    <div>
+      <div class="card" style="margin-bottom:20px; border-color:var(--accent-pink);">
+        <h4 style="color:var(--accent-pink);">❌ Baseline 路径的问题</h4>
+        <ul>
+          <li>标量密集型内核，Tensor Core 饥饿</li>
+          <li>非持久化流水线，每次迭代都付出启动开销</li>
+          <li>禁用 Cluster，忽略 DSMEM / Multicast 硬件</li>
+          <li>单 Warp 承担所有角色（加载 + 计算 + 存储）</li>
+        </ul>
+      </div>
+      <div class="card" style="border-color:var(--accent-green);">
+        <h4 style="color:var(--accent-green);">✅ Optimized 路径的改进</h4>
+        <ul>
+          <li>Warp 特化：Producer / Consumer 分工</li>
+          <li>TMA 驱动的异步流水线</li>
+          <li>持久化内核，摊销启动开销</li>
+          <li>Thread Block Cluster + DSMEM + Multicast</li>
+        </ul>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="height:100%;">
+        <h4>核心目标</h4>
+        <p style="font-size:48px; font-weight:800; color:var(--accent-cyan); text-align:center; margin:24px 0;">
+          喂饱 Tensor Core
+        </p>
+        <p style="text-align:center;">让计算单元永远不缺数据</p>
+        <div style="margin-top:24px;">
+          <div class="flow-row" style="justify-content:center;">
+            <div class="flow-box" style="border-color:var(--accent-orange);">Global Memory</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-box" style="border-color:var(--accent-purple);">TMA / cp.async</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-box" style="border-color:var(--accent-cyan);">Shared Memory</div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-box" style="border-color:var(--accent-green);">Tensor Core</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 3: Measured Results ===================== -->
+<div class="slide" id="slide-3">
+  <h3>Measured Delta</h3>
+  <h2>实测性能提升</h2>
+  <div class="grid-4" style="margin-bottom:32px;">
+    <div class="card metric">
+      <div class="metric-value highlight-green">71.4×</div>
+      <div class="metric-label">Cluster Group Single CTA</div>
+      <div style="font-size:13px; color:var(--text-dim); margin-top:8px;">2.203 ms → 0.031 ms</div>
+    </div>
+    <div class="card metric">
+      <div class="metric-value highlight-cyan">54.4×</div>
+      <div class="metric-label">Batch Scheduling</div>
+      <div style="font-size:13px; color:var(--text-dim); margin-top:8px;">10.061 ms → 0.185 ms</div>
+    </div>
+    <div class="card metric">
+      <div class="metric-value highlight-orange">122</div>
+      <div class="metric-label">Source Files</div>
+      <div style="font-size:13px; color:var(--text-dim); margin-top:8px;">CUDA + Python + Triton</div>
+    </div>
+    <div class="card metric">
+      <div class="metric-value highlight-purple">20+</div>
+      <div class="metric-label">Benchmark Pairs</div>
+      <div style="font-size:13px; color:var(--text-dim); margin-top:8px;">Baseline ↔ Optimized</div>
+    </div>
+  </div>
+  <div class="card">
+    <h4>关键 Benchmark Targets</h4>
+    <table>
+      <tr><th>Target</th><th>Baseline</th><th>Optimized</th><th>Speedup</th></tr>
+      <tr><td><span class="inline-code">cluster_group_single_cta</span></td><td>2.203 ms</td><td>0.031 ms</td><td class="highlight-green">71.42×</td></tr>
+      <tr><td><span class="inline-code">batch</span></td><td>10.061 ms</td><td>0.185 ms</td><td class="highlight-cyan">54.44×</td></tr>
+      <tr><td><span class="inline-code">double_buffered_pipeline</span></td><td colspan="2" style="text-align:center;">TMA + cp.async 异步流水线</td><td class="highlight-orange">—</td></tr>
+      <tr><td><span class="inline-code">warp_specialized_pipeline</span></td><td colspan="2" style="text-align:center;">Producer/Consumer Warp 分工</td><td class="highlight-purple">—</td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 4: Architecture Overview ===================== -->
+<div class="slide" id="slide-4">
+  <h3>Architecture</h3>
+  <h2>Blackwell sm_100 核心特性</h2>
+  <div class="grid-3" style="flex:1; align-content:start;">
+    <div class="card">
+      <h4 style="color:var(--accent-cyan);">🔧 TMA (Tensor Memory Accelerator)</h4>
+      <p>硬件级异步内存拷贝引擎，支持 2D/3D 张量描述符，零 SM 开销的 Global → Shared 数据搬运。</p>
+      <pre style="margin-top:12px; font-size:12px;"><span class="cmt">// TMA 描述符 + 异步拷贝</span>
+<span class="fn">cudaTensorMapEncodeTiled</span>(...)
+<span class="fn">cp_async_bulk_tensor</span>(smem, tma_desc, ...)</pre>
+    </div>
+    <div class="card">
+      <h4 style="color:var(--accent-green);">🧩 tcgen05 Tensor Core</h4>
+      <p>第五代 Tensor Core 指令集，支持 FP16/BF16/FP8/NVFP4，Warp Group 级 MMA 操作。</p>
+      <pre style="margin-top:12px; font-size:12px;"><span class="cmt">// tcgen05 MMA 指令</span>
+<span class="fn">tcgen05::mma</span>(d, a, b, ...)
+<span class="fn">tcgen05::commit</span>(...)</pre>
+    </div>
+    <div class="card">
+      <h4 style="color:var(--accent-orange);">🏗️ Thread Block Clusters</h4>
+      <p>多 CTA 协作执行，DSMEM (Distributed Shared Memory) 跨 CTA 通信，TMA Multicast 广播。</p>
+      <pre style="margin-top:12px; font-size:12px;"><span class="cmt">// Cluster 级操作</span>
+<span class="fn">cluster.sync</span>()
+<span class="fn">tma_multicast</span>(smem, desc, ...)</pre>
+    </div>
+    <div class="card">
+      <h4 style="color:var(--accent-purple);">⚡ Warp Specialization</h4>
+      <p>Producer Warp 专司数据加载，Consumer Warp 专司 Tensor Core 计算，消除角色切换开销。</p>
+      <pre style="margin-top:12px; font-size:12px;"><span class="cmt">// Warp 角色分工</span>
+<span class="kw">if</span> (warp_id < producer_count)
+  <span class="fn">producer_loop</span>();
+<span class="kw">else</span>
+  <span class="fn">consumer_loop</span>();</pre>
+    </div>
+    <div class="card">
+      <h4 style="color:var(--accent-pink);">🔄 Pipelines</h4>
+      <p>多级异步流水线：双缓冲、三阶段、TMA Micro-Pipeline，利用 async barrier 实现计算与加载重叠。</p>
+      <pre style="margin-top:12px; font-size:12px;"><span class="cmt">// 多阶段流水线</span>
+stage0: <span class="fn">load</span>(next_tile)
+stage1: <span class="fn">compute</span>(cur_tile)
+<span class="fn">async_barrier</span>()</pre>
+    </div>
+    <div class="card">
+      <h4 style="color:var(--accent-yellow);">🔁 Persistent Kernels</h4>
+      <p>内核内循环，一次启动处理所有工作块，消除反复的 launch overhead。</p>
+      <pre style="margin-top:12px; font-size:12px;"><span class="cmt">// 持久化内核循环</span>
+<span class="kw">while</span> (work_tile = <span class="fn">get_next_tile</span>()) {
+  <span class="fn">process_tile</span>(work_tile);
+}</pre>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 5: Directory Map ===================== -->
+<div class="slide" id="slide-5">
+  <h3>Directory Layout</h3>
+  <h2>代码组织结构</h2>
+  <div style="flex:1; overflow-y:auto;">
+    <table style="font-size:15px;">
+      <tr><th>Category</th><th>Files</th><th>Description</th></tr>
+      <tr>
+        <td class="highlight-cyan">Attention</td>
+        <td><span class="inline-code">baseline/optimized_attention.py</span><br><span class="inline-code">flash_attention.py</span><br><span class="inline-code">flash_attn_tma_micro_pipeline.*</span><br><span class="inline-code">flashattention3_pipeline.py</span></td>
+        <td>Eager → Fused → torch.compile → TMA Micro-Pipeline → FlashAttention3</td>
+      </tr>
+      <tr>
+        <td class="highlight-green">Warp Specialization</td>
+        <td><span class="inline-code">warp_specialized_pipeline.*</span><br><span class="inline-code">warp_spec_pingpong.*</span><br><span class="inline-code">tcgen05_warp_specialization*.py</span></td>
+        <td>Producer/Consumer 分工、Ping-Pong Staging、CUTLASS 对齐实现</td>
+      </tr>
+      <tr>
+        <td class="highlight-orange">Pipelines</td>
+        <td><span class="inline-code">double_buffered_pipeline.*</span><br><span class="inline-code">pipeline_3stage.*</span><br><span class="inline-code">tma_2d_pipeline.py</span></td>
+        <td>cp.async 双缓冲、三阶段异步流水线、TMA 2D 流水线</td>
+      </tr>
+      <tr>
+        <td class="highlight-purple">Cluster</td>
+        <td><span class="inline-code">cluster_group*.*</span><br><span class="inline-code">cluster_multicast.py</span><br><span class="inline-code">dsmem_reduction*.*</span></td>
+        <td>DSMEM 集群归约、Multicast GEMM、DSMEM-free 变体</td>
+      </tr>
+      <tr>
+        <td class="highlight-pink">Persistent</td>
+        <td><span class="inline-code">cooperative_persistent.*</span><br><span class="inline-code">persistent_matmul_tma.py</span></td>
+        <td>设备端循环持久化内核，两阶段 Shared Memory 流水线</td>
+      </tr>
+      <tr>
+        <td class="highlight-yellow">tcgen05</td>
+        <td><span class="inline-code">tcgen05_blackwell.cu</span><br><span class="inline-code">tcgen05_cluster.cu</span><br><span class="inline-code">matmul_tcgen05*.py</span></td>
+        <td>Blackwell 原生 tcgen05 MMA + Cluster Pipeline + cuBLAS 对比</td>
+      </tr>
+      <tr>
+        <td class="highlight-cyan">Tools</td>
+        <td><span class="inline-code">compare.py</span> <span class="inline-code">analyze_scaling.py</span><br><span class="inline-code">workload_config.py</span> <span class="inline-code">profile.sh</span></td>
+        <td>Harness 入口、Scaling 分析、工作负载配置、Nsight 自动化</td>
+      </tr>
+    </table>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 6: Pipeline Architecture ===================== -->
+<div class="slide" id="slide-6">
+  <h3>Pipeline Deep Dive</h3>
+  <h2>异步流水线架构演进</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>Stage 1: Double Buffered Pipeline</h4>
+        <pre style="font-size:13px;"><span class="cmt">// baseline: 同步加载 + 计算</span>
+<span class="kw">for</span> each tile:
+  load(tile)          <span class="cmt">// SM 等待</span>
+  compute(tile)       <span class="cmt">// 内存空闲</span>
+
+<span class="cmt">// optimized: 双缓冲重叠</span>
+load(buf[0])          <span class="cmt">// 预加载第一块</span>
+<span class="kw">for</span> each tile:
+  load(buf[next])     <span class="cmt">// 异步加载下一块</span>
+  compute(buf[cur])   <span class="cmt">// 同时计算当前块</span>
+  swap(buf[cur], buf[next])</pre>
+      </div>
+      <div class="card">
+        <h4>Stage 3: 3-Stage Pipeline</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 三级流水: Global → Register → Compute</span>
+stage0: <span class="fn">cp.async</span>(gmem → smem[buf0])
+stage1: <span class="fn">ldmatrix</span>(smem → reg[buf1])
+stage2: <span class="fn">mma.sync</span>(reg[buf2])
+<span class="fn">async_barrier</span>()  <span class="cmt">// 流水线同步</span></pre>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>Stage 2: TMA 2D Pipeline</h4>
+        <pre style="font-size:13px;"><span class="cmt">// TMA 硬件加速 2D 张量拷贝</span>
+<span class="fn">cudaTensorMapEncodeTiled</span>(
+  &desc, <span class="type">float</span>,
+  rank=<span class="num">2</span>,
+  globalDim=[M, N],
+  boxDim=[TILE_M, TILE_N]
+)
+
+<span class="cmt">// 内核中零 SM 开销搬运</span>
+<span class="fn">cp_async_bulk_tensor</span>(
+  smem_ptr, desc, coord
+)</pre>
+      </div>
+      <div class="card">
+        <h4>Stage 4: TMA Micro-Pipeline (FlashAttention)</h4>
+        <pre style="font-size:13px;"><span class="cmt">// FlashAttention TMA 微流水线</span>
+<span class="cmt">// Q/K/V 三路 TMA 异步加载</span>
+tma_load(Q_tile, stage=<span class="num">0</span>)
+tma_load(K_tile, stage=<span class="num">1</span>)
+tma_load(V_tile, stage=<span class="num">2</span>)
+<span class="cmt">// 计算与加载完全重叠</span>
+<span class="fn">flash_attention_compute</span>()</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 7: Warp Specialization ===================== -->
+<div class="slide" id="slide-7">
+  <h3>Warp Specialization</h3>
+  <h2>Warp 角色特化：从混合到分工</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card" style="border-color:var(--accent-pink); margin-bottom:20px;">
+        <h4 style="color:var(--accent-pink);">❌ Baseline: 混合角色</h4>
+        <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">
+          <div class="flow-row">
+            <div class="flow-box" style="flex:1; border-color:var(--accent-pink);">Warp 0: Load → Compute → Store</div>
+          </div>
+          <div class="flow-row">
+            <div class="flow-box" style="flex:1; border-color:var(--accent-pink);">Warp 1: Load → Compute → Store</div>
+          </div>
+          <div class="flow-row">
+            <div class="flow-box" style="flex:1; border-color:var(--accent-pink);">Warp 2: Load → Compute → Store</div>
+          </div>
+          <div class="flow-row">
+            <div class="flow-box" style="flex:1; border-color:var(--accent-pink);">Warp 3: Load → Compute → Store</div>
+          </div>
+        </div>
+        <p style="margin-top:12px; font-size:14px;">每个 Warp 都在角色切换，Tensor Core 利用率低</p>
+      </div>
+      <div class="card" style="border-color:var(--accent-green);">
+        <h4 style="color:var(--accent-green);">✅ Optimized: 角色特化</h4>
+        <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">
+          <div class="flow-row">
+            <div class="flow-box" style="flex:1; border-color:var(--accent-orange); background:rgba(255,140,0,0.1);">Warp 0-1: Producer (TMA Load)</div>
+          </div>
+          <div class="flow-row">
+            <div class="flow-box" style="flex:1; border-color:var(--accent-green); background:rgba(0,255,136,0.1);">Warp 2-3: Consumer (Tensor Core MMA)</div>
+          </div>
+        </div>
+        <p style="margin-top:12px; font-size:14px;">专用 Producer 持续喂数据，Consumer 持续计算</p>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>Ping-Pong Staging</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 乒乓缓冲 + Warp 特化</span>
+<span class="kw">__shared__</span> <span class="type">float</span> buf[<span class="num">2</span>][TILE];
+
+<span class="cmt">// Producer Warp</span>
+<span class="kw">for</span> (stage = <span class="num">0</span>; stage < num_stages; stage++) {
+  <span class="fn">cp.async</span>(buf[stage % <span class="num">2</span>], gmem);
+  <span class="fn">arrive</span>(load_barrier);
+  <span class="fn">wait</span>(compute_barrier);
+}
+
+<span class="cmt">// Consumer Warp</span>
+<span class="kw">for</span> (stage = <span class="num">0</span>; stage < num_stages; stage++) {
+  <span class="fn">wait</span>(load_barrier);
+  <span class="fn">mma</span>(reg, buf[stage % <span class="num">2</span>]);
+  <span class="fn">arrive</span>(compute_barrier);
+}</pre>
+      </div>
+      <div class="card">
+        <h4>CUTLASS Warpgroup Specialization</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 2-SM Warpgroup Tile (CUTLASS 对齐)</span>
+<span class="cmt">// sm100_mma_array_warpspecialized</span>
+<span class="kw">struct</span> <span class="type">WarpGroupMma</span> {
+  <span class="cmt">// 1-SM warp-specialized vs</span>
+  <span class="cmt">// 2-SM warpgroup tile</span>
+  <span class="fn">tcgen05::mma_array</span>(
+    d, a, b,
+    cluster_shape=<span class="num">2</span>
+  );
+};</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 8: Thread Block Clusters ===================== -->
+<div class="slide" id="slide-8">
+  <h3>Thread Block Clusters</h3>
+  <h2>集群协作：DSMEM & Multicast</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>DSMEM (Distributed Shared Memory)</h4>
+        <pre style="font-size:13px;"><span class="cmt">// Cluster 内 CTA 间直接访问共享内存</span>
+<span class="kw">__cluster_shared__</span> <span class="type">float</span> tile[TILE];
+
+<span class="cmt">// CTA 0 写入本地 DSMEM</span>
+tile[local_idx] = <span class="fn">compute_value</span>();
+<span class="fn">cluster.sync</span>();
+
+<span class="cmt">// CTA 1 直接读取 CTA 0 的 DSMEM</span>
+<span class="type">float</span> val = tile[remote_idx];
+<span class="cmt">// 不经过 Global Memory!</span></pre>
+      </div>
+      <div class="card">
+        <h4>TMA Multicast</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 一次 TMA 操作广播到多个 CTA</span>
+<span class="fn">tma_multicast</span>(
+  smem_ptr,
+  tma_desc,
+  coord,
+  cta_mask    <span class="cmt">// 目标 CTA 位掩码</span>
+);
+<span class="cmt">// 硬件级广播，NVLink-C2C 加速</span></pre>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>Cluster 归约示例</h4>
+        <div style="display:flex; flex-direction:column; gap:8px; margin:12px 0;">
+          <div class="flow-row" style="justify-content:center;">
+            <div class="flow-box" style="border-color:var(--accent-cyan);">CTA 0</div>
+            <div class="flow-box" style="border-color:var(--accent-cyan);">CTA 1</div>
+            <div class="flow-box" style="border-color:var(--accent-cyan);">CTA 2</div>
+            <div class="flow-box" style="border-color:var(--accent-cyan);">CTA 3</div>
+          </div>
+          <div style="text-align:center; color:var(--text-dim);">↓ DSMEM 交换 ↓</div>
+          <div class="flow-row" style="justify-content:center;">
+            <div class="flow-box" style="border-color:var(--accent-green); background:rgba(0,255,136,0.1); width:100%; text-align:center;">
+              Cluster-wide Reduction Result
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h4>Baseline vs Optimized Cluster</h4>
+        <table style="font-size:14px;">
+          <tr><th>Feature</th><th>Baseline</th><th>Optimized</th></tr>
+          <tr><td>CTA 间通信</td><td>Global Memory</td><td class="highlight-green">DSMEM</td></tr>
+          <tr><td>数据广播</td><td>逐 CTA 加载</td><td class="highlight-cyan">TMA Multicast</td></tr>
+          <tr><td>同步</td><td>__syncthreads</td><td class="highlight-purple">cluster.sync</td></tr>
+          <tr><td>单 CTA 变体</td><td>—</td><td class="highlight-orange">无 DSMEM 仍优化</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 9: tcgen05 Deep Dive ===================== -->
+<div class="slide" id="slide-9">
+  <h3>tcgen05 Tensor Core</h3>
+  <h2>Blackwell 第五代 Tensor Core 指令集</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>tcgen05 MMA 操作</h4>
+        <pre style="font-size:13px;"><span class="cmt">// tcgen05 矩阵乘加</span>
+<span class="fn">tcgen05::mma</span>(
+  D,          <span class="cmt">// accumulator (TMEM)</span>
+  A,          <span class="cmt">// A operand (SMEM)</span>
+  B,          <span class="cmt">// B operand (SMEM)</span>
+  <span class="type">fp16</span>,       <span class="cmt">// 数据类型</span>
+  <span class="num">128x256x32</span> <span class="cmt">// tile shape</span>
+);
+
+<span class="cmt">// 提交到 Tensor Core</span>
+<span class="fn">tcgen05::commit</span>(dep_group);
+<span class="fn">tcgen05::wait</span>(dep_group);</pre>
+      </div>
+      <div class="card">
+        <h4>Epilogue 优化</h4>
+        <pre style="font-size:13px;"><span class="cmt">// tcgen05 专用 Epilogue</span>
+<span class="cmt">// TMEM → SMEM → Global</span>
+<span class="fn">tcgen05::ld</span>(smem, tmem_acc);
+<span class="fn">__syncthreads</span>();
+
+<span class="cmt">// 向量化存储</span>
+<span class="fn">st.global.v4</span>(gmem, smem[idx]);
+<span class="cmt">// 避免 scalar store 瓶颈</span></pre>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>tcgen05 vs cuBLAS</h4>
+        <table style="font-size:14px;">
+          <tr><th>Aspect</th><th>cuBLAS</th><th>Custom tcgen05</th></tr>
+          <tr><td>灵活性</td><td>黑盒 API</td><td class="highlight-green">完全控制</td></tr>
+          <tr><td>融合操作</td><td>有限</td><td class="highlight-cyan">任意 Epilogue</td></tr>
+          <tr><td>集群支持</td><td>无</td><td class="highlight-purple">Cluster Pipeline</td></tr>
+          <tr><td>调试</td><td>困难</td><td class="highlight-orange">完整可见性</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h4>tcgen05 Cluster Pipeline</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 集群级流水线</span>
+<span class="cmt">// Leader CTA 负责加载数据到 DSMEM</span>
+<span class="kw">if</span> (is_leader_cta) {
+  <span class="fn">tma_load_to_dsmem</span>(tile);
+  <span class="fn">cluster.sync</span>();
+}
+<span class="cmt">// 所有 CTA 从 DSMEM 计算</span>
+<span class="fn">tcgen05::mma</span>(d, dsmem_a, dsmem_b);
+<span class="cmt">// 全集群重用，零冗余加载</span></pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 10: Persistent Kernels ===================== -->
+<div class="slide" id="slide-10">
+  <h3>Persistent Kernels</h3>
+  <h2>持久化内核：一次启动，全部完成</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card" style="border-color:var(--accent-pink); margin-bottom:16px;">
+        <h4 style="color:var(--accent-pink);">❌ Non-Persistent (Baseline)</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 每个 tile 一次 kernel launch</span>
+<span class="kw">for</span> tile <span class="kw">in</span> tiles:
+  kernel<<<grid, block>>>(tile)
+  <span class="cmt">// launch overhead: ~5-10 μs</span>
+  <span class="cmt">// 100 tiles = 500-1000 μs 开销!</span></pre>
+        <p style="margin-top:8px; font-size:14px;">Launch overhead 在小 kernel 或多 tile 时成为瓶颈</p>
+      </div>
+      <div class="card" style="border-color:var(--accent-green);">
+        <h4 style="color:var(--accent-green);">✅ Persistent (Optimized)</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 一次 launch，内核内循环</span>
+__global__ <span class="kw">void</span> <span class="fn">persistent_kernel</span>() {
+  <span class="kw">while</span> (<span class="num">true</span>) {
+    <span class="type">int</span> tile = <span class="fn">atomicAdd</span>(&counter, <span class="num">1</span>);
+    <span class="kw">if</span> (tile >= num_tiles) <span class="kw">break</span>;
+
+    <span class="fn">process_tile</span>(tile);
+  }
+}
+<span class="cmt">// launch overhead: 仅 1 次!</span></pre>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>Cooperative Persistent + TMA Pipeline</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 持久化 + 两阶段 SM 流水线</span>
+__global__ <span class="kw">void</span> <span class="fn">coop_persistent</span>() {
+  <span class="kw">__shared__</span> <span class="type">float</span> smem[<span class="num">2</span>][TILE];
+
+  <span class="kw">while</span> (has_work) {
+    <span class="cmt">// Stage 0: TMA 异步加载</span>
+    <span class="fn">tma_load_async</span>(smem[buf], tile);
+    <span class="fn">cp_async_barrier</span>();
+
+    <span class="cmt">// Stage 1: 计算</span>
+    <span class="fn">compute</span>(smem[1-buf]);
+    <span class="fn">__syncthreads</span>();
+  }
+}</pre>
+      </div>
+      <div class="card">
+        <h4>Persistent MatMul with TMA</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 持久化矩阵乘 + TMA</span>
+<span class="cmt">// 设备端 tile 调度</span>
+<span class="kw">while</span> ((tile_m = <span class="fn">fetch_tile</span>()) < M_tiles) {
+  <span class="kw">for</span> (tile_n = <span class="num">0</span>; tile_n < N_tiles; tile_n++) {
+    <span class="fn">tma_load</span>(A_tile[tile_m][k]);
+    <span class="fn">tma_load</span>(B_tile[k][tile_n]);
+    <span class="fn">mma</span>(C_acc, A_smem, B_smem);
+  }
+}</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 11: FlashAttention Pipeline ===================== -->
+<div class="slide" id="slide-11">
+  <h3>FlashAttention</h3>
+  <h2>从 Eager 到 TMA Micro-Pipeline</h2>
+  <div style="flex:1; display:flex; flex-direction:column; gap:16px;">
+    <div class="grid-4" style="margin-bottom:8px;">
+      <div class="card" style="text-align:center; border-color:var(--accent-pink);">
+        <h4 style="font-size:14px;">Eager SDPA</h4>
+        <p style="font-size:13px;">PyTorch 原生<br>多 kernel launch<br>中间物写回 GMEM</p>
+      </div>
+      <div class="card" style="text-align:center; border-color:var(--accent-orange);">
+        <h4 style="font-size:14px;">Fused FlashAttn</h4>
+        <p style="font-size:13px;">flash_attn 库<br>融合 QKV 计算<br>减少 GMEM 往返</p>
+      </div>
+      <div class="card" style="text-align:center; border-color:var(--accent-cyan);">
+        <h4 style="font-size:14pxpx;">FlashAttention3</h4>
+        <p style="font-size:13px;">Warp 特化<br>Producer/Consumer<br>异步流水线</p>
+      </div>
+      <div class="card" style="text-align:center; border-color:var(--accent-green); box-shadow:var(--glow-green);">
+        <h4 style="font-size:14px;">TMA Micro-Pipeline</h4>
+        <p style="font-size:13px;">TMA 硬件加速<br>零 SM 开销搬运<br>最大吞吐</p>
+      </div>
+    </div>
+    <div class="grid-2" style="flex:1;">
+      <div class="card">
+        <h4>FlashAttention3 Pipeline Code</h4>
+        <pre style="font-size:13px;"><span class="cmt">// Warp 特化 FlashAttention</span>
+<span class="cmt">// Producer: 加载 Q/K/V</span>
+<span class="kw">if</span> (warp_id < <span class="num">2</span>) {
+  <span class="kw">while</span> (tile < num_tiles) {
+    <span class="fn">tma_load</span>(K_tile[tile]);
+    <span class="fn">tma_load</span>(V_tile[tile]);
+    <span class="fn">arrive</span>(load_bar);
+    <span class="fn">wait</span>(compute_bar);
+    tile++;
+  }
+}
+<span class="cmt">// Consumer: 计算 Attention</span>
+<span class="kw">else</span> {
+  <span class="kw">while</span> (tile < num_tiles) {
+    <span class="fn">wait</span>(load_bar);
+    S = Q @ K^T / sqrt(d);
+    P = <span class="fn">softmax</span>(S);
+    O += P @ V;
+    <span class="fn">arrive</span>(compute_bar);
+    tile++;
+  }
+}</pre>
+      </div>
+      <div class="card">
+        <h4>Attention Metrics</h4>
+        <pre style="font-size:13px;"><span class="cmt">// Attention 工作负载度量</span>
+{
+  <span class="str">"attention.batch_size"</span>:   <span class="num">32</span>,
+  <span class="str">"attention.seq_len"</span>:      <span class="num">2048</span>,
+  <span class="str">"attention.hidden_dim"</span>:   <span class="num">4096</span>,
+  <span class="str">"attention.num_heads"</span>:    <span class="num">32</span>,
+  <span class="str">"attention.head_dim"</span>:     <span class="num">128</span>,
+  <span class="str">"attention.score_elements"</span>: <span class="num">2.15B</span>,
+  <span class="str">"attention.is_causal"</span>:    <span class="num">true</span>,
+  <span class="str">"attention.backend"</span>:      <span class="str">"flash_attn_3"</span>
+}</pre>
+        <p style="margin-top:12px; font-size:14px;">
+          FlashAttn 后端通过 <span class="inline-code">compute_attention_backend_metrics</span> 自动检测并报告
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 12: Benchmark Harness ===================== -->
+<div class="slide" id="slide-12">
+  <h3>Benchmark Harness</h3>
+  <h2>测试框架与验证机制</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>CudaBinaryBenchmark 基类</h4>
+        <pre style="font-size:13px;"><span class="kw">class</span> <span class="type">BaselineClusterGroup</span>(
+    <span class="type">CudaBinaryBenchmark</span>
+):
+  <span class="kw">def</span> <span class="fn">__init__</span>(self):
+    <span class="fn">super</span>().__init__(
+      chapter_dir=chapter_dir,
+      binary_name=<span class="str">"baseline_cluster_group"</span>,
+      iterations=<span class="num">3</span>,
+      warmup=<span class="num">5</span>,
+      timeout_seconds=<span class="num">180</span>,
+      time_regex=<span class="str">r"TIME_MS:\s*([0-9.]+)"</span>,
+      workload_params={
+        <span class="str">"batch_size"</span>: <span class="num">8192</span>,
+        <span class="str">"elements"</span>: <span class="num">1 << 24</span>,
+      },
+    )</pre>
+      </div>
+      <div class="card">
+        <h4>验证与签名</h4>
+        <pre style="font-size:13px;"><span class="kw">def</span> <span class="fn">get_input_signature</span>(self):
+  <span class="kw">return</span> <span class="fn">simple_signature</span>(
+    batch_size=<span class="num">8192</span>,
+    dtype=<span class="str">"float32"</span>,
+    elements=<span class="num">1 << 24</span>,
+  )
+
+<span class="kw">def</span> <span class="fn">get_output_tolerance</span>(self):
+  <span class="kw">return</span> (<span class="num">5e-2</span>, <span class="num">5e-2</span>)</pre>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>Custom Metrics</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 流水线特化指标</span>
+<span class="fn">compute_warp_specialization_metrics</span>(
+  params,
+  num_stages=<span class="num">1</span>,
+  producer_warps=<span class="num">1</span>,
+  compute_warps=<span class="num">1</span>,
+  consumer_warps=<span class="num">1</span>,
+  uses_pipeline_api=<span class="kw">False</span>,
+  async_staging=<span class="kw">False</span>,
+)
+
+<span class="cmt">// 输出:</span>
+<span class="cmt">// pipeline.warp_specialized = 1.0</span>
+<span class="cmt">// pipeline.producer_warps = 1.0</span>
+<span class="cmt">// pipeline.num_stages = 1.0</span></pre>
+      </div>
+      <div class="card">
+        <h4>运行命令</h4>
+        <pre style="font-size:13px;"><span class="cmt"># 快速对比</span>
+python -m ch10.compare
+
+<span class="cmt"># 列出所有 target</span>
+python -m cli.aisp bench list-targets \
+  --chapter ch10
+
+<span class="cmt"># 运行全部 benchmark</span>
+python -m cli.aisp bench run \
+  --targets ch10 --profile minimal
+
+<span class="cmt"># Nsight 深度分析</span>
+python -m cli.aisp bench run \
+  --targets ch10:cluster_group_single_cta \
+  --profile deep_dive --single-gpu</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 13: DSMEM Reduction Case Study ===================== -->
+<div class="slide" id="slide-13">
+  <h3>Case Study</h3>
+  <h2>DSMEM Reduction 演进路径</h2>
+  <div style="flex:1; display:flex; flex-direction:column; gap:16px;">
+    <div class="flow-row" style="justify-content:center; gap:16px;">
+      <div class="arch-box" style="border-color:var(--accent-pink);">
+        <div style="font-size:12px; color:var(--accent-pink);">v0</div>
+        Atomic<br>Reduction
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="arch-box" style="border-color:var(--accent-orange);">
+        <div style="font-size:12px; color:var(--accent-orange);">v1</div>
+        DSMEM<br>Reduction
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="arch-box" style="border-color:var(--accent-cyan);">
+        <div style="font-size:12px; color:var(--accent-cyan);">v2</div>
+        Warp<br>Specialized
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="arch-box" style="border-color:var(--accent-green);">
+        <div style="font-size:12px; color:var(--accent-green);">v3</div>
+        Cluster<br>Atomic
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="arch-box accent">
+        <div style="font-size:12px; color:var(--accent-green);">final</div>
+        Fixed<br>Demo
+      </div>
+    </div>
+    <div class="grid-3">
+      <div class="card">
+        <h4>Atomic Reduction (Baseline)</h4>
+        <pre style="font-size:12px;"><span class="cmt">// 全局原子加，竞争严重</span>
+__global__ <span class="kw">void</span> <span class="fn">reduce</span>(
+    <span class="type">float</span>* data, <span class="type">float</span>* out
+) {
+  <span class="type">float</span> val = data[tid];
+  <span class="fn">atomicAdd</span>(out, val);
+  <span class="cmt">// 全局竞争 → 串行化</span>
+}</pre>
+      </div>
+      <div class="card">
+        <h4>DSMEM Reduction</h4>
+        <pre style="font-size:12px;"><span class="cmt">// Cluster 内 DSMEM 归约</span>
+<span class="kw">__cluster_shared__</span> <span class="type">float</span> sdata[];
+
+sdata[local_tid] = data[global_tid];
+<span class="fn">cluster.sync</span>();
+
+<span class="cmt">// Cluster 内树形归约</span>
+<span class="kw">for</span> (s=blockDim.x/<span class="num">2</span>; s><span class="num">0</span>; s>>=<span class="num">1</span>) {
+  <span class="kw">if</span> (tid < s)
+    sdata[tid] += sdata[tid+s];
+  <span class="fn">cluster.sync</span>();
+}</pre>
+      </div>
+      <div class="card">
+        <h4>Warp Specialized + Cluster Atomic</h4>
+        <pre style="font-size:12px;"><span class="cmt">// Warp 特化 + 集群原子</span>
+<span class="kw">if</span> (is_producer_warp) {
+  <span class="fn">load_tiles_to_dsmem</span>();
+} <span class="kw">else</span> {
+  <span class="fn">wait_for_load</span>();
+  <span class="fn">reduce_in_registers</span>();
+}
+
+<span class="cmt">// 集群级原子写回</span>
+<span class="kw">if</span> (cluster_leader)
+  <span class="fn">atomicAdd</span>(out, partial);
+<span class="cmt">// 仅 leader 写，无竞争</span></pre>
+      </div>
+    </div>
+    <div class="card">
+      <h4>文件清单</h4>
+      <table style="font-size:14px;">
+        <tr><th>Stage</th><th>CUDA</th><th>Python Harness</th></tr>
+        <tr><td>Baseline</td><td><span class="inline-code">baseline_atomic_reduction.cu</span></td><td><span class="inline-code">baseline_atomic_reduction.py</span></td></tr>
+        <tr><td>DSMEM v1</td><td><span class="inline-code">baseline_dsmem_reduction.cu</span></td><td><span class="inline-code">baseline_dsmem_reduction.py</span></td></tr>
+        <tr><td>Optimized</td><td><span class="inline-code">optimized_dsmem_reduction.cu</span></td><td><span class="inline-code">optimized_dsmem_reduction.py</span></td></tr>
+        <tr><td>Warp Spec</td><td><span class="inline-code">optimized_dsmem_reduction_warp_specialized.cu</span></td><td><span class="inline-code">..._warp_specialized.py</span></td></tr>
+        <tr><td>Cluster Atomic</td><td><span class="inline-code">optimized_dsmem_reduction_cluster_atomic.cu</span></td><td><span class="inline-code">..._cluster_atomic.py</span></td></tr>
+        <tr><td>Fixed Demo</td><td><span class="inline-code">dsmem_reduction_fixed_demo.cu</span></td><td><span class="inline-code">dsmem_reduction_fixed_demo.py</span></td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 14: Cluster Multicast ===================== -->
+<div class="slide" id="slide-14">
+  <h3>Cluster Multicast</h3>
+  <h2>TMA Multicast GEMM</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4 style="color:var(--accent-pink);">Baseline: 逐 CTA 加载</h4>
+        <div style="display:flex; flex-direction:column; gap:6px; margin:12px 0;">
+          <div class="flow-row" style="justify-content:center;">
+            <div class="flow-box" style="font-size:12px; border-color:var(--accent-pink);">CTA 0: Load A tile</div>
+            <div class="flow-box" style="font-size:12px; border-color:var(--accent-pink);">CTA 1: Load A tile</div>
+          </div>
+          <div class="flow-row" style="justify-content:center;">
+            <div class="flow-box" style="font-size:12px; border-color:var(--accent-pink);">CTA 2: Load A tile</div>
+            <div class="flow-box" style="font-size:12px; border-color:var(--accent-pink);">CTA 3: Load A tile</div>
+          </div>
+        </div>
+        <p style="font-size:13px; color:var(--accent-pink);">同一 A tile 被加载 4 次！带宽浪费</p>
+      </div>
+      <div class="card">
+        <h4 style="color:var(--accent-green);">Optimized: TMA Multicast</h4>
+        <div style="display:flex; flex-direction:column; gap:6px; margin:12px 0;">
+          <div class="flow-row" style="justify-content:center;">
+            <div class="flow-box" style="font-size:12px; border-color:var(--accent-green); background:rgba(0,255,136,0.1);">
+              TMA Multicast A tile → CTA 0,1,2,3
+            </div>
+          </div>
+        </div>
+        <p style="font-size:13px; color:var(--accent-green);">一次 TMA 操作广播到所有 CTA，NVLink-C2C 加速</p>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>Multicast GEMM 核心代码</h4>
+        <pre style="font-size:13px;"><span class="cmt">// TMA Multicast GEMM</span>
+<span class="type">uint32_t</span> cta_mask = <span class="num">0xFFFF</span>; <span class="cmt">// 所有 CTA</span>
+
+<span class="cmt">// A tile multicast (广播)</span>
+<span class="fn">tma_multicast</span>(
+  smem_A, desc_A, coord_A,
+  cta_mask
+);
+<span class="cmt">// 所有 CTA 同时收到 A tile</span>
+
+<span class="cmt">// B tile 各自加载 (不共享)</span>
+<span class="fn">tma_load</span>(smem_B, desc_B, coord_B);
+
+<span class="fn">cluster.sync</span>();
+
+<span class="cmt">// 所有 CTA 独立计算</span>
+<span class="fn">tcgen05::mma</span>(C, smem_A, smem_B);</pre>
+      </div>
+      <div class="card">
+        <h4>适用场景</h4>
+        <ul>
+          <li>GEMM: A 矩阵被多 CTA 共享行/列</li>
+          <li>Attention: Q 被多 head 共享</li>
+          <li>Convolution: 权重被多 output tile 共享</li>
+          <li>任何 <strong>读多写少</strong> 的共享数据模式</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 15: Workload Config ===================== -->
+<div class="slide" id="slide-15">
+  <h3>Configuration</h3>
+  <h2>统一工作负载配置</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card">
+        <h4>Chapter10Workload 数据类</h4>
+        <pre style="font-size:13px;"><span class="kw">@dataclass</span>(<span class="type">frozen</span>=<span class="kw">True</span>)
+<span class="kw">class</span> <span class="type">Chapter10Workload</span>:
+  <span class="cmt"># 核心维度</span>
+  hidden_dim: <span class="type">int</span> = <span class="num">2048</span>
+  ffn_dim: <span class="type">int</span> = <span class="num">8192</span>
+
+  <span class="cmt"># Triton 配置</span>
+  triton_batch_size: <span class="type">int</span> = <span class="num">128</span>
+  triton_micro_batches: <span class="type">int</span> = <span class="num">32</span>
+
+  <span class="cmt"># Baseline 配置</span>
+  baseline_micro_batch_size: <span class="type">int</span> = <span class="num">4</span>
+  baseline_micro_batches: <span class="type">int</span> = <span class="num">128</span>
+
+  <span class="cmt"># Optimized 配置</span>
+  optimized_batch_size: <span class="type">int</span> = <span class="num">512</span>
+
+  <span class="cmt"># Roofline 配置</span>
+  roofline_batch_size: <span class="type">int</span> = <span class="num">256</span>
+  roofline_hidden_dim: <span class="type">int</span> = <span class="num">4096</span>
+
+  <span class="cmt"># Pipeline 配置</span>
+  pipeline_micro_batches: <span class="type">int</span> = <span class="num">64</span>
+  pipeline_chunk_tokens: <span class="type">int</span> = <span class="num">256</span>
+
+  <span class="cmt"># Warp 配置</span>
+  warp_elements: <span class="type">int</span> = <span class="num">16_777_216</span></pre>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>使用方式</h4>
+        <pre style="font-size:13px;"><span class="cmt">// 全局单例</span>
+<span class="kw">from</span> ch10.workload_config <span class="kw">import</span> WORKLOAD
+
+<span class="cmt">// 在 benchmark 中使用</span>
+WORKLOAD.hidden_dim     <span class="cmt"># 2048</span>
+WORKLOAD.ffn_dim        <span class="cmt"># 8192</span>
+WORKLOAD.triton_batch_size <span class="cmt"># 128</span>
+
+<span class="cmt">// 自定义方法</span>
+WORKLOAD.<span class="fn">warp_branch_iterations_for_mode</span>(
+  mode=<span class="str">"debug"</span>
+) <span class="cmt"># → 32</span></pre>
+      </div>
+      <div class="card">
+        <h4>设计原则</h4>
+        <ul style="font-size:15px;">
+          <li><span class="highlight-cyan">frozen=True</span> — 不可变配置，防止运行时篡改</li>
+          <li><span class="highlight-green">统一来源</span> — 所有 benchmark 共享同一配置</li>
+          <li><span class="highlight-orange">分层设计</span> — Triton / Baseline / Roofline / Pipeline 独立配置</li>
+          <li><span class="highlight-purple">可扩展</span> — 添加新维度只需修改 dataclass</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 16: Build System ===================== -->
+<div class="slide" id="slide-16">
+  <h3>Build System</h3>
+  <h2>Makefile 架构</h2>
+  <div class="grid-2" style="flex:1;">
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>自动目标发现</h4>
+        <pre style="font-size:13px;"><span class="cmt"># 自动检测所有 .cu 文件</span>
+CUDA_SOURCES := <span class="fn">$(wildcard *.cu)</span>
+
+<span class="cmt"># 过滤需要 PyTorch 扩展的文件</span>
+EXTENSION_SOURCES := <span class="fn">$(wildcard *_extension.cu)</span> \
+  matmul_tcgen05.cu tcgen05_blackwell.cu
+
+<span class="cmt"># 自动生成目标列表</span>
+STANDALONE_SOURCES := <span class="fn">$(filter-out ...)</span>
+BASE_TARGETS := <span class="fn">$(STANDALONE_SOURCES:.cu=)</span>
+TARGETS := <span class="fn">$(addsuffix $(SUFFIX), ...)</span></pre>
+      </div>
+      <div class="card">
+        <h4>特殊编译规则</h4>
+        <pre style="font-size:13px;"><span class="cmt"># Cluster 支持需要 -rdc=true</span>
+<span class="fn">baseline_cluster_group</span>: NVCC_FLAGS += <span class="str">-rdc=true</span>
+
+<span class="cmt"># C++20 特性</span>
+<span class="fn">flash_attn_tma_micro_pipeline</span>: NVCC_FLAGS += <span class="str">-std=c++20</span>
+
+<span class="cmt"># TMA 需要 -lcuda</span>
+<span class="fn">tma_multicast_cluster</span>: NVCC_FLAGS += <span class="str">-lcuda</span>
+
+<span class="cmt"># Verify 构建 (harness checksum)</span>
+<span class="fn">%_verify</span>: NVCC_FLAGS += <span class="str">-DVERIFY=1</span></pre>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:16px;">
+        <h4>架构目标</h4>
+        <table style="font-size:14px;">
+          <tr><th>Make Target</th><th>Architecture</th><th>GPU</th></tr>
+          <tr><td><span class="inline-code">make b200</span></td><td>sm_100</td><td>B200</td></tr>
+          <tr><td><span class="inline-code">make gb10</span></td><td>sm_121</td><td>GB10</td></tr>
+          <tr><td><span class="inline-code">make b300</span></td><td>sm_103</td><td>B300</td></tr>
+          <tr><td><span class="inline-code">make gb300</span></td><td>sm_103</td><td>GB300</td></tr>
+        </table>
+      </div>
+      <div class="card">
+        <h4>Profile 命令</h4>
+        <pre style="font-size:13px;"><span class="cmt"># Nsight Systems</span>
+make profile-nsys
+
+<span class="cmt"># Nsight Compute</span>
+make profile-ncu
+
+<span class="cmt"># HTA (Heat Transfer Analysis)</span>
+make profile-hta
+
+<span class="cmt"># Linux perf</span>
+make profile-perf
+
+<span class="cmt"># 全部</span>
+make profile-all</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 17: Learning Goals ===================== -->
+<div class="slide" id="slide-17">
+  <h3>Learning Goals</h3>
+  <h2>本章学习目标</h2>
+  <div style="flex:1; display:flex; flex-direction:column; justify-content:center;">
+    <div class="grid-2" style="gap:24px;">
+      <div class="card" style="border-color:var(--accent-cyan);">
+        <h4 style="color:var(--accent-cyan);">1. Warp 特化与异步加载</h4>
+        <p>使用 warp specialization 和 cp.async / TMA 保持 Tensor Core 持续饱和，理解 Producer/Consumer 角色分工的性能收益。</p>
+        <div style="margin-top:12px;">
+          <span class="inline-code">warp_specialized_pipeline</span>
+          <span class="inline-code">warp_spec_pingpong</span>
+        </div>
+      </div>
+      <div class="card" style="border-color:var(--accent-green);">
+        <h4 style="color:var(--accent-green);">2. 持久化矩阵乘</h4>
+        <p>原型化持久化内核，在设备端循环中摊销启动开销，理解 Persistent MatMul 与 TMA 流水线的结合。</p>
+        <div style="margin-top:12px;">
+          <span class="inline-code">persistent_matmul_tma</span>
+          <span class="inline-code">cooperative_persistent</span>
+        </div>
+      </div>
+      <div class="card" style="border-color:var(--accent-orange);">
+        <h4 style="color:var(--accent-orange);">3. Thread Block Clusters</h4>
+        <p>练习使用 Thread Block Clusters，理解 DSMEM 和 Multicast 的硬件限制与性能边界。</p>
+        <div style="margin-top:12px;">
+          <span class="inline-code">cluster_group</span>
+          <span class="inline-code">cluster_multicast</span>
+          <span class="inline-code">dsmem_reduction</span>
+        </div>
+      </div>
+      <div class="card" style="border-color:var(--accent-purple);">
+        <h4 style="color:var(--accent-purple);">4. 混合工具链</h4>
+        <p>组合 PyTorch、Triton 和 CUDA 内核，同时保持期望基线同步，掌握端到端的性能工程流程。</p>
+        <div style="margin-top:12px;">
+          <span class="inline-code">flash_attention</span>
+          <span class="inline-code">matmul_tcgen05_vs_cublas</span>
+          <span class="inline-code">compare.py</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SLIDE 18: Summary ===================== -->
+<div class="slide" id="slide-18">
+  <div class="section-divider">
+    <div class="section-number" style="color:var(--accent-cyan); opacity:0.3;">10</div>
+    <h2 style="font-size:42px; margin-top:0;">
+      Chapter 10 总结
+    </h2>
+    <p style="font-size:22px; max-width:800px; text-align:center; margin-top:16px;">
+      Tensor Core 调度不是单点优化，而是<span class="highlight-cyan">流水线</span>、<span class="highlight-green">Warp 分工</span>、<span class="highlight-orange">集群协作</span>和<span class="highlight-purple">持久化执行</span>的系统工程。
+    </p>
+    <div style="display:flex; gap:24px; margin-top:40px; flex-wrap:wrap; justify-content:center;">
+      <div style="text-align:center;">
+        <div style="font-size:48px; font-weight:800; color:var(--accent-cyan);">6</div>
+        <div style="font-size:13px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px;">核心优化技术</div>
+      </div>
+      <div style="text-align:center;">
+        <div style="font-size:48px; font-weight:800; color:var(--accent-green);">20+</div>
+        <div style="font-size:13px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px;">Benchmark Pairs</div>
+      </div>
+      <div style="text-align:center;">
+        <div style="font-size:48px; font-weight:800; color:var(--accent-orange);">71×</div>
+        <div style="font-size:13px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px;">Peak Speedup</div>
+      </div>
+      <div style="text-align:center;">
+        <div style="font-size:48px; font-weight:800; color:var(--accent-purple);">Blackwell</div>
+        <div style="font-size:13px; color:var(--text-dim); text-transform:uppercase; letter-spacing:1px;">sm_100 Target</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /deck -->
+
+<!-- Navigation -->
+<div class="slide-counter" id="counter">1 / 18</div>
+<div class="nav-hint"><kbd>←</kbd> <kbd>→</kbd> 或点击翻页</div>
+
+<script>
+(function() {
+  const slides = document.querySelectorAll('.slide');
+  const counter = document.getElementById('counter');
+  let current = 0;
+  const total = slides.length;
+
+  function show(idx) {
+    slides[current].classList.remove('active');
+    current = (idx + total) % total;
+    slides[current].classList.add('active');
+    counter.textContent = (current + 1) + ' / ' + total;
+  }
+
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); show(current + 1); }
+    if (e.key === 'ArrowLeft') { e.preventDefault(); show(current - 1); }
+    if (e.key === 'Home') { e.preventDefault(); show(0); }
+    if (e.key === 'End') { e.preventDefault(); show(total - 1); }
+  });
+
+  document.addEventListener('click', function(e) {
+    if (e.clientX > window.innerWidth * 0.6) show(current + 1);
+    else if (e.clientX < window.innerWidth * 0.4) show(current - 1);
+  });
+
+  // Touch support
+  let touchStartX = 0;
+  document.addEventListener('touchstart', function(e) { touchStartX = e.touches[0].clientX; });
+  document.addEventListener('touchend', function(e) {
+    const diff = e.changedTouches[0].clientX - touchStartX;
+    if (Math.abs(diff) > 50) {
+      if (diff < 0) show(current + 1);
+      else show(current - 1);
+    }
+  });
+})();
+</script>
+
+</body>
+</html>

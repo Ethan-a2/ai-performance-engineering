@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 8 - Occupancy, Warp Efficiency & ILP</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; }
+
+.slide {
+  width: 100vw; min-height: 100vh;
+  display: flex; flex-direction: column; justify-content: center; align-items: center;
+  padding: 60px 80px; position: relative;
+  background: linear-gradient(135deg, #0a0a0a 0%, #1a1a2e 100%);
+  border-bottom: 1px solid #222;
+}
+
+.slide:nth-child(even) {
+  background: linear-gradient(135deg, #0f0f23 0%, #16213e 100%);
+}
+
+.slide-number {
+  position: absolute; top: 30px; right: 40px;
+  font-size: 14px; color: #555; font-weight: 300;
+}
+
+h1 {
+  font-size: 52px; font-weight: 700; margin-bottom: 20px;
+  background: linear-gradient(90deg, #00d2ff, #7b2ff7);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  text-align: center; line-height: 1.2;
+}
+
+h2 {
+  font-size: 38px; font-weight: 600; margin-bottom: 30px;
+  color: #00d2ff; text-align: center;
+}
+
+h3 {
+  font-size: 26px; font-weight: 500; margin: 20px 0 15px;
+  color: #7b2ff7;
+}
+
+p, li {
+  font-size: 20px; line-height: 1.7; color: #c0c0c0;
+}
+
+.subtitle {
+  font-size: 24px; color: #888; text-align: center; margin-bottom: 40px;
+}
+
+ul { list-style: none; padding: 0; }
+ul li {
+  padding: 8px 0 8px 30px; position: relative;
+}
+ul li::before {
+  content: '▸'; position: absolute; left: 0; color: #00d2ff; font-weight: bold;
+}
+
+.code-block {
+  background: #1e1e2e; border: 1px solid #333; border-radius: 12px;
+  padding: 24px 28px; margin: 20px 0; font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 15px; line-height: 1.6; overflow-x: auto;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+}
+
+.code-block .keyword { color: #c678dd; }
+.code-block .type { color: #e5c07b; }
+.code-block .func { color: #61afef; }
+.code-block .comment { color: #5c6370; font-style: italic; }
+.code-block .number { color: #d19a66; }
+.code-block .string { color: #98c379; }
+.code-block .macro { color: #56b6c2; }
+.code-block .operator { color: #abb2bf; }
+
+.perf-card {
+  background: linear-gradient(135deg, #1a1a2e, #16213e);
+  border: 1px solid #333; border-radius: 16px;
+  padding: 30px 40px; margin: 15px; text-align: center;
+  min-width: 250px; flex: 1;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+  transition: transform 0.3s, box-shadow 0.3s;
+}
+.perf-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 12px 40px rgba(0,210,255,0.15);
+}
+
+.perf-value {
+  font-size: 56px; font-weight: 800;
+  background: linear-gradient(90deg, #00d2ff, #7b2ff7);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+
+.perf-label { font-size: 16px; color: #888; margin-top: 8px; }
+.perf-detail { font-size: 14px; color: #666; margin-top: 12px; }
+
+.cards-row {
+  display: flex; gap: 20px; margin: 30px 0; width: 100%;
+  justify-content: center; flex-wrap: wrap;
+}
+
+.arch-diagram {
+  display: flex; align-items: center; gap: 20px; margin: 30px 0;
+  flex-wrap: wrap; justify-content: center;
+}
+
+.arch-box {
+  background: #1e1e2e; border: 2px solid #333; border-radius: 12px;
+  padding: 20px 28px; text-align: center; min-width: 160px;
+  transition: border-color 0.3s;
+}
+.arch-box:hover { border-color: #00d2ff; }
+.arch-box .label { font-size: 14px; color: #888; margin-bottom: 6px; }
+.arch-box .value { font-size: 22px; font-weight: 600; color: #e0e0e0; }
+
+.arrow {
+  font-size: 28px; color: #00d2ff;
+}
+
+.grid-2 {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 30px;
+  width: 100%; max-width: 1200px; margin: 20px 0;
+}
+
+.grid-3 {
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;
+  width: 100%; max-width: 1200px; margin: 20px 0;
+}
+
+.comparison-table {
+  width: 100%; max-width: 1000px; border-collapse: collapse; margin: 20px 0;
+}
+.comparison-table th, .comparison-table td {
+  padding: 14px 20px; text-align: left; border-bottom: 1px solid #222;
+}
+.comparison-table th {
+  background: #1a1a2e; color: #00d2ff; font-weight: 600; font-size: 16px;
+}
+.comparison-table td { font-size: 16px; color: #c0c0c0; }
+.comparison-table tr:hover { background: rgba(0,210,255,0.05); }
+
+.tag {
+  display: inline-block; padding: 4px 12px; border-radius: 20px;
+  font-size: 13px; font-weight: 600; margin: 2px;
+}
+.tag-green { background: rgba(34,197,94,0.2); color: #22c55e; border: 1px solid rgba(34,197,94,0.3); }
+.tag-red { background: rgba(239,68,68,0.2); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
+.tag-blue { background: rgba(59,130,246,0.2); color: #3b82f6; border: 1px solid rgba(59,130,246,0.3); }
+.tag-purple { background: rgba(168,85,247,0.2); color: #a855f7; border: 1px solid rgba(168,85,247,0.3); }
+
+.highlight-box {
+  background: linear-gradient(135deg, rgba(0,210,255,0.1), rgba(123,47,247,0.1));
+  border: 1px solid rgba(0,210,255,0.3); border-radius: 12px;
+  padding: 24px 30px; margin: 20px 0; width: 100%; max-width: 1000px;
+}
+
+.flow-diagram {
+  display: flex; align-items: center; gap: 15px; margin: 25px 0;
+  flex-wrap: wrap; justify-content: center;
+}
+.flow-step {
+  background: #1e1e2e; border: 2px solid #333; border-radius: 10px;
+  padding: 15px 22px; text-align: center; font-size: 15px;
+}
+.flow-step.active { border-color: #00d2ff; color: #00d2ff; }
+.flow-arrow { color: #555; font-size: 22px; }
+
+.warp-grid {
+  display: grid; grid-template-columns: repeat(8, 40px); gap: 4px;
+  margin: 15px 0;
+}
+.warp-thread {
+  width: 40px; height: 40px; border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600;
+}
+.thread-active { background: rgba(34,197,94,0.3); color: #22c55e; border: 1px solid rgba(34,197,94,0.5); }
+.thread-idle { background: rgba(239,68,68,0.2); color: #ef4444; border: 1px solid rgba(239,68,68,0.3); }
+.thread-predicated { background: rgba(59,130,246,0.3); color: #3b82f6; border: 1px solid rgba(59,130,246,0.5); }
+
+.progress-bar {
+  width: 100%; max-width: 800px; height: 8px; background: #222;
+  border-radius: 4px; margin: 10px 0; overflow: hidden;
+}
+.progress-fill {
+  height: 100%; border-radius: 4px;
+  background: linear-gradient(90deg, #00d2ff, #7b2ff7);
+  transition: width 0.5s ease;
+}
+
+.footer {
+  position: absolute; bottom: 20px; left: 0; right: 0;
+  text-align: center; font-size: 13px; color: #444;
+}
+
+@media (max-width: 768px) {
+  .slide { padding: 30px 20px; }
+  h1 { font-size: 36px; }
+  h2 { font-size: 28px; }
+  .cards-row { flex-direction: column; align-items: center; }
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  .code-block { font-size: 13px; padding: 16px; }
+}
+</style>
+</head>
+<body>
+
+<!-- Slide 1: Title -->
+<div class="slide">
+  <div class="slide-number">01 / 12</div>
+  <h1>Chapter 8<br>Occupancy, Warp Efficiency & ILP</h1>
+  <p class="subtitle">AI Systems Performance Engineering</p>
+  <div class="cards-row" style="margin-top:40px;">
+    <div class="perf-card">
+      <div class="perf-value">10.19×</div>
+      <div class="perf-label">Threshold Speedup</div>
+      <div class="perf-detail">Branch → Predication</div>
+    </div>
+    <div class="perf-card">
+      <div class="perf-value">4.17×</div>
+      <div class="perf-label">Loop Unrolling Speedup</div>
+      <div class="perf-detail">ILP + Vectorized Loads</div>
+    </div>
+    <div class="perf-card">
+      <div class="perf-value">2.68×</div>
+      <div class="perf-label">AI Optimization Speedup</div>
+      <div class="perf-detail">Shared Weights + ILP</div>
+    </div>
+  </div>
+  <div class="footer">B200 GPU · Verified Results · Profiler-Driven Optimization</div>
+</div>
+
+<!-- Slide 2: Core Problem -->
+<div class="slide">
+  <div class="slide-number">02 / 12</div>
+  <h2>The Profiler-to-Fix Pipeline</h2>
+  <p style="text-align:center; max-width:800px; margin-bottom:30px;">
+    Chapter 8 核心问题：如何将 profiler 症状映射到具体优化方案？
+  </p>
+  <div class="flow-diagram">
+    <div class="flow-step active">Profiler<br>Symptoms</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">Identify<br>Stalls</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step active">Apply<br>Fix</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step">Reprofile<br>Verify</div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-step active">Fewer<br>Stalls</div>
+  </div>
+  <div class="highlight-box" style="margin-top:30px;">
+    <h3>Three Key Questions</h3>
+    <ul>
+      <li>哪些变化能减少 <strong>execution-dependency stalls</strong>？</li>
+      <li>如何提高 <strong>warp execution efficiency</strong>？</li>
+      <li>怎样保持足够的 <strong>resident work</strong> 而不爆寄存器？</li>
+    </ul>
+  </div>
+</div>
+
+<!-- Slide 3: Baseline vs Optimized Overview -->
+<div class="slide">
+  <div class="slide-number">03 / 12</div>
+  <h2>Baseline → Optimized Path</h2>
+  <div class="grid-2">
+    <div class="perf-card" style="text-align:left;">
+      <h3 style="color:#ef4444;">❌ Baseline Path</h3>
+      <ul>
+        <li>保守的 launch geometry</li>
+        <li>分支密集的 kernel</li>
+        <li>每线程更多依赖链</li>
+        <li>较低的 warp 执行效率</li>
+        <li>SM 未填满 / warp scheduler 空闲</li>
+      </ul>
+    </div>
+    <div class="perf-card" style="text-align:left;">
+      <h3 style="color:#22c55e;">✅ Optimized Path</h3>
+      <ul>
+        <li><strong>Occupancy-aware</strong> launch 和 block shape 调优</li>
+        <li><strong>Predication</strong> 和 <strong>loop unrolling</strong> 暴露更多有用工作</li>
+        <li>每个 warp 更多 <strong>independent work</strong></li>
+        <li>通过标准 harness 验证收益</li>
+        <li>可重复的性能提升</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 4: Benchmark Results -->
+<div class="slide">
+  <div class="slide-number">04 / 12</div>
+  <h2>Measured Performance Deltas</h2>
+  <p style="text-align:center; margin-bottom:20px;">B200 GPU 验证结果</p>
+  <table class="comparison-table">
+    <thead>
+      <tr>
+        <th>Target</th>
+        <th>Baseline</th>
+        <th>Optimized</th>
+        <th>Speedup</th>
+        <th>What Changed</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="tag tag-green">threshold</span></td>
+        <td>2.324 ms</td>
+        <td>0.228 ms</td>
+        <td><strong>10.19×</strong></td>
+        <td>Predication 消除分支慢路径，提升 warp efficiency</td>
+      </tr>
+      <tr>
+        <td><span class="tag tag-blue">loop_unrolling</span></td>
+        <td>1.591 ms</td>
+        <td>0.382 ms</td>
+        <td><strong>4.17×</strong></td>
+        <td>更多 independent work 减少 execution-dependency stalls</td>
+      </tr>
+      <tr>
+        <td><span class="tag tag-purple">ai_optimization</span></td>
+        <td>0.646 ms</td>
+        <td>0.241 ms</td>
+        <td><strong>2.68×</strong></td>
+        <td>Occupancy-aware scheduling 保持更多 resident work</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="highlight-box" style="margin-top:20px;">
+    <p>补充对比：<span class="tag tag-blue">thresholdtma</span> <span class="tag tag-blue">tiling</span> <span class="tag tag-blue">nvfp4_mlp</span> 作为 bridge comparison pairs 保留，标记为 <code>comparison_pair=1</code></p>
+  </div>
+</div>
+
+<!-- Slide 5: Threshold - The Branch Divergence Problem -->
+<div class="slide">
+  <div class="slide-number">05 / 12</div>
+  <h2>Threshold: Warp Divergence Problem</h2>
+  <p style="text-align:center; margin-bottom:20px;">分支密集的 threshold 操作导致 warp divergence</p>
+  <div class="grid-2">
+    <div>
+      <h3>Warp 执行模型</h3>
+      <p>32 个线程同步执行，分支导致部分线程空闲：</p>
+      <div class="warp-grid">
+        <div class="warp-thread thread-active">T0</div>
+        <div class="warp-thread thread-idle">T1</div>
+        <div class="warp-thread thread-active">T2</div>
+        <div class="warp-thread thread-idle">T3</div>
+        <div class="warp-thread thread-active">T4</div>
+        <div class="warp-thread thread-idle">T5</div>
+        <div class="warp-thread thread-active">T6</div>
+        <div class="warp-thread thread-idle">T7</div>
+        <div class="warp-thread thread-active">T8</div>
+        <div class="warp-thread thread-idle">T9</div>
+        <div class="warp-thread thread-active">T10</div>
+        <div class="warp-thread thread-idle">T11</div>
+        <div class="warp-thread thread-active">T12</div>
+        <div class="warp-thread thread-idle">T13</div>
+        <div class="warp-thread thread-active">T14</div>
+        <div class="warp-thread thread-idle">T15</div>
+      </div>
+      <p style="font-size:14px; color:#888; margin-top:8px;">绿色 = 执行 path A，红色 = 空闲等待</p>
+    </div>
+    <div>
+      <h3>优化后：Predicated 执行</h3>
+      <p>所有线程执行相同指令，用 predication 替代分支：</p>
+      <div class="warp-grid">
+        <div class="warp-thread thread-predicated">T0</div>
+        <div class="warp-thread thread-predicated">T1</div>
+        <div class="warp-thread thread-predicated">T2</div>
+        <div class="warp-thread thread-predicated">T3</div>
+        <div class="warp-thread thread-predicated">T4</div>
+        <div class="warp-thread thread-predicated">T5</div>
+        <div class="warp-thread thread-predicated">T6</div>
+        <div class="warp-thread thread-predicated">T7</div>
+        <div class="warp-thread thread-predicated">T8</div>
+        <div class="warp-thread thread-predicated">T9</div>
+        <div class="warp-thread thread-predicated">T10</div>
+        <div class="warp-thread thread-predicated">T11</div>
+        <div class="warp-thread thread-predicated">T12</div>
+        <div class="warp-thread thread-predicated">T13</div>
+        <div class="warp-thread thread-predicated">T14</div>
+        <div class="warp-thread thread-predicated">T15</div>
+      </div>
+      <p style="font-size:14px; color:#888; margin-top:8px;">蓝色 = 所有线程同步执行</p>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 6: Threshold Code Comparison -->
+<div class="slide">
+  <div class="slide-number">06 / 12</div>
+  <h2>Threshold: Code Comparison</h2>
+  <div class="grid-2">
+    <div>
+      <h3 style="color:#ef4444;">Baseline: Branch-Heavy</h3>
+      <div class="code-block">
+<span class="comment">// 4-way branch → warp divergence</span>
+<span class="keyword">if</span> (value > outer_threshold) {
+    <span class="comment">// Path A: outer positive</span>
+    result = <span class="func">compute</span>(value, <span class="number">1.25f</span>);
+} <span class="keyword">else if</span> (value > threshold) {
+    <span class="comment">// Path B: inner positive</span>
+    result = <span class="func">compute</span>(value, <span class="number">0.85f</span>);
+} <span class="keyword">else if</span> (value < -outer) {
+    <span class="comment">// Path C: outer negative</span>
+    result = <span class="func">compute</span>(value, <span class="number">-1.25f</span>);
+} <span class="keyword">else if</span> (value < -threshold) {
+    <span class="comment">// Path D: inner negative</span>
+    result = <span class="func">compute</span>(value, <span class="number">-0.85f</span>);
+}
+<span class="comment">// Threads idle during other paths!</span>
+      </div>
+    </div>
+    <div>
+      <h3 style="color:#22c55e;">Optimized: Predicated</h3>
+      <div class="code-block">
+<span class="comment">// No branches → full warp utilization</span>
+<span class="type">float</span> scale = <span class="func">compute_threshold_scale</span>(
+    value, threshold);
+
+<span class="comment">// Predicated: all threads execute</span>
+<span class="keyword">if</span> (scale == <span class="number">0.0f</span>) {
+    <span class="keyword">return</span> <span class="number">0.0f</span>;  <span class="comment">// uniform path</span>
+}
+
+<span class="type">float</span> sine, cosine;
+<span class="func">__sincosf</span>(value, &sine, &cosine);
+<span class="keyword">return</span> <span class="func">expensive_transform</span>(
+    value, sine, cosine) * scale;
+<span class="comment">// All threads execute same path!</span>
+      </div>
+    </div>
+  </div>
+  <div class="highlight-box" style="margin-top:15px;">
+    <p><strong>关键差异：</strong>Baseline 使用 4-way nested if/else 导致 warp divergence；Optimized 使用 predication 让所有线程执行相同指令序列</p>
+  </div>
+</div>
+
+<!-- Slide 7: Loop Unrolling -->
+<div class="slide">
+  <div class="slide-number">07 / 12</div>
+  <h2>Loop Unrolling: ILP Optimization</h2>
+  <p style="text-align:center; margin-bottom:20px;">通过 ILP 和向量化加载减少 execution-dependency stalls</p>
+  <div class="grid-2">
+    <div class="perf-card" style="text-align:left;">
+      <h3 style="color:#ef4444;">Baseline</h3>
+      <div class="code-block" style="font-size:13px;">
+<span class="comment">// 标量加载，冗余累加</span>
+<span class="keyword">for</span> (k = <span class="number">0</span>; k < <span class="number">512</span>; ++k) {
+    <span class="type">float</span> mul = row[k] * weights[k];
+    <span class="comment">// 16 次冗余累加</span>
+    <span class="keyword">for</span> (r = <span class="number">0</span>; r < <span class="number">16</span>; ++r) {
+        sum += mul * (<span class="number">1.0f</span>/<span class="number">16.0f</span>);
+    }
+}
+<span class="comment">// 问题：依赖链长，ILP 低</span>
+      </div>
+      <div style="margin-top:10px;">
+        <span class="tag tag-red">1.591 ms</span>
+        <span class="tag tag-red">低 ILP</span>
+        <span class="tag tag-red">标量加载</span>
+      </div>
+    </div>
+    <div class="perf-card" style="text-align:left;">
+      <h3 style="color:#22c55e;">Optimized</h3>
+      <div class="code-block" style="font-size:13px;">
+<span class="comment">// 向量化加载 + 4 个独立累加器</span>
+<span class="type">float4</span> vec = <span class="func">load_float4</span>(row + idx);
+<span class="type">float</span> acc0, acc1, acc2, acc3;
+
+<span class="comment">// 4 路独立 FMA</span>
+acc0 = <span class="func">fmaf</span>(vec.x, w.x, acc0);
+acc1 = <span class="func">fmaf</span>(vec.y, w.y, acc1);
+acc2 = <span class="func">fmaf</span>(vec.z, w.z, acc2);
+acc3 = <span class="func">fmaf</span>(vec.w, w.w, acc3);
+
+<span class="comment">// Shared memory 缓存权重</span>
+<span class="comment">// Warp shuffle 归约</span>
+      </div>
+      <div style="margin-top:10px;">
+        <span class="tag tag-green">0.382 ms</span>
+        <span class="tag tag-green">4.17× 快</span>
+        <span class="tag tag-green">高 ILP</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 8: Loop Unrolling Techniques -->
+<div class="slide">
+  <div class="slide-number">08 / 12</div>
+  <h2>Loop Unrolling: Key Techniques</h2>
+  <div class="grid-3">
+    <div class="perf-card" style="text-align:left;">
+      <h3>1. Vectorized Loads</h3>
+      <div class="code-block" style="font-size:12px;">
+<span class="type">float4</span>* row_vec =
+  <span class="keyword">reinterpret_cast</span>&lt;<span class="type">float4</span>*&gt;(
+    row_ptr);
+<span class="comment">// 1 load = 4 floats</span>
+      </div>
+      <p style="font-size:14px; margin-top:10px;">将 4 次标量加载合并为 1 次向量加载，减少内存事务</p>
+    </div>
+    <div class="perf-card" style="text-align:left;">
+      <h3>2. Multiple Accumulators</h3>
+      <div class="code-block" style="font-size:12px;">
+<span class="type">float</span> acc0 = <span class="number">0</span>;
+<span class="type">float</span> acc1 = <span class="number">0</span>;
+<span class="type">float</span> acc2 = <span class="number">0</span>;
+<span class="type">float</span> acc3 = <span class="number">0</span>;
+<span class="comment">// 4 independent chains</span>
+      </div>
+      <p style="font-size:14px; margin-top:10px;">打破依赖链，允许 GPU 同时执行多条独立指令</p>
+    </div>
+    <div class="perf-card" style="text-align:left;">
+      <h3>3. Shared Memory Cache</h3>
+      <div class="code-block" style="font-size:12px;">
+<span class="keyword">extern</span> __shared__
+  <span class="type">float</span> shared_weights[];
+
+<span class="comment">// Warp shuffle broadcast</span>
+weight[w] = <span class="func">__shfl_sync</span>(
+  mask, lane_weight, w);
+      </div>
+      <p style="font-size:14px; margin-top:10px;">权重缓存到 shared memory，减少全局内存访问</p>
+    </div>
+  </div>
+  <div class="highlight-box" style="margin-top:20px;">
+    <h3>ILP 原理</h3>
+    <p>GPU 每周期可以发射多条独立指令。当一个累加器等待 FMA 结果时，scheduler 可以切换到另一个累加器的指令，从而隐藏延迟。</p>
+  </div>
+</div>
+
+<!-- Slide 9: AI Optimization -->
+<div class="slide">
+  <div class="slide-number">09 / 12</div>
+  <h2>AI Optimization: Occupancy + ILP</h2>
+  <p style="text-align:center; margin-bottom:20px;">AI kernel 调度示例：shared weights + 向量化 + occupancy 优化</p>
+  <div class="grid-2">
+    <div>
+      <h3 style="color:#ef4444;">Baseline Kernel</h3>
+      <div class="code-block" style="font-size:13px;">
+__global__ <span class="keyword">void</span> ai_baseline(
+    <span class="type">float</span>* inputs,
+    <span class="type">float</span>* weights,
+    <span class="type">float</span>* output,
+    <span class="type">int</span> rows, <span class="type">int</span> cols) {
+
+  <span class="type">int</span> row = blockIdx.x * blockDim.x
+           + threadIdx.x;
+  <span class="type">float</span> acc = <span class="number">0.0f</span>;
+
+  <span class="comment">// 逐元素加载权重（全局内存）</span>
+  <span class="keyword">for</span> (<span class="type">int</span> col = <span class="number">0</span>; col < cols; ++col) {
+    acc = fmaf(row_ptr[col],
+               weights[col], acc);
+  }
+  output[row] = tanhf(acc);
+}
+      </div>
+    </div>
+    <div>
+      <h3 style="color:#22c55e;">Optimized Kernel</h3>
+      <div class="code-block" style="font-size:13px;">
+__global__ <span class="keyword">void</span> ai_optimized(
+    <span class="type">float</span>* inputs,
+    <span class="type">float</span>* weights,
+    <span class="type">float</span>* output,
+    <span class="type">int</span> rows, <span class="type">int</span> cols) {
+
+  <span class="comment">// Step 1: 权重加载到 shared memory</span>
+  <span class="keyword">extern</span> __shared__ <span class="type">float</span> sw[];
+  <span class="keyword">for</span> (<span class="type">int</span> i = threadIdx.x;
+       i < cols; i += blockDim.x)
+    sw[i] = weights[i];
+  __syncthreads();
+
+  <span class="comment">// Step 2: 4-way 向量化累加</span>
+  <span class="type">float4</span>* row_vec = ...;
+  <span class="type">float</span> acc0, acc1, acc2, acc3;
+
+  <span class="comment">// Step 3: 独立累加器链</span>
+  <span class="keyword">#pragma unroll 4</span>
+  <span class="keyword">for</span> (<span class="type">int</span> v = <span class="number">0</span>; v < vec_cols; ++v){
+    acc0 = fmaf(vals.x, w.x, acc0);
+    acc1 = fmaf(vals.y, w.y, acc1);
+    <span class="comment">// ...</span>
+  }
+}
+      </div>
+    </div>
+  </div>
+  <div class="cards-row" style="margin-top:15px;">
+    <div class="perf-card">
+      <div class="perf-value" style="font-size:40px;">0.646 ms</div>
+      <div class="perf-label">Baseline</div>
+    </div>
+    <div class="perf-card">
+      <div class="perf-value" style="font-size:40px;">0.241 ms</div>
+      <div class="perf-label">Optimized</div>
+    </div>
+    <div class="perf-card">
+      <div class="perf-value" style="font-size:40px;">2.68×</div>
+      <div class="perf-label">Speedup</div>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 10: Occupancy Tuning -->
+<div class="slide">
+  <div class="slide-number">10 / 12</div>
+  <h2>Occupancy Tuning Deep Dive</h2>
+  <p style="text-align:center; margin-bottom:20px;">通过调整 CTA shape、寄存器上限和 launch 配置优化 occupancy</p>
+  <div class="grid-2">
+    <div>
+      <h3>Tunable Parameters</h3>
+      <div class="code-block" style="font-size:13px;">
+<span class="comment">// occupancy_tuning.cu</span>
+<span class="keyword">int</span> block_size = <span class="number">128</span>;   <span class="comment">// CTA 大小</span>
+<span class="keyword">int</span> smem_bytes = <span class="number">0</span>;    <span class="comment">// Shared memory</span>
+<span class="keyword">int</span> unroll = <span class="number">1</span>;         <span class="comment">// 循环展开因子</span>
+<span class="keyword">int</span> inner_iters = <span class="number">2</span>;   <span class="comment">// 内部迭代次数</span>
+
+<span class="comment">// __launch_bounds__ 控制寄存器</span>
+__global__ __launch_bounds__(<span class="number">256</span>, <span class="number">4</span>)
+<span class="keyword">void</span> kernel(...) {
+  <span class="comment">// 4 个独立累加器 → ILP</span>
+  <span class="type">float</span> a = val * <span class="number">1.1f</span>;
+  <span class="type">float</span> b = val * <span class="number">0.9f</span>;
+  <span class="type">float</span> c = val * <span class="number">1.3f</span>;
+  <span class="type">float</span> d = val * <span class="number">0.7f</span>;
+}
+      </div>
+    </div>
+    <div>
+      <h3>Occupancy vs ILP Trade-off</h3>
+      <div class="perf-card" style="text-align:left; margin-bottom:15px;">
+        <p><strong>高 Occupancy：</strong></p>
+        <ul>
+          <li>更多 CTA resident → 更好的 latency hiding</li>
+          <li>但每个 CTA 资源更少（寄存器/shared memory）</li>
+        </ul>
+      </div>
+      <div class="perf-card" style="text-align:left;">
+        <p><strong>高 ILP：</strong></p>
+        <ul>
+          <li>更多独立指令 → 更好的 instruction throughput</li>
+          <li>但需要更多寄存器 → 可能降低 occupancy</li>
+        </ul>
+      </div>
+      <div class="highlight-box" style="margin-top:15px;">
+        <p><strong>平衡点：</strong>通过 profiler 找到最佳的 occupancy/ILP 组合</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 11: Profiler-Driven Workflow -->
+<div class="slide">
+  <div class="slide-number">11 / 12</div>
+  <h2>Profiler-Driven Optimization Workflow</h2>
+  <div class="arch-diagram">
+    <div class="arch-box">
+      <div class="label">Step 1</div>
+      <div class="value">Nsight Compute</div>
+      <div style="font-size:13px; color:#888; margin-top:5px;">Kernel 分析</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="arch-box">
+      <div class="label">Step 2</div>
+      <div class="value">Identify Stalls</div>
+      <div style="font-size:13px; color:#888; margin-top:5px;">定位瓶颈</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="arch-box">
+      <div class="label">Step 3</div>
+      <div class="value">Apply Fix</div>
+      <div style="font-size:13px; color:#888; margin-top:5px;">应用优化</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="arch-box">
+      <div class="label">Step 4</div>
+      <div class="value">Reprofile</div>
+      <div style="font-size:13px; color:#888; margin-top:5px;">验证收益</div>
+    </div>
+  </div>
+
+  <div class="code-block" style="margin-top:25px;">
+<span class="comment"># 三条 profiler 验证路径</span>
+<span class="macro">$</span> python -m cli.aisp bench run --targets ch08:threshold --profile deep_dive --single-gpu
+<span class="macro">$</span> python -m cli.aisp bench run --targets ch08:loop_unrolling --profile deep_dive --single-gpu
+<span class="macro">$</span> python -m cli.aisp bench run --targets ch08:ai_optimization --profile deep_dive --single-gpu
+  </div>
+
+  <div class="grid-3" style="margin-top:25px;">
+    <div class="perf-card">
+      <h3>threshold</h3>
+      <p style="font-size:14px;">Branch elimination<br>Warp execution efficiency</p>
+    </div>
+    <div class="perf-card">
+      <h3>loop_unrolling</h3>
+      <p style="font-size:14px;">Per-thread ILP<br>Execution-dependency stalls</p>
+    </div>
+    <div class="perf-card">
+      <h3>ai_optimization</h3>
+      <p style="font-size:14px;">Occupancy/resource tradeoffs<br>Compute-heavy kernel</p>
+    </div>
+  </div>
+</div>
+
+<!-- Slide 12: Summary & Learning Goals -->
+<div class="slide">
+  <div class="slide-number">12 / 12</div>
+  <h2>Summary & Learning Goals</h2>
+
+  <div class="grid-2" style="margin-bottom:30px;">
+    <div class="perf-card" style="text-align:left;">
+      <h3>核心技能</h3>
+      <ul>
+        <li><strong>Occupancy 调优：</strong>观察寄存器数量如何限制 resident CTAs</li>
+        <li><strong>Warp Divergence：</strong>用 predication 和 uniform control flow 最小化</li>
+        <li><strong>ILP 利用：</strong>loop unrolling + instruction scheduling 提升每线程吞吐</li>
+        <li><strong>Profiler 验证：</strong>每次改动后 reprofile 确认收益</li>
+      </ul>
+    </div>
+    <div class="perf-card" style="text-align:left;">
+      <h3>优化 Checklist</h3>
+      <ul>
+        <li>✅ Nsight Compute 验证 warp execution efficiency 提升</li>
+        <li>✅ <code>occupancy-tuning</code> 工具测试 preset timings</li>
+        <li>✅ <code>thresholdtma</code> 验证 Blackwell-only 路径</li>
+        <li>✅ 所有结果通过 harness 验证</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="highlight-box">
+    <h3>Chapter 8 Key Takeaways</h3>
+    <div class="cards-row" style="margin-top:15px;">
+      <div class="perf-card">
+        <div class="perf-value" style="font-size:36px;">10.19×</div>
+        <div class="perf-label">Warp Efficiency</div>
+      </div>
+      <div class="perf-card">
+        <div class="perf-value" style="font-size:36px;">4.17×</div>
+        <div class="perf-label">ILP Gains</div>
+      </div>
+      <div class="perf-card">
+        <div class="perf-value" style="font-size:36px;">2.68×</div>
+        <div class="perf-label">Occupancy</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="margin-top:30px; text-align:center;">
+    <p style="font-size:18px; color:#888;">
+      <span class="tag tag-green">threshold</span>
+      <span class="tag tag-blue">loop_unrolling</span>
+      <span class="tag tag-purple">ai_optimization</span>
+      <span class="tag tag-blue">occupancy_tuning</span>
+    </p>
+    <p style="font-size:16px; color:#666; margin-top:15px;">
+      Repro: <code>python -m ch08.compare</code> · <code>python -m cli.aisp bench run --targets ch08</code>
+    </p>
+  </div>
+
+  <div class="footer">Chapter 8 - Occupancy, Warp Efficiency & ILP · AI Systems Performance Engineering</div>
+</div>
+
+<script>
+// Smooth scroll for keyboard navigation
+document.addEventListener('keydown', (e) => {
+  const slides = document.querySelectorAll('.slide');
+  const viewportH = window.innerHeight;
+  const current = Math.round(window.scrollY / viewportH);
+
+  if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === ' ') {
+    e.preventDefault();
+    const next = Math.min(current + 1, slides.length - 1);
+    slides[next].scrollIntoView({ behavior: 'smooth' });
+  } else if (e.key === 'ArrowUp' || e.key === 'PageUp') {
+    e.preventDefault();
+    const prev = Math.max(current - 1, 0);
+    slides[prev].scrollIntoView({ behavior: 'smooth' });
+  }
+});
+
+// Animate progress bars on scroll
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const bars = entry.target.querySelectorAll('.progress-fill');
+      bars.forEach(bar => {
+        bar.style.width = bar.dataset.width || '0%';
+      });
+    }
+  });
+}, { threshold: 0.3 });
+
+document.querySelectorAll('.slide').forEach(slide => observer.observe(slide));
+</script>
+
+</body>
+</html>
