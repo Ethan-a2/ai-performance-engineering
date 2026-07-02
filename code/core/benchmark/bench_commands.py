@@ -655,21 +655,22 @@ def _execute_benchmarks(
         logger.error(str(exc))
         sys.exit(1)
 
-    def _cpu_minimal_filter_only() -> bool:
+    def _portable_filter_only() -> bool:
         if only_cuda or torch.cuda.is_available():
             return False
         if not chapter_dirs:
             return False
+        portable_targets = {"cpu_minimal", "htp_minimal"}
         for chapter_dir in chapter_dirs:
             chapter_id = chapter_slug(chapter_dir, active_bench_root, bench_root=active_bench_root)
             example_filter = chapter_filters.get(chapter_id)
-            if example_filter is not None and set(example_filter) != {"cpu_minimal"}:
+            if example_filter is not None and not set(example_filter).issubset(portable_targets):
                 return False
         return True
 
-    if _cpu_minimal_filter_only():
+    if _portable_filter_only():
         logger.warning(
-            "CUDA not available; skipping CUDA hardware capability dump for CPU-only cpu_minimal run."
+            "CUDA not available; skipping CUDA hardware capability dump for explicit portable target run."
         )
     else:
         try:

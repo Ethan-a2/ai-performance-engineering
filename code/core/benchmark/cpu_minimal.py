@@ -169,8 +169,15 @@ def requested_cpu_minimal(argv: Sequence[str] | None = None) -> bool:
     return False
 
 
+def requested_htp_minimal(argv: Sequence[str] | None = None) -> bool:
+    for arg in list(sys.argv[1:] if argv is None else argv):
+        if "htp_minimal" in str(arg).replace(",", " ").split():
+            return True
+    return False
+
+
 def should_use_cpu_minimal(argv: Sequence[str] | None = None) -> bool:
-    return requested_cpu_minimal(argv) or not torch.cuda.is_available()
+    return requested_cpu_minimal(argv) or (not requested_htp_minimal(argv) and not torch.cuda.is_available())
 
 
 def _time_benchmark(

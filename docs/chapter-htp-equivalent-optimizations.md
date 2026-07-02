@@ -9,6 +9,7 @@
 - [核心结论](#核心结论)
 - [HTP 能力模型](#htp-能力模型)
 - [构建与运行参考](#构建与运行参考)
+- [本仓库最小 HTP 实现](#本仓库最小-htp-实现)
 - [GPU/CPU 到 HTP 的概念映射](#gpucpu-到-htp-的概念映射)
 - [章节总览](#章节总览)
 - [Chapter 1 - Performance Fundamentals](#chapter-1---performance-fundamentals)
@@ -120,6 +121,45 @@ M=functiongemma-270m-it-BF16.gguf D=HTP0 \
 | `MB=<bytes>` / `GGML_HEXAGON_MBUF` | 最大 buffer 大小 |
 | `PROF=1/2/3` / `GGML_HEXAGON_PROFILE` | basic / PMU / trace profiling |
 | `V=1` / `GGML_HEXAGON_VERBOSE` | verbose op support/execution 日志 |
+
+## 本仓库最小 HTP 实现
+
+每章现在都有一组最小 HTP benchmark wrapper：
+
+| 文件 | 作用 |
+| --- | --- |
+| `code/chXX/baseline_htp_minimal.py` | 调用 llama.cpp Snapdragon wrapper，使用 HVX/minimal baseline knobs：`HMX=0`、`MM=1`、`FA=1`、`OC=0`、`OB=1`、`OQ=1` |
+| `code/chXX/optimized_htp_minimal.py` | 调用同一 prompt/model，使用 HMX/fused optimized knobs：`HMX=1`、`MM=3`、`FA=2`、`OC=1`、`OB=1024`、`OQ=16` |
+| `code/chXX/compare_htp_minimal.py` | 直接运行 baseline/optimized 并打印 wall-clock speedup |
+| `code/core/benchmark/htp_minimal.py` | 共享 runner、capability checks、ADB 调用、metrics parsing、strict verification payload |
+
+运行方式：
+
+```bash
+cd /media/code/tools/ai-performance-engineering/code
+
+# 直接跑某章最小 HTP 对比
+AISP_HTP_N_PREDICT=4 python -m ch02.compare_htp_minimal
+
+# 通过 benchmark CLI 跑同一目标，生成 manifest/report
+AISP_HTP_N_PREDICT=4 \
+  python -m cli.aisp bench run --targets ch02:htp_minimal --profile minimal --iterations 1 --warmup 0
+```
+
+可覆盖的环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `AISP_HTP_LLAMA_CPP_ROOT` | `/media/code/llm/llama/llama.cpp` | llama.cpp checkout 位置 |
+| `AISP_HTP_MODEL` | `functiongemma-270m-it-BF16.gguf` | 设备端 `/data/local/tmp/gguf/` 下模型名 |
+| `AISP_HTP_DEVICE` | `HTP0` | llama.cpp `--device` |
+| `AISP_HTP_PROMPT` | `what is the most popular cookie in the world?` | completion prompt |
+| `AISP_HTP_N_PREDICT` | `16` | 生成 token 数；smoke 建议 `4`，正式对比建议更大 |
+| `AISP_HTP_TIMEOUT_SECONDS` | `120` | 单次 ADB wrapper 超时 |
+| `AISP_HTP_PROFILE` | `1` | 映射到 `GGML_HEXAGON_PROFILE` |
+| `AISP_HTP_VERBOSE` | `1` | 映射到 `GGML_HEXAGON_VERBOSE` |
+
+能力门控：如果 `adb`、llama.cpp checkout、`scripts/snapdragon/adb/run-completion.sh` 或 `pkg-snapdragon/llama.cpp` 缺失，目标会显式返回 `SKIPPED:`；如果设备/模型不可用，运行阶段会失败或跳过，并在输出 tail 中保留 ADB/llama.cpp 诊断。
 
 ## GPU/CPU 到 HTP 的概念映射
 

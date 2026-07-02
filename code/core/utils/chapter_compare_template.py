@@ -410,7 +410,11 @@ def profile_template(
         table = "\n".join(lines)
         logger.info(f"\nExample: {example_name}\n{table}")
     
-    if not torch.cuda.is_available():
+    cli_args = _parse_compare_cli_args()
+    portable_examples = {"cpu_minimal", "htp_minimal"}
+    portable_examples_only = bool(cli_args.examples) and set(cli_args.examples).issubset(portable_examples)
+
+    if not torch.cuda.is_available() and not portable_examples_only:
         logger.warning("CUDA not available - skipping")
         return {
             "metrics": {
@@ -424,17 +428,16 @@ def profile_template(
             }
         }
     
-    # Initialize CUDA context early to prevent cuBLAS warnings
-    # This ensures the context is ready before any operations
-    try:
-        torch.cuda.init()
-        # Create a dummy tensor to force context initialization
-        _ = torch.zeros(1, device='cuda')
-        torch.cuda.synchronize()
-    except Exception as e:
-        logger.warning(f"CUDA context initialization warning (non-fatal): {e}")
+    if torch.cuda.is_available():
+        # Initialize CUDA context early to prevent cuBLAS warnings.
+        # This ensures the context is ready before any operations.
+        try:
+            torch.cuda.init()
+            _ = torch.zeros(1, device='cuda')
+            torch.cuda.synchronize()
+        except Exception as e:
+            logger.warning(f"CUDA context initialization warning (non-fatal): {e}")
     
-    cli_args = _parse_compare_cli_args()
     pairs = discover_benchmarks(chapter_dir)
 
     if cli_args.examples:

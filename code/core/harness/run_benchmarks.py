@@ -4802,6 +4802,10 @@ def _test_chapter_impl(
         )
 
     requested_examples = {name.strip() for name in (only_examples or []) if name.strip()}
+    portable_targets = {"cpu_minimal", "htp_minimal"}
+    portable_target_possible = not only_cuda and (
+        not requested_examples or bool(requested_examples & portable_targets)
+    )
     cpu_target_possible = not only_cuda and (
         not requested_examples or "cpu_minimal" in requested_examples
     )
@@ -4813,11 +4817,11 @@ def _test_chapter_impl(
             os.environ["CUDA_VISIBLE_DEVICES"] = tokens[0] if tokens else "0"
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    if torch.cuda.is_available() or not cpu_target_possible:
+    if torch.cuda.is_available() or not portable_target_possible:
         dump_environment_and_capabilities()
     else:
         logger.warning(
-            "CUDA not available; skipping CUDA hardware capability dump for explicit CPU-only target cpu_minimal."
+            "CUDA not available; skipping CUDA hardware capability dump for explicit portable target."
         )
 
     chapter_id = chapter_slug(chapter_dir, repo_root)
@@ -4830,6 +4834,14 @@ def _test_chapter_impl(
         logger.info(
             "Explicit CPU-only target cpu_minimal selected; disabling CUDA profiling "
             "and strict host gates for that target."
+        )
+    explicit_portable_only = bool(requested_examples) and requested_examples.issubset(portable_targets)
+    if explicit_portable_only and not explicit_cpu_minimal_only:
+        enable_profiling = False
+        profile_type = "none"
+        enforce_environment_validation = False
+        logger.info(
+            "Explicit portable non-CUDA target selected; disabling CUDA profiling and strict host gates."
         )
     emit_event(
         event_logger,
@@ -4933,8 +4945,8 @@ def _test_chapter_impl(
 
     cpu_fallback_mode = False
     if not torch.cuda.is_available():
-        cpu_target_requested = cpu_target_possible
-        if not cpu_target_requested:
+        portable_target_requested = portable_target_possible
+        if not portable_target_requested:
             emit_event(
                 event_logger,
                 logger,
@@ -4956,21 +4968,28 @@ def _test_chapter_impl(
                 }
             }
         cpu_fallback_mode = True
-        only_examples = ["cpu_minimal"]
+        if not requested_examples:
+            only_examples = ["cpu_minimal"]
         enable_profiling = False
         profile_type = "none"
         enforce_environment_validation = False
         profiling_output_dir = None
-        logger.warning(
-            "CUDA not available; running explicit CPU-only target cpu_minimal. "
-            "CUDA/GPU targets remain skipped and are not reported as CPU results."
-        )
+        if requested_examples == {"htp_minimal"}:
+            logger.warning(
+                "CUDA not available; running explicit HTP target htp_minimal. "
+                "HTP capability checks remain explicit and may report SKIPPED."
+            )
+        else:
+            logger.warning(
+                "CUDA not available; running explicit CPU-only target cpu_minimal. "
+                "CUDA/GPU targets remain skipped and are not reported as CPU results."
+            )
         emit_event(
             event_logger,
             logger,
             "cpu_fallback_target_selected",
             chapter=chapter_name,
-            target="cpu_minimal",
+            target=",".join(sorted(requested_examples or {"cpu_minimal"})),
             reason="CUDA not available",
         )
 
