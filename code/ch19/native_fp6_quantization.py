@@ -26,13 +26,12 @@ Requirements:
 - torch._scaled_mm support
 
 """
-import os
+import time
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
-import time
 
 # Check if running on Blackwell
 def is_blackwell() -> bool:
@@ -40,6 +39,30 @@ def is_blackwell() -> bool:
         return False
     props = torch.cuda.get_device_properties(0)
     return props.major >= 10
+
+
+def _benchmark_forward(module: nn.Module, x: torch.Tensor, warmup_iters: int, benchmark_iters: int) -> Tuple[torch.Tensor, float]:
+    output = module(x)
+    for _ in range(warmup_iters):
+        output = module(x)
+
+    count = max(benchmark_iters, 1)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream()
+        start.record(current_stream)
+        for _ in range(count):
+            output = module(x)
+        end.record(current_stream)
+        end.synchronize()
+        return output, start.elapsed_time(end) / (count * 1000.0)
+
+    start_time = time.perf_counter()
+    for _ in range(count):
+        output = module(x)
+    return output, (time.perf_counter() - start_time) / count
 
 
 # ============================================================================
@@ -79,8 +102,9 @@ class FP6Tensor:
         # For simplicity, using per-tensor scale here
         abs_max = data.abs().max()
         
-        # FP6 can represent up to 16, scale accordingly
-        scale = abs_max / 16.0 if abs_max > 0 else torch.tensor(1.0, device=data.device)
+        # FP6 can represent up to 16, scale accordingly.
+        scale = abs_max / 16.0
+        scale.masked_fill_(abs_max == 0, 1.0)
         
         # Scale data to FP6 range
         scaled_data = data / scale
@@ -219,16 +243,7 @@ class FP6Linear(nn.Module):
         # Dequantize weights on-the-fly
         weight = self.weight_fp6.dequantize()
         
-        # On Blackwell, this automatically uses FP6 tensor cores
-        if is_blackwell() and hasattr(torch, '_scaled_mm'):
-            # Use Blackwell's native scaled matrix multiply
-            # torch._scaled_mm can handle FP6 internally
-            output = F.linear(x, weight, self.bias)
-        else:
-            # Fallback to standard linear
-            output = F.linear(x, weight, self.bias)
-        
-        return output
+        return F.linear(x, weight, self.bias)
     
     def memory_usage(self) -> dict:
         """Return memory usage statistics."""
@@ -354,19 +369,7 @@ def benchmark_fp6_vs_fp16():
     print("=" * 80)
     mlp_fp16 = FP6MLP(d_model, d_ff, dtype=dtype, use_fp6=False).to(device)
     
-    # Warmup
-    for _ in range(warmup_iters):
-        _ = mlp_fp16(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    
-    # Benchmark
-    start = time.time()
-    for _ in range(benchmark_iters):
-        output_fp16 = mlp_fp16(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    time_fp16 = (time.time() - start) / benchmark_iters
+    output_fp16, time_fp16 = _benchmark_forward(mlp_fp16, x, warmup_iters, benchmark_iters)
     
     mem_fp16 = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else (
         sum(p.numel() * p.element_size() for p in mlp_fp16.parameters()) / 1024**2
@@ -383,19 +386,7 @@ def benchmark_fp6_vs_fp16():
     mlp_fp6 = FP6MLP(d_model, d_ff, dtype=dtype, use_fp6=True).to(device)
     mlp_fp6.quantize()
     
-    # Warmup
-    for _ in range(warmup_iters):
-        _ = mlp_fp6(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    
-    # Benchmark
-    start = time.time()
-    for _ in range(benchmark_iters):
-        output_fp6 = mlp_fp6(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    time_fp6 = (time.time() - start) / benchmark_iters
+    output_fp6, time_fp6 = _benchmark_forward(mlp_fp6, x, warmup_iters, benchmark_iters)
     
     mem_fp6 = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else (
         sum(p.numel() * p.element_size() for p in mlp_fp6.parameters()) / 1024**2
@@ -406,7 +397,7 @@ def benchmark_fp6_vs_fp16():
     print(f"  Throughput: {batch_size * seq_len / time_fp6 / 1e6:.2f} M tokens/sec")
     
     # Numerical accuracy
-    with torch.no_grad():
+    with torch.inference_mode():
         error = (output_fp16 - output_fp6).abs().mean()
         rel_error = error / output_fp16.abs().mean()
     

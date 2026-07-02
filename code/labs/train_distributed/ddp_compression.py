@@ -2,14 +2,14 @@
 
 import argparse
 import os
-
-from core.common.device_utils import resolve_local_rank
 from time import perf_counter
 from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+from core.common.device_utils import resolve_local_rank
 
 
 def parse_args():
@@ -123,7 +123,7 @@ def _int8_allreduce_hook(
         dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=state.process_group)
     # Scale to keep the int8 sum in-range across all ranks.
     scale = (local_max / float(state.limit)).to(dtype=tensor.dtype)
-    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    scale.masked_fill_(scale == 0, 1.0)
     quant = torch.clamp((tensor / scale).round(), -state.limit, state.limit).to(torch.int8)
     dist.all_reduce(quant, op=dist.ReduceOp.SUM, group=state.process_group)
     # Keep dequant in tensor dtype to reduce temporary memory overhead.
@@ -136,8 +136,8 @@ def _int8_allreduce_hook(
 
 
 def main():
-    from torch.nn.parallel import DistributedDataParallel as DDP
     from torch.distributed.algorithms.ddp_comm_hooks import powerSGD
+    from torch.nn.parallel import DistributedDataParallel as DDP
 
     from labs.train_distributed.training_utils.utils import (
         build_dataloader,
@@ -254,7 +254,7 @@ def main():
 
     extra_param = None
     if args.extra_grad_mb > 0:
-        elem_bytes = torch.tensor([], dtype=torch.bfloat16).element_size()
+        elem_bytes = torch.finfo(torch.bfloat16).bits // 8
         numel = (args.extra_grad_mb * 1024 * 1024) // elem_bytes
         rows = min(4096, max(1, numel))
         cols = max(1, numel // rows)
@@ -266,28 +266,63 @@ def main():
 
     comm_buffer = None
     if args.simulate_single_gpu_comm and world_size < 2 and args.extra_grad_mb > 0:
-        elem_bytes = torch.tensor([], dtype=torch.float32).element_size()
+        elem_bytes = torch.finfo(torch.float32).bits // 8
         numel = (args.extra_grad_mb * 1024 * 1024) // elem_bytes
         comm_buffer = torch.randn(numel, device=device, dtype=torch.float32)
 
+    def _empty_cpu_staging(shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
+        pin_memory = device.type == "cuda" and torch.cuda.is_available()
+        try:
+            return torch.empty(shape, device="cpu", dtype=dtype, pin_memory=pin_memory)
+        except RuntimeError:
+            return torch.empty(shape, device="cpu", dtype=dtype)
+
+    comm_staging = {}
+    if comm_buffer is not None:
+        if args.compression == "none":
+            comm_staging["cpu_float"] = _empty_cpu_staging(comm_buffer.shape, comm_buffer.dtype)
+        elif args.compression == "int8":
+            comm_staging["work"] = torch.empty_like(comm_buffer)
+            comm_staging["quant"] = torch.empty(comm_buffer.shape, device=device, dtype=torch.int8)
+            comm_staging["cpu_quant"] = _empty_cpu_staging(comm_buffer.shape, torch.int8)
+        elif args.compression == "powersgd":
+            stride = max(1, 8 // max(1, args.powersgd_rank))
+            sample_numel = comm_buffer.view(-1)[::stride].numel()
+            comm_staging["powersgd_stride"] = stride
+            comm_staging["sample"] = torch.empty(sample_numel, device=device, dtype=comm_buffer.dtype)
+            comm_staging["cpu_sample"] = _empty_cpu_staging(
+                torch.Size((sample_numel,)), comm_buffer.dtype
+            )
+
     def _simulate_single_gpu_comm(buffer: torch.Tensor) -> None:
         if args.compression == "none":
-            cpu_buf = buffer.cpu()
-            buffer.copy_(cpu_buf.to(device))
+            cpu_buf = comm_staging["cpu_float"]
+            cpu_buf.copy_(buffer, non_blocking=False)
+            buffer.copy_(cpu_buf, non_blocking=False)
         elif args.compression == "int8":
-            max_val = buffer.abs().max()
-            scale = max_val / 127.0 if max_val > 0 else 1.0
-            quant = torch.clamp((buffer / scale).round(), -127, 127).to(torch.int8)
-            cpu_buf = quant.cpu()
-            dequant = cpu_buf.to(device).float() * scale
-            buffer.copy_(dequant)
+            work = comm_staging["work"]
+            quant = comm_staging["quant"]
+            cpu_quant = comm_staging["cpu_quant"]
+            scale = buffer.abs().max().clamp_min(1e-12).div(127.0)
+            torch.div(buffer, scale, out=work)
+            work.round_().clamp_(-127, 127)
+            quant.copy_(work)
+            cpu_quant.copy_(quant, non_blocking=False)
+            quant.copy_(cpu_quant, non_blocking=False)
+            buffer.copy_(quant)
+            buffer.mul_(scale)
         elif args.compression == "powersgd":
             flat = buffer.view(-1)
-            stride = max(1, 8 // max(1, args.powersgd_rank))
-            sampled = flat[::stride].contiguous()
-            cpu_buf = sampled.cpu()
-            flat[::stride].copy_(cpu_buf.to(device))
-        torch.cuda.synchronize(device)
+            stride = comm_staging["powersgd_stride"]
+            sample = comm_staging["sample"]
+            cpu_sample = comm_staging["cpu_sample"]
+            sample_view = flat[::stride]
+            sample.copy_(sample_view)
+            cpu_sample.copy_(sample, non_blocking=False)
+            sample.copy_(cpu_sample, non_blocking=False)
+            sample_view.copy_(sample)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
     if args.naive_allreduce and dist.is_initialized() and world_size < 2:
         raise RuntimeError("--naive-allreduce requires >=2 GPUs")
@@ -326,6 +361,7 @@ def main():
     num_steps = min(args.steps, len(dataloader))
     start = perf_counter()
     total_tokens = 0
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
 
     for step, batch in enumerate(dataloader):
         if step >= num_steps:
@@ -354,8 +390,10 @@ def main():
         total_tokens += batch["input_ids"].numel()
 
         if is_main and step % 10 == 0:
+            loss_value_buffer[0].copy_(loss.detach())
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
             print(
-                f"[ddp-compression:{args.compression}] step {step}/{num_steps} | loss={loss.item():.4f}"
+                f"[ddp-compression:{args.compression}] step {step}/{num_steps} | loss={loss_value:.4f}"
             )
 
     if device.type == "cuda":

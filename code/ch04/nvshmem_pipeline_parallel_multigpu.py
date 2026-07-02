@@ -87,9 +87,9 @@ from core.benchmark.gpu_requirements import require_min_gpus, warn_optimal_gpu_c
 import argparse
 import datetime
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -375,7 +375,17 @@ class NVSHMEMPipelineEngine:
         )
         
         # Track activations for backward pass
-        self.saved_activations: List[torch.Tensor] = []
+        self.saved_activations: Deque[torch.Tensor] = deque()
+        self._loss_buffer = torch.empty(num_microbatches, dtype=torch.float64, device=device)
+        try:
+            self._loss_host_buffer = torch.empty(
+                num_microbatches,
+                dtype=torch.float64,
+                device="cpu",
+                pin_memory=True,
+            )
+        except RuntimeError:
+            self._loss_host_buffer = torch.empty(num_microbatches, dtype=torch.float64, device="cpu")
     
     def forward_microbatch(
         self,
@@ -434,7 +444,7 @@ class NVSHMEMPipelineEngine:
             return
         
         # Pop saved activation
-        activation = self.saved_activations.pop(0)
+        activation = self.saved_activations.popleft()
         
         if self.stage_id == self.num_stages - 1:
             # Last stage: compute loss and backward
@@ -472,7 +482,7 @@ class NVSHMEMPipelineEngine:
         Returns:
             List of losses (only for last stage)
         """
-        losses = []
+        loss_count = 0
         
         # Warmup: Forward passes
         num_warmup = min(self.num_stages - self.stage_id - 1, self.num_microbatches)
@@ -481,7 +491,8 @@ class NVSHMEMPipelineEngine:
             output = self.forward_microbatch(mb_id, input_data)
             if output is not None:
                 loss = output.sum()
-                losses.append(loss.item())
+                self._loss_buffer[loss_count].copy_(loss.detach())
+                loss_count += 1
         
         # Steady state: 1F1B
         num_steady = self.num_microbatches - num_warmup
@@ -492,7 +503,8 @@ class NVSHMEMPipelineEngine:
             output = self.forward_microbatch(mb_id, input_data)
             if output is not None:
                 loss = output.sum()
-                losses.append(loss.item())
+                self._loss_buffer[loss_count].copy_(loss.detach())
+                loss_count += 1
             
             # Backward
             self.backward_microbatch(i, loss if output is not None else None)
@@ -502,7 +514,11 @@ class NVSHMEMPipelineEngine:
             mb_id = num_steady + i
             self.backward_microbatch(mb_id, None)
         
-        return losses
+        if loss_count == 0:
+            return []
+        host_losses = self._loss_host_buffer[:loss_count]
+        host_losses.copy_(self._loss_buffer[:loss_count], non_blocking=False)
+        return [float(host_losses[idx]) for idx in range(loss_count)]
 
     def close(self) -> None:
         """Release pipeline buffers to avoid teardown hangs."""
@@ -647,10 +663,10 @@ def demo_1f1b_pipeline(
         ]
     
     # Run 1F1B schedule
-    start_time = time.time()
+    start_time = time.perf_counter()
     losses = engine.run_1f1b_schedule(input_batches)
     torch.cuda.synchronize()
-    elapsed = time.time() - start_time
+    elapsed = time.perf_counter() - start_time
     
     if rank == 0:
         print(f"[1f1b] Completed {num_microbatches} microbatches in {elapsed:.2f}s")
@@ -713,10 +729,10 @@ def demo_interleaved_pipeline(
         ]
     
     # Run interleaved schedule
-    start_time = time.time()
-    losses = pipeline.run_interleaved_schedule(input_batches)
+    start_time = time.perf_counter()
+    pipeline.run_interleaved_schedule(input_batches)
     torch.cuda.synchronize()
-    elapsed = time.time() - start_time
+    elapsed = time.perf_counter() - start_time
     
     if rank == 0:
         print(f"[interleaved] Completed {num_microbatches} microbatches in {elapsed:.2f}s")

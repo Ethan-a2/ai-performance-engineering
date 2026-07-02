@@ -32,21 +32,26 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
-
-from core.common.device_utils import resolve_local_rank
 import random
 import string
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
+import torch
+import torch.distributed as dist
+
+from core.common.device_utils import resolve_local_rank
 from core.optimization.symmetric_memory_patch import (
     SymmetricMemoryHandle,
     maybe_create_symmetric_memory_handle,
+)
+from core.optimization.symmetric_memory_patch import (
     symmetric_memory_available as _symmetric_memory_available,
 )
 
-import torch
-import torch.distributed as dist
+
+def _dtype_bytes(dtype: torch.dtype) -> int:
+    return torch.finfo(dtype).bits // 8
 
 
 # ============================================================================
@@ -229,7 +234,7 @@ class MultiModelSymmetricPool:
         self.snapshots: Dict[str, ModelWeightsSnapshot] = {}
 
     def register(self, name: str, size_mb: int = 512) -> None:
-        elements = max(1, (size_mb * 1024 * 1024) // torch.tensor([], dtype=self.dtype).element_size())
+        elements = max(1, (size_mb * 1024 * 1024) // _dtype_bytes(self.dtype))
         generator = torch.Generator(device=self.device.type)
         generator.manual_seed(abs(hash(name)) % (2**31))
         tensor = torch.randn(elements, device=self.device, dtype=self.dtype, generator=generator)
@@ -254,8 +259,8 @@ def demo_multi_model(size_mb: int = 256) -> None:
 
     active = model_a if rank % 2 == 0 else model_b
     weights = pool.route_to(active)
-    checksum = float(weights[:1024].float().sum().item())
-    dist.all_reduce(torch.tensor(checksum, device=device))
+    checksum = weights[:1024].float().sum()
+    dist.all_reduce(checksum)
 
     if rank == 0:
         print(f"[multi] routed to {active}, pool_size={len(pool.snapshots)}")
@@ -286,8 +291,8 @@ class SpeculativeDecodingCoordinator:
         else:
             self.handle = None
 
-    def publish(self, token_probs: torch.Tensor, step: int) -> None:
-        self.buffer[step, : token_probs.size(0)].copy_(token_probs)
+    def publish(self, token_scores: torch.Tensor, step: int) -> None:
+        self.buffer[step, : token_scores.size(0)].copy_(token_scores)
 
     def consume(self, step: int) -> torch.Tensor:
         return self.buffer[step].clone()
@@ -299,18 +304,36 @@ def demo_speculative(num_steps: int = 8) -> None:
 
     role = "draft" if rank < world_size // 2 else "target"
     torch.manual_seed(rank)
+    topk_values = None
+    topk_indices = None
+    topk_host = None
+    topk_display = [0] * 4
+    if role == "target":
+        topk_values = torch.empty(4, device=device, dtype=torch.float16)
+        topk_indices = torch.empty(4, device=device, dtype=torch.long)
+        topk_host = torch.empty(
+            4,
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        )
 
     for step in range(num_steps):
         if role == "draft":
-            logits = torch.randn(256, device=device, dtype=torch.float16)
-            probs = torch.softmax(logits, dim=0)
-            coordinator.publish(probs, step)
+            scores = torch.randn(256, device=device, dtype=torch.float16)
+            coordinator.publish(scores, step)
         dist.barrier()
         if role == "target":
-            probs = coordinator.consume(step)
-            topk = torch.topk(probs, k=4).indices.tolist()
+            scores = coordinator.consume(step)
+            assert topk_values is not None
+            assert topk_indices is not None
+            assert topk_host is not None
+            torch.topk(scores, k=4, out=(topk_values, topk_indices))
+            topk_host.copy_(topk_indices, non_blocking=False)
+            for topk_idx in range(4):
+                topk_display[topk_idx] = int(topk_host[topk_idx])
             if rank == world_size // 2:
-                print(f"[speculative] step={step} topk={topk}")
+                print(f"[speculative] step={step} topk={topk_display}")
         dist.barrier()
 
 

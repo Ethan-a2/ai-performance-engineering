@@ -326,7 +326,7 @@ def train_step(
     model: nn.Module,
     batch: torch.Tensor,
     optimizer: torch.optim.Optimizer,
-) -> float:
+) -> torch.Tensor:
     """Single training step."""
     input_ids = batch["input_ids"]
     labels = batch["labels"]
@@ -352,7 +352,7 @@ def train_step(
     optimizer.step()
     optimizer.zero_grad()
     
-    return loss.item()
+    return loss.detach()
 
 
 def train(
@@ -390,20 +390,27 @@ def train(
     
     # Training loop
     step = 0
-    start_time = time.time()
+    start_time = time.perf_counter()
+    loss_value_buffer = torch.empty(
+        1,
+        dtype=torch.float64,
+        device=next(model.parameters()).device,
+    )
     
     for batch in dataloader:
         # Move to device
         batch = {k: v.cuda(non_blocking=True) for k, v in batch.items()}
         
         # Training step
-        step_start = time.time()
+        step_start = time.perf_counter()
         loss = train_step(model, batch, optimizer)
-        step_time = time.time() - step_start
-        
+        step_time = time.perf_counter() - step_start
+
         if rank == 0 and step % 10 == 0:
+            loss_value_buffer[0].copy_(loss)
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
             tokens_per_sec = (batch_size * seq_len * world_size) / step_time
-            print(f"Step {step:4d} | Loss: {loss:.4f} | "
+            print(f"Step {step:4d} | Loss: {loss_value:.4f} | "
                   f"Tokens/sec: {tokens_per_sec/1e6:.2f}M | "
                   f"Time: {step_time*1000:.1f}ms")
         
@@ -411,7 +418,7 @@ def train(
         if step >= num_steps:
             break
     
-    total_time = time.time() - start_time
+    total_time = time.perf_counter() - start_time
     
     if rank == 0:
         print(f"\n{'='*70}")

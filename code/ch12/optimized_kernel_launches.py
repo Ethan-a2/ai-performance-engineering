@@ -32,6 +32,7 @@ class OptimizedKernelLaunchesBenchmark(VerificationPayloadMixin, BaseBenchmark):
             tokens_per_iteration=float(tokens),
         )
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         # Kernel launch benchmark - fixed dimensions for consistent overhead measurement
     
     def setup(self) -> None:
@@ -48,7 +49,7 @@ class OptimizedKernelLaunchesBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 x_warmup = torch.relu(x_warmup)
         
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        with torch.inference_mode(), torch.cuda.graph(self.graph):
             if self.work_a is None or self.x_input is None:
                 raise RuntimeError("CUDA graph buffers missing")
             torch.add(self.x_input, 1.0, out=self.work_a)
@@ -60,30 +61,26 @@ class OptimizedKernelLaunchesBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 torch.clamp_min(self.work_a, 0.0, out=self.work_a)
         self.graph_output = self.work_a
         self._verify_input = self.x_input.detach().clone()
+        self._verify_output_buffer = torch.empty_like(self.graph_output)
     
     def benchmark_fn(self) -> None:
         """Function to benchmark."""
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-
-        with nvtx_range("kernel_launches", enable=enable_nvtx):
-            with torch.no_grad():
-                self.graph.replay()
-                self.output = self.graph_output
+        with torch.inference_mode(), self._nvtx_range("kernel_launches"):
+            self.graph.replay()
+            self.output = self.graph_output
         if self._verify_input is None or self.graph_output is None:
             raise RuntimeError("Verification input or captured output missing")
         dtype = self._verify_input.dtype
         self._payload_dtype = dtype
 
     def capture_verification_payload(self) -> None:
+        if self.graph_output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output for verification")
         dtype = self._payload_dtype
+        self._verify_output_buffer.copy_(self.graph_output)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.graph_output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=0,
             precision_flags={
@@ -98,6 +95,8 @@ class OptimizedKernelLaunchesBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         """Cleanup."""
         del self.x_input, self.work_a, self.graph, self.graph_output
+        self._verify_input = None
+        self._verify_output_buffer = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     

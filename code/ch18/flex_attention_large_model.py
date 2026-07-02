@@ -15,6 +15,7 @@ Test configurations:
 Hardware: NVIDIA B200 (SM 10.0, 178 GB HBM3e)
 """
 import os
+import sys
 
 try:
     pass
@@ -33,7 +34,6 @@ except Exception:
 import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-import time
 from typing import Dict, Tuple
 
 from core.utils.compile_utils import enable_tf32
@@ -87,6 +87,12 @@ class TransformerBlock(nn.Module):
         
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+
+    def _project_qkv(self, x):
+        batch, seq_len, _ = x.shape
+        qkv = self.qkv(x).reshape(batch, seq_len, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        return q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         
     def forward_with_baseline_attention(self, x):
         """Forward pass with baseline SDPA"""
@@ -94,9 +100,7 @@ class TransformerBlock(nn.Module):
         x = self.norm1(x)
         
         batch, seq_len, _ = x.shape
-        qkv = self.qkv(x).reshape(batch, seq_len, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = self._project_qkv(x)
         
         # Baseline: scaled_dot_product_attention
         attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -119,15 +123,13 @@ class TransformerBlock(nn.Module):
         x = self.norm1(x)
         
         batch, seq_len, _ = x.shape
-        qkv = self.qkv(x).reshape(batch, seq_len, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = self._project_qkv(x)
         
         # FlexAttention with sliding window
         if block_mask is None:
             def sliding_window(b, h, q_idx, kv_idx):
                 return (q_idx - kv_idx).abs() <= window_size
-            block_mask = create_block_mask(sliding_window, batch, self.n_heads, seq_len, seq_len)
+            block_mask = create_block_mask(sliding_window, batch, self.n_heads, seq_len, seq_len, device=x.device)
         attn_out = flex_attention(q, k, v, block_mask=block_mask)
         attn_out = attn_out.transpose(1, 2).reshape(batch, seq_len, self.d_model)
         x = self.out_proj(attn_out) + residual
@@ -178,7 +180,14 @@ class FlexAttentionModel(nn.Module):
         if block_mask is None or block_mask.device != x.device:
             def sliding_window(b, h, q_idx, kv_idx):
                 return (q_idx - kv_idx).abs() <= self.window_size
-            block_mask = create_block_mask(sliding_window, batch, self.blocks[0].n_heads, seq_len, seq_len).to(x.device)
+            block_mask = create_block_mask(
+                sliding_window,
+                batch,
+                self.blocks[0].n_heads,
+                seq_len,
+                seq_len,
+                device=x.device,
+            )
             self._mask_cache[cache_key] = block_mask
 
         for block in self.blocks:
@@ -217,14 +226,18 @@ def benchmark_model(model, x, name, num_warmup=50, num_iters=100):
     torch.cuda.synchronize()
     
     # Benchmark
-    start = time.perf_counter()
+    count = max(num_iters, 1)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     with torch.inference_mode():
-        for _ in range(num_iters):
+        current_stream = torch.cuda.current_stream(x.device)
+        start.record(current_stream)
+        for _ in range(count):
             _ = model(x)
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+        end.record(current_stream)
+    end.synchronize()
     
-    avg_time_ms = (elapsed / num_iters) * 1000
+    avg_time_ms = start.elapsed_time(end) / count
     
     print(f"  Average time: {avg_time_ms:.2f} ms")
     

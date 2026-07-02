@@ -5,13 +5,12 @@ from __future__ import annotations
 
 import argparse
 import os
-
-from core.common.device_utils import resolve_local_rank
 import time
 
 import torch
 import torch.distributed as dist
 
+from core.common.device_utils import resolve_local_rank
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,17 +54,34 @@ def init_runtime() -> tuple[int, int, torch.device, bool]:
 def benchmark_collective(rank: int, world_size: int, tensor: torch.Tensor,
                          op_type: str, warmup: int, trials: int) -> tuple[float, float, float]:
     device = tensor.device
+    allgather_outputs = [torch.empty_like(tensor) for _ in range(world_size)] if op_type == "allgather" else None
+    shard_size = (tensor.numel() + world_size - 1) // world_size
+    reducescatter_output = (
+        torch.empty(shard_size, device=device, dtype=tensor.dtype)
+        if op_type == "reducescatter"
+        else None
+    )
+    reducescatter_inputs = None
+    if op_type == "reducescatter":
+        padded_numel = shard_size * world_size
+        reducescatter_source = (
+            tensor
+            if padded_numel == tensor.numel()
+            else torch.empty(padded_numel, device=device, dtype=tensor.dtype)
+        )
+        reducescatter_inputs = reducescatter_source.view(world_size, shard_size)
 
     def _run_collective() -> None:
         if op_type == "allreduce":
             dist.all_reduce(tensor)
         elif op_type == "allgather":
-            outputs = [torch.empty_like(tensor) for _ in range(world_size)]
-            dist.all_gather(outputs, tensor)
+            if allgather_outputs is None:
+                raise RuntimeError("allgather outputs were not initialized")
+            dist.all_gather(allgather_outputs, tensor)
         elif op_type == "reducescatter":
-            output = torch.empty(tensor.numel() // world_size, device=device, dtype=tensor.dtype)
-            inputs = list(tensor.chunk(world_size))
-            dist.reduce_scatter(output, inputs)
+            if reducescatter_output is None or reducescatter_inputs is None:
+                raise RuntimeError("reduce-scatter buffers were not initialized")
+            dist.reduce_scatter_tensor(reducescatter_output, reducescatter_inputs)
         elif op_type == "broadcast":
             dist.broadcast(tensor, src=0)
         elif op_type == "reduce":
@@ -77,16 +93,23 @@ def benchmark_collective(rank: int, world_size: int, tensor: torch.Tensor,
         _run_collective()
         torch.cuda.synchronize(device)
 
-    times = []
+    total_time = 0.0
+    min_time = float("inf")
+    max_time = float("-inf")
+    trial_count = 0
     for _ in range(trials):
         torch.cuda.synchronize(device)
-        start = time.time()
+        start = time.perf_counter()
         _run_collective()
         torch.cuda.synchronize(device)
-        times.append(time.time() - start)
+        elapsed = time.perf_counter() - start
+        total_time += elapsed
+        min_time = min(min_time, elapsed)
+        max_time = max(max_time, elapsed)
+        trial_count += 1
 
-    avg_time = sum(times) / len(times)
-    return avg_time, min(times), max(times)
+    avg_time = total_time / trial_count
+    return avg_time, min_time, max_time
 
 
 def format_bandwidth(tensor: torch.Tensor, op_type: str, avg_time: float, world_size: int) -> float:
@@ -113,16 +136,16 @@ def run_single_gpu(args: argparse.Namespace) -> None:
     for op in ops:
         for dtype_name in dtypes:
             dtype = getattr(torch, dtype_name)
-            bytes_per_elem = torch.empty((), dtype=dtype).element_size()
+            bytes_per_elem = torch.finfo(dtype).bits // 8
             for size_mb in sizes_mb:
                 total_bytes = size_mb * 1024 * 1024
                 numel = max(1, total_bytes // bytes_per_elem)
                 tensor = torch.randn(numel, device=device, dtype=dtype)
                 torch.cuda.synchronize(device)
-                start = time.time()
+                start = time.perf_counter()
                 _ = tensor * 2
                 torch.cuda.synchronize(device)
-                elapsed = time.time() - start
+                elapsed = time.perf_counter() - start
                 bandwidth = (tensor.numel() * tensor.element_size()) / elapsed / 1e9
                 print(f"SINGLE_GPU {op.upper()} {dtype_name} {size_mb}MB: {bandwidth:.2f} GB/s")
 

@@ -77,7 +77,8 @@ class Llama31_8B_Optimization:
 
                 # For the naive baseline attention path, precompute a causal mask once
                 # to avoid measuring mask materialization overhead.
-                causal = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+                pos = torch.arange(seq_len)
+                causal = pos.unsqueeze(0) > pos.unsqueeze(1)
                 self.register_buffer("_causal_mask", causal, persistent=False)
             
             def forward(self, x):
@@ -104,7 +105,7 @@ class Llama31_8B_Optimization:
                     k_fp32 = k.float()
                     v_fp32 = v.float()
                     scores = torch.matmul(q_fp32, k_fp32.transpose(-2, -1)) * self._scale
-                    scores = scores.masked_fill(self._causal_mask, float("-inf"))
+                    scores.masked_fill_(self._causal_mask, float("-inf"))
                     probs = torch.softmax(scores, dim=-1)
                     attn = torch.matmul(probs, v_fp32).to(dtype=q.dtype)
                 
@@ -123,7 +124,11 @@ class Llama31_8B_Optimization:
                 self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
             
             def forward(self, x):
-                return self.down_proj(nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+                gate = self.gate_proj(x)
+                up = self.up_proj(x)
+                F.silu(gate, inplace=True)
+                gate.mul_(up)
+                return self.down_proj(gate)
         
         return SimplifiedMLP(self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE)
     
@@ -169,7 +174,10 @@ class Llama31_8B_Optimization:
         self.model = LayerStack(self.layers)
         self.model.eval()
 
-        # Apply torch.compile if requested.
+        # Apply torch.compile if requested. (The old sm_103 fallback to "default"
+        # is retired: the tcgen05.wait.st abort it dodged was caused by the
+        # sm_103a de-suffix in core/benchmark/triton_compat.py, fixed 2026-06-11;
+        # max-autotune re-verified clean on GB300 / Triton 3.7.)
         if self.use_compile:
             self.model = compile_model(
                 self.model,

@@ -178,14 +178,17 @@ smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
+last_step_reduce = torch.empty((), dtype=torch.int32, device=device) if ddp else None
+log_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
 while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # Synchronize last_step across all ranks to avoid hangs in the distributed setting
     if ddp:
-        last_step_tensor = torch.tensor(last_step, dtype=torch.int32, device=device)
-        dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
-        last_step = bool(last_step_tensor.item())
+        assert last_step_reduce is not None
+        last_step_reduce.fill_(int(last_step))
+        dist.all_reduce(last_step_reduce, op=dist.ReduceOp.MAX)
+        last_step = bool(last_step_reduce.detach().cpu().item())
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if eval_every > 0 and (last_step or step % eval_every == 0):
@@ -236,7 +239,7 @@ while True:
     # single training step
     # evaluate the gradient
     synchronize()
-    t0 = time.time()
+    t0 = time.perf_counter()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
@@ -257,7 +260,7 @@ while True:
         opt.step()
     model.zero_grad(set_to_none=True)
     synchronize()
-    t1 = time.time()
+    t1 = time.perf_counter()
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
@@ -265,7 +268,9 @@ while True:
     step += 1
 
     # logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    log_value_buffer[0].copy_(train_loss)
+    train_loss_value = float(log_value_buffer.detach().cpu()[0])
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_value # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * progress
     tok_per_sec = int(total_batch_size / dt)

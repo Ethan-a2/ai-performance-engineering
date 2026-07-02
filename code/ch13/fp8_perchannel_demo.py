@@ -29,13 +29,12 @@ REQUIREMENTS:
 
 from __future__ import annotations
 
-from pathlib import Path
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-from typing import Tuple, Optional
-from dataclasses import dataclass
-from enum import Enum
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (
@@ -103,13 +102,27 @@ class FP8PerChannelLinear(nn.Module):
         # Amax history for delayed scaling
         self.register_buffer(
             'input_amax_history',
-            torch.zeros(self.config.amax_history_len, in_features)
+            torch.zeros(
+                self.config.amax_history_len,
+                in_features,
+                device=device,
+                dtype=torch.float32,
+            )
         )
         self.register_buffer(
             'weight_amax_history',
-            torch.zeros(self.config.amax_history_len)
+            torch.zeros(
+                self.config.amax_history_len,
+                device=device,
+                dtype=torch.float32,
+            )
         )
-        self.register_buffer('amax_counter', torch.tensor(0))
+        self.register_buffer('amax_counter', torch.tensor(0, device=device))
+        self.register_buffer(
+            '_stats_buffer',
+            torch.empty(4, device=device, dtype=torch.float32),
+            persistent=False,
+        )
         
         self._reset_parameters()
     
@@ -203,15 +216,9 @@ class FP8PerChannelLinear(nn.Module):
         Returns:
             Dequantized output tensor
         """
-        # Combined scale: input_scale (scalar) * weight_scale [out_features]
-        # Broadcast weight_scale across batch dimensions
-        combined_scale = input_scale * weight_scale  # [out_features]
-        
-        # Dequantize: output = output_q * combined_scale
-        # combined_scale broadcasts across leading dimensions
-        output = output_q * combined_scale
-        
-        return output.to(output_dtype)
+        output_q.mul_(input_scale * weight_scale)
+
+        return output_q.to(output_dtype)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with per-channel FP8 quantization.
@@ -257,7 +264,10 @@ class FP8PerChannelLinear(nn.Module):
             weight_q = torch.clamp(self.weight / weight_scale, -self.fp8_max, self.fp8_max).round()
             
             output_q = torch.nn.functional.linear(x_q, weight_q, bias=None)
-            output = (output_q * input_scale * weight_scale).to(original_dtype)
+            output = output_q
+            output.mul_(input_scale)
+            output.mul_(weight_scale)
+            output = output.to(original_dtype)
             
         else:
             # No quantization fallback
@@ -265,12 +275,12 @@ class FP8PerChannelLinear(nn.Module):
         
         # Add bias if present
         if self.bias is not None:
-            output = output + self.bias
+            output.add_(self.bias)
         
         # Update amax history for delayed scaling
         if self.training:
             idx = self.amax_counter % self.config.amax_history_len
-            with torch.no_grad():
+            with torch.inference_mode():
                 self.input_amax_history[idx] = x.abs().amax(dim=list(range(x.ndim - 1)))
                 self.weight_amax_history[idx] = self.weight.abs().max()
                 self.amax_counter += 1
@@ -279,14 +289,24 @@ class FP8PerChannelLinear(nn.Module):
     
     def get_quantization_stats(self) -> dict:
         """Get statistics about the quantization."""
+        stats_buffer = self._stats_buffer
+        stats_buffer[0].copy_(self.input_amax_history.mean())
+        stats_buffer[1].copy_(self.input_amax_history.std())
+        stats_buffer[2].copy_(self.weight_amax_history.mean())
+        stats_buffer[3].copy_(self.amax_counter.to(dtype=torch.float32))
+        stats_host = stats_buffer.detach().cpu()
+        input_amax_mean = float(stats_host[0])
+        input_amax_std = float(stats_host[1])
+        weight_amax_mean = float(stats_host[2])
+        amax_counter = float(stats_host[3])
         return {
             "scaling_mode": self.config.scaling_mode.value,
             "fp8_format": self.config.fp8_format,
             "fp8_max": self.fp8_max,
-            "input_amax_mean": self.input_amax_history.mean().item(),
-            "input_amax_std": self.input_amax_history.std().item(),
-            "weight_amax_mean": self.weight_amax_history.mean().item(),
-            "amax_counter": self.amax_counter.item(),
+            "input_amax_mean": input_amax_mean,
+            "input_amax_std": input_amax_std,
+            "weight_amax_mean": weight_amax_mean,
+            "amax_counter": amax_counter,
         }
 
 
@@ -329,7 +349,7 @@ class FP8PerChannelBenchmark:
         )
         
         # Copy weights for fair comparison
-        with torch.no_grad():
+        with torch.inference_mode():
             self.per_tensor_linear.weight.copy_(self.fp32_linear.weight)
             self.per_channel_linear.weight.copy_(self.fp32_linear.weight)
             if self.fp32_linear.bias is not None:
@@ -346,11 +366,11 @@ class FP8PerChannelBenchmark:
         Uses weights with varying magnitudes across output channels to highlight
         per-channel benefits. Per-channel weight scaling adapts to each row's range.
         """
-        results = {"per_tensor": [], "per_channel": []}
+        error_sums = torch.zeros(2, device=self.device, dtype=torch.float32)
         
         # Create weights with varying magnitudes per output channel
         # This stresses per-tensor scaling (one scale for all) vs per-channel (one per row)
-        with torch.no_grad():
+        with torch.inference_mode():
             # Scale each output channel differently: some large, some small
             output_scales = torch.logspace(-1, 1, self.out_features, device=self.device)
             output_scales = output_scales[torch.randperm(self.out_features)]
@@ -366,7 +386,7 @@ class FP8PerChannelBenchmark:
                 device=self.device, dtype=self.dtype
             )
             
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Reference: FP32 with scaled weights
                 ref_output = torch.nn.functional.linear(x, scaled_weight, self.fp32_linear.bias)
                 pt_output = self.per_tensor_linear(x)
@@ -376,13 +396,17 @@ class FP8PerChannelBenchmark:
             ref_norm = ref_output.abs().mean()
             pt_error = (pt_output - ref_output).abs().mean() / ref_norm
             pc_error = (pc_output - ref_output).abs().mean() / ref_norm
-            
-            results["per_tensor"].append(pt_error.item())
-            results["per_channel"].append(pc_error.item())
+
+            error_sums[0].add_(pt_error.detach())
+            error_sums[1].add_(pc_error.detach())
+
+        error_totals_host = error_sums.detach().cpu()
+        pt_error_total = float(error_totals_host[0])
+        pc_error_total = float(error_totals_host[1])
         
         return {
-            "per_tensor_error_pct": 100 * sum(results["per_tensor"]) / len(results["per_tensor"]),
-            "per_channel_error_pct": 100 * sum(results["per_channel"]) / len(results["per_channel"]),
+            "per_tensor_error_pct": 100 * pt_error_total / num_samples,
+            "per_channel_error_pct": 100 * pc_error_total / num_samples,
         }
     
     def measure_throughput(
@@ -416,7 +440,7 @@ class FP8PerChannelBenchmark:
             for _ in range(num_iterations):
                 _ = layer(x)
             end.record()
-            torch.cuda.synchronize()
+            end.synchronize()
             
             elapsed_ms = start.elapsed_time(end) / num_iterations
             
@@ -454,6 +478,8 @@ class FP8PerChannelDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.output = None
         self._verify_input = None
         self._payload_verify_input = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._per_channel_linear: Optional[FP8PerChannelLinear] = None
         
         tokens = self.batch_size * self.seq_len
         self._workload = WorkloadMetadata(
@@ -472,6 +498,7 @@ class FP8PerChannelDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
             dtype=torch.float32,
             device=str(self.device),
         )
+        self._per_channel_linear = self.demo_benchmark.per_channel_linear
         self._verify_input = torch.randn(
             self.batch_size,
             self.seq_len,
@@ -480,26 +507,41 @@ class FP8PerChannelDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
             dtype=torch.float32,
         )
         self._payload_verify_input = self._verify_input.detach().clone()
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            min(128, self.seq_len),
+            self.out_features,
+            device=self.device,
+            dtype=torch.float32,
+        )
         # Warmup
         _ = self.demo_benchmark.measure_throughput(num_warmup=5, num_iterations=3)
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
         """Benchmark: Per-channel FP8 forward pass."""
-        if self.demo_benchmark is None or not hasattr(self.demo_benchmark, "per_channel_linear"):
+        per_channel_linear = self._per_channel_linear
+        if per_channel_linear is None:
             raise RuntimeError("Demo benchmark not initialized")
         if self._verify_input is None:
             raise RuntimeError("Verification input not initialized")
-        with torch.no_grad():
-            output = self.demo_benchmark.per_channel_linear(self._verify_input)
-            self._last = float(output.detach().sum())
-            self.output = output.detach().float().clone()
+        with torch.inference_mode():
+            output = per_channel_linear(self._verify_input)
+            self.output = output
 
     def capture_verification_payload(self) -> None:
         verify_input = self._payload_verify_input
+        if self.output is None or verify_input is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before verification capture")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            :,
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input": verify_input},
-            output=self.output,
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             precision_flags={
                 "fp16": False,
@@ -512,9 +554,12 @@ class FP8PerChannelDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def teardown(self) -> None:
         """Teardown: Clean up resources."""
+        self._per_channel_linear = None
         self.demo_benchmark = None
         self._verify_input = None
         self._payload_verify_input = None
+        self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -541,5 +586,3 @@ class FP8PerChannelDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> BaseBenchmark:
     """Factory function for benchmark discovery."""
     return FP8PerChannelDemoBenchmark()
-
-

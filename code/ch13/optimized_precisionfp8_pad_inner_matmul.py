@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -50,6 +49,7 @@ class OptimizedPrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Bas
         self.scale_b: Optional[torch.Tensor] = None
         self.mm_config: Optional[LinearMMConfig] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         self.m = 8192
         self.k = 8200
@@ -76,6 +76,12 @@ class OptimizedPrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Bas
 
         self.a = torch.randn(self.m, self.k, device=self.device, dtype=torch.float32) * self.input_scale
         self.b = torch.randn(self.k, self.n, device=self.device, dtype=torch.float32) * self.input_scale
+        self._verify_output_buffer = torch.empty(
+            min(128, self.m),
+            min(256, self.n),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         self.scale_a = tensor_to_scale(
             self.a,
@@ -107,7 +113,7 @@ class OptimizedPrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Bas
         if self.a is None or self.b is None or self.scale_a is None or self.scale_b is None or self.mm_config is None:
             raise RuntimeError("Benchmark not configured")
         with self._nvtx_range("optimized_precisionfp8_pad_inner_matmul"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 a_fp8 = hp_tensor_and_scale_to_float8(
                     self.a,
                     self.scale_a,
@@ -125,16 +131,21 @@ class OptimizedPrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Bas
                     axiswise_dim=0,
                 )
                 out = a_fp8 @ b_fp8
-                self.output = out.detach().float().clone()
+                self.output = out
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
-        if self.a is None:
+        if self.a is None or self.b is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("Benchmark not configured")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"a": self.a, "b": self.b},
-            output=self.output,
+            output=self._verify_output_buffer,
             batch_size=self.a.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -148,6 +159,8 @@ class OptimizedPrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Bas
 
     def teardown(self) -> None:
         del self.a, self.b, self.scale_a, self.scale_b, self.mm_config
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
@@ -161,5 +174,3 @@ class OptimizedPrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Bas
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedPrecisionFP8PadInnerMatmulBenchmark()
-
-

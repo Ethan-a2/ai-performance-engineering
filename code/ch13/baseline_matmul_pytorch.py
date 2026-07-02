@@ -25,6 +25,23 @@ from core.harness.benchmark_harness import (
 resolve_device = partial(require_cuda_device, "CUDA required for ch13")
 
 
+def baseline_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    bias: torch.Tensor,
+    residual: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Keep the baseline epilogue unfused while reusing the preallocated output."""
+    torch.mm(A, B, out=out)
+    out.add_(bias)
+    torch.relu_(out)
+    out.add_(residual)
+    out.mul_(scale)
+    return out
+
+
 class BaselineMatmulPyTorchBenchmark(VerificationPayloadMixin, BaseBenchmark):
     """PyTorch matmul baseline - sequential unfused operations."""
 
@@ -36,6 +53,7 @@ class BaselineMatmulPyTorchBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.A = None
         self.B = None
         self.C = None
+        self._verify_output_buffer = None
         self.bias = None
         self.residual = None
         self.scale = 0.125
@@ -64,28 +82,35 @@ class BaselineMatmulPyTorchBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.A = torch.randn(self.m, self.k, device=self.device, dtype=torch.float16)
         self.B = torch.randn(self.k, self.n, device=self.device, dtype=torch.float16)
         self.C = torch.empty(self.m, self.n, device=self.device, dtype=torch.float16)
+        self._verify_output_buffer = torch.empty_like(self.C)
         self.bias = torch.randn(self.m, self.n, device=self.device, dtype=torch.float16)
         self.residual = torch.randn(self.m, self.n, device=self.device, dtype=torch.float16)
         
         # Warmup
-        out = torch.matmul(self.A, self.B)
-        out = torch.relu(out + self.bias)
-        out = (out + self.residual) * self.scale
+        baseline_matmul(self.A, self.B, self.bias, self.residual, self.C, self.scale)
         self._synchronize()
     
     def benchmark_fn(self) -> None:
         """Function to benchmark - PyTorch matmul."""
-        assert self.A is not None and self.B is not None and self.bias is not None and self.residual is not None
-        with self._nvtx_range("baseline_matmul_pytorch"):
+        assert self.A is not None and self.B is not None and self.bias is not None and self.residual is not None and self.C is not None
+        with torch.inference_mode(), self._nvtx_range("baseline_matmul_pytorch"):
             # Standard PyTorch matrix multiplication
-            out = torch.matmul(self.A, self.B)
-            out = torch.relu(out + self.bias)
-            self.C = (out + self.residual) * self.scale
+            self.C = baseline_matmul(
+                self.A,
+                self.B,
+                self.bias,
+                self.residual,
+                self.C,
+                self.scale,
+            )
 
     def capture_verification_payload(self) -> None:
+        if self.C is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.C)
         self._set_verification_payload(
             inputs={"A": self.A, "B": self.B, "bias": self.bias, "residual": self.residual},
-            output=self.C.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.m,
             parameter_count=0,
             precision_flags={
@@ -99,6 +124,7 @@ class BaselineMatmulPyTorchBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         """Cleanup."""
         del self.A, self.B, self.C, self.bias, self.residual
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

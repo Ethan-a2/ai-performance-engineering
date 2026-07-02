@@ -27,7 +27,7 @@ class FullDepthModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            x = torch.relu(layer(x))
+            x = torch.relu_(layer(x))
         return self.head(x)
 
 
@@ -62,6 +62,7 @@ class OptimizedInferenceFullBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def __init__(self):
         super().__init__()
         self.model: Optional[nn.Module] = None
+        self._early_exit_layers: list[nn.Module] = []
         self.inputs: Optional[torch.Tensor] = None
         self.batch_size = 16
         self.hidden_dim = 2048
@@ -92,7 +93,7 @@ class OptimizedInferenceFullBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model.eval()
         self.parameter_count = sum(p.numel() for p in self.model.parameters())
 
-        with torch.no_grad():
+        with torch.inference_mode():
             dtype = next(self.model.parameters()).dtype
             eye = torch.eye(self.hidden_dim, device=self.device, dtype=dtype)
             for layer in self.model.layers[self.identity_start_layer :]:
@@ -101,15 +102,16 @@ class OptimizedInferenceFullBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
         input_dtype = next(self.model.parameters()).dtype
         self.inputs = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=input_dtype)
+        self._early_exit_layers = list(self.model.layers[: self.exit_layer])
 
     def benchmark_fn(self) -> None:
         assert self.model is not None and self.inputs is not None
 
         with self._nvtx_range("inference_full_comparison_early_exit"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 x = self.inputs
-                for layer in self.model.layers[: self.exit_layer]:
-                    x = torch.relu(layer(x))
+                for layer in self._early_exit_layers:
+                    x = torch.relu_(layer(x))
                 self.output = self.model.head(x)
         if self.output is None or self.inputs is None:
             raise RuntimeError("benchmark_fn() must produce output")
@@ -134,6 +136,7 @@ class OptimizedInferenceFullBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def teardown(self) -> None:
         self.model = None
+        self._early_exit_layers = []
         self.inputs = None
         super().teardown()
 

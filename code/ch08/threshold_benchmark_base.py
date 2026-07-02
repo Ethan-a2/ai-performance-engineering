@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.benchmark.utils import scalar_tensor_to_float
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
 from core.utils.extension_loader_template import load_cuda_extension
 
@@ -29,6 +30,7 @@ class ThresholdBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         self.outputs: Optional[torch.Tensor] = None
         self.host_inputs: Optional[torch.Tensor] = None
         self.extension = None
+        self._inner_iteration_range = range(self.inner_iterations)
         self.register_workload_metadata(requests_per_iteration=float(self.inner_iterations))
 
     def _resolve_device(self) -> torch.device:
@@ -55,12 +57,8 @@ class ThresholdBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        with nvtx_range(self.nvtx_label, enable=enable_nvtx):
-            for _ in range(self.inner_iterations):
+        with torch.inference_mode(), self._nvtx_range(self.nvtx_label):
+            for _ in self._inner_iteration_range:
                 self._invoke_kernel()
         if self.inputs is None or self.outputs is None:
             raise RuntimeError("benchmark_fn() must run after setup() initializes tensors")
@@ -98,17 +96,12 @@ class ThresholdBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         active = abs_inputs > self.threshold
         outer = abs_inputs > (self.threshold * THRESHOLD_SECONDARY_SCALE)
 
-        inner_scale = torch.full_like(self.inputs, THRESHOLD_INNER_SCALE)
-        outer_scale = torch.full_like(self.inputs, THRESHOLD_OUTER_SCALE)
-        scale = torch.where(outer, outer_scale, inner_scale)
-        signed_scale = torch.where(self.inputs >= 0, scale, -scale)
-        reference = torch.where(
-            active,
-            magnitude * signed_scale,
-            torch.zeros_like(self.inputs),
-        )
+        scale = torch.where(outer, THRESHOLD_OUTER_SCALE, THRESHOLD_INNER_SCALE)
+        reference = magnitude * scale
+        reference.copysign_(self.inputs)
+        reference.masked_fill_(active.logical_not_(), 0.0)
         torch.cuda.synchronize()
-        max_error = torch.max(torch.abs(reference - self.outputs)).item()
+        max_error = scalar_tensor_to_float(torch.max(torch.abs(reference - self.outputs)))
         if max_error > 5e-3:
             raise RuntimeError(
                 f"Threshold kernel validation failed (max error={max_error:.4f})"

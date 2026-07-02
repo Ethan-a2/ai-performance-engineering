@@ -128,17 +128,35 @@ def _run_worker(
         inputs = torch.randn(batch_size, seq_length, hidden, device=device, dtype=torch.bfloat16)
     else:
         inputs = None
+    recv_micro_batch: Optional[torch.Tensor] = None
+    if rank > 0:
+        recv_micro_batch = torch.empty(
+            micro_batch_size,
+            seq_length,
+            hidden,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+    recv_grad: Optional[torch.Tensor] = None
+    if rank < world_size - 1:
+        recv_grad = torch.empty(
+            micro_batch_size,
+            seq_length,
+            hidden,
+            device=device,
+            dtype=torch.bfloat16,
+        )
 
     def _forward(micro_batch: torch.Tensor) -> torch.Tensor:
         x = micro_batch
         for layer in fwd_layers:
-            x = torch.relu(layer(x))
+            x = torch.relu_(layer(x))
         return x
 
     def _backward(grad_in: torch.Tensor) -> torch.Tensor:
         x = grad_in
         for layer in bwd_layers:
-            x = torch.relu(layer(x))
+            x = torch.relu_(layer(x))
         return x
 
     def _run_iteration() -> None:
@@ -150,13 +168,9 @@ def _run_worker(
                 end_idx = start_idx + micro_batch_size
                 micro_batch = inputs[start_idx:end_idx]
             else:
-                micro_batch = torch.empty(
-                    micro_batch_size,
-                    seq_length,
-                    hidden,
-                    device=device,
-                    dtype=torch.bfloat16,
-                )
+                if recv_micro_batch is None:
+                    raise RuntimeError("recv microbatch buffer missing")
+                micro_batch = recv_micro_batch
                 dist.recv(micro_batch, src=rank - 1)
 
             out = _forward(micro_batch)
@@ -171,7 +185,9 @@ def _run_worker(
         for _ in range(num_micro_batches):
             activation = activations.pop()
             if rank < world_size - 1:
-                grad_in = torch.empty_like(activation)
+                if recv_grad is None:
+                    raise RuntimeError("recv grad buffer missing")
+                grad_in = recv_grad
                 dist.recv(grad_in, src=rank + 1)
                 torch.cuda.synchronize(device)
             else:
@@ -184,14 +200,15 @@ def _run_worker(
             # Mirror the forward-path sync to keep the baseline fully serialized.
             dist.barrier()
 
-    for _ in range(max(warmup, 0)):
-        _run_iteration()
-    torch.cuda.synchronize(device)
+    with torch.inference_mode():
+        for _ in range(max(warmup, 0)):
+            _run_iteration()
+        torch.cuda.synchronize(device)
 
-    start = time.perf_counter()
-    for _ in range(max(iters, 1)):
-        _run_iteration()
-    torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        for _ in range(max(iters, 1)):
+            _run_iteration()
+        torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
 
     if rank == 0:
@@ -248,8 +265,10 @@ class BaselinePipelineParallelBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self._fwd_layers: Optional[nn.ModuleList] = None
         self._bwd_layers: Optional[nn.ModuleList] = None
         self._input: Optional[torch.Tensor] = None
+        self._micro_batch: Optional[torch.Tensor] = None
         self._output: Optional[torch.Tensor] = None
         self._world_size = 1
+        self._world_size_range = range(self._world_size)
         self._num_layers = _DEFAULT_LAYERS
         self._batch_size = _DEFAULT_BATCH
         self._micro_batches = _DEFAULT_MICRO_BATCHES
@@ -258,6 +277,7 @@ class BaselinePipelineParallelBenchmark(VerificationPayloadMixin, BaseBenchmark)
     def setup(self) -> None:
         require_min_gpus(2, "baseline_pipeline_parallel_multigpu.py")
         self._world_size = torch.cuda.device_count()
+        self._world_size_range = range(self._world_size)
         self._num_layers = _resolve_num_layers(None, self._world_size)
         self._batch_size, self._micro_batches = _resolve_batch_config(None, None, self._world_size)
         self._layers_per_stage = self._num_layers // self._world_size
@@ -275,19 +295,23 @@ class BaselinePipelineParallelBenchmark(VerificationPayloadMixin, BaseBenchmark)
             device=self.device,
             dtype=torch.bfloat16,
         )
+        self._micro_batch = self._input.narrow(0, 0, self._batch_size // self._micro_batches)
 
     def benchmark_fn(self) -> None:
-        if self._input is None or self._fwd_layers is None or self._bwd_layers is None:
+        if (
+            self._input is None
+            or self._micro_batch is None
+            or self._fwd_layers is None
+            or self._bwd_layers is None
+        ):
             raise RuntimeError("setup() must run before benchmark_fn()")
-        micro_batch_size = self._batch_size // self._micro_batches
-        micro_batch = self._input[:micro_batch_size]
-        x = micro_batch
-        for _ in range(self._world_size):
+        x = self._micro_batch
+        for _ in self._world_size_range:
             for layer in self._fwd_layers:
-                x = torch.relu(layer(x))
-        for _ in range(self._world_size):
+                x = torch.relu_(layer(x))
+        for _ in self._world_size_range:
             for layer in self._bwd_layers:
-                x = torch.relu(layer(x))
+                x = torch.relu_(layer(x))
         self._output = x
 
     def capture_verification_payload(self) -> None:
@@ -329,6 +353,7 @@ class BaselinePipelineParallelBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self._fwd_layers = None
         self._bwd_layers = None
         self._input = None
+        self._micro_batch = None
         self._output = None
         torch.cuda.empty_cache()
 
@@ -363,4 +388,3 @@ class BaselinePipelineParallelBenchmark(VerificationPayloadMixin, BaseBenchmark)
 
 def get_benchmark() -> BaseBenchmark:
     return BaselinePipelineParallelBenchmark()
-

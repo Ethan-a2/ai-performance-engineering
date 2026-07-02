@@ -32,6 +32,7 @@ class OptimizedDecodeKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.cols = 1024
         self.input: Optional[torch.Tensor] = None
         self._output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._module: Optional[ModuleType] = None
         tokens = self.rows * self.cols
@@ -39,6 +40,7 @@ class OptimizedDecodeKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             requests_per_iteration=1.0,
             tokens_per_iteration=float(tokens),
         )
+        self._enable_nvtx = False
 
     def setup(self) -> None:
         import gc
@@ -78,6 +80,8 @@ class OptimizedDecodeKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         
         # Allocate contiguous tensors with explicit memory layout
         # TMA requires contiguous tensors with proper alignment
@@ -95,6 +99,7 @@ class OptimizedDecodeKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             dtype=torch.float32,
             device=self.device,
         ).contiguous()
+        self._verify_output_buffer = torch.empty_like(self._output_buffer)
         self.output = None
         
         torch.cuda.synchronize(self.device)
@@ -109,15 +114,17 @@ class OptimizedDecodeKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if self._module is None:
             raise RuntimeError("Optimized decode kernel module not initialized")
 
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        with nvtx_range("moe_cuda_decode_kernel_optimized", enable=enable_nvtx):
+        with torch.inference_mode(), nvtx_range("moe_cuda_decode_kernel_optimized", enable=self._enable_nvtx):
             self._module.run_optimized(self.input, self._output_buffer)
         self.output = self._output_buffer
 
     def capture_verification_payload(self) -> None:
+        if self.input is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self.input.detach()},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=1,
             parameter_count=0,
             precision_flags={"tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -128,6 +135,7 @@ class OptimizedDecodeKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.empty_cache()
         self.input = None
         self._output_buffer = None
+        self._verify_output_buffer = None
         self.output = None
         self._module = None
 

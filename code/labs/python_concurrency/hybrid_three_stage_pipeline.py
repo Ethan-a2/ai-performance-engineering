@@ -27,7 +27,6 @@ import asyncio
 import json
 import math
 import multiprocessing as mp
-import statistics
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
@@ -41,6 +40,32 @@ SUCCESS = "success"
 FAILED_STAGE_A = "failed_stage_a"
 FAILED_STAGE_B = "failed_stage_b"
 FAILED_STAGE_C = "failed_stage_c"
+
+
+def _total_latency_percentiles(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+
+    values.sort()
+    midpoint = len(values) // 2
+    if len(values) % 2:
+        p50 = values[midpoint]
+    else:
+        p50 = (values[midpoint - 1] + values[midpoint]) / 2.0
+    p95 = values[max(0, int(0.95 * len(values)) - 1)]
+    return round(p50, 2), round(p95, 2)
+
+
+def _count_whitespace_separated_tokens(text: str) -> int:
+    count = 0
+    in_token = False
+    for char in text:
+        if char.isspace():
+            in_token = False
+        elif not in_token:
+            count += 1
+            in_token = True
+    return count
 
 
 @dataclass(slots=True)
@@ -126,7 +151,7 @@ def cpu_parse_payload(payload: str, cpu_rounds: int) -> dict[str, Any]:
         checksum ^= (i << 1) & 0xFFFF
 
     transformed = payload.strip().upper()
-    token_count = len(transformed.split())
+    token_count = _count_whitespace_separated_tokens(transformed)
 
     return {
         "text": transformed,
@@ -443,13 +468,25 @@ def summarize(results: list[PipelineResult]) -> dict[str, Any]:
     """Create aggregate pipeline metrics."""
 
     total = len(results)
-    success = sum(1 for r in results if r.status == SUCCESS)
-    failed_a = sum(1 for r in results if r.status == FAILED_STAGE_A)
-    failed_b = sum(1 for r in results if r.status == FAILED_STAGE_B)
-    failed_c = sum(1 for r in results if r.status == FAILED_STAGE_C)
-
-    totals = [r.total_ms for r in results]
-    success_lat = [r.total_ms for r in results if r.status == SUCCESS]
+    success = 0
+    failed_a = 0
+    failed_b = 0
+    failed_c = 0
+    success_total_ms = 0.0
+    totals: list[float] = []
+    for result in results:
+        totals.append(result.total_ms)
+        if result.status == SUCCESS:
+            success += 1
+            success_total_ms += result.total_ms
+        elif result.status == FAILED_STAGE_A:
+            failed_a += 1
+        elif result.status == FAILED_STAGE_B:
+            failed_b += 1
+        elif result.status == FAILED_STAGE_C:
+            failed_c += 1
+    p50_total_ms, p95_total_ms = _total_latency_percentiles(totals)
+    mean_success_ms = round(success_total_ms / success, 2) if success else math.nan
 
     return {
         "total": total,
@@ -457,14 +494,9 @@ def summarize(results: list[PipelineResult]) -> dict[str, Any]:
         "failed_stage_a": failed_a,
         "failed_stage_b": failed_b,
         "failed_stage_c": failed_c,
-        "p50_total_ms": round(statistics.median(totals), 2) if totals else 0.0,
-        "p95_total_ms": round(
-            sorted(totals)[max(0, int(0.95 * len(totals)) - 1)],
-            2,
-        )
-        if totals
-        else 0.0,
-        "mean_success_ms": round(statistics.mean(success_lat), 2) if success_lat else math.nan,
+        "p50_total_ms": p50_total_ms,
+        "p95_total_ms": p95_total_ms,
+        "mean_success_ms": mean_success_ms,
     }
 
 

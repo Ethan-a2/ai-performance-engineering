@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import statistics
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -236,9 +235,26 @@ def percentile(values: list[float], p: float) -> float:
 
     if not values:
         return 0.0
-    ordered = sorted(values)
+    values.sort()
+    return _percentile_from_ordered(values, p)
+
+
+def _percentile_from_ordered(ordered: list[float], p: float) -> float:
     rank = max(0, min(len(ordered) - 1, int(round((p / 100.0) * (len(ordered) - 1)))))
     return ordered[rank]
+
+
+def _latency_percentiles(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+
+    values.sort()
+    midpoint = len(values) // 2
+    if len(values) % 2:
+        p50 = values[midpoint]
+    else:
+        p50 = (values[midpoint - 1] + values[midpoint]) / 2.0
+    return round(p50, 2), round(_percentile_from_ordered(values, 95.0), 2)
 
 
 async def run_pipeline(items: list[WorkItem], max_workers: int, timeout_ms: int, retries: int) -> list[ItemResult]:
@@ -295,18 +311,25 @@ async def run_pipeline(items: list[WorkItem], max_workers: int, timeout_ms: int,
 def summarize(results: list[ItemResult]) -> dict[str, Any]:
     """Build aggregate metrics for quick health/throughput review."""
 
-    latencies = [r.latency_ms for r in results]
-    success_count = sum(1 for r in results if r.ok)
+    latencies: list[float] = []
+    success_count = 0
+    timed_out_count = 0
+    for result in results:
+        latencies.append(result.latency_ms)
+        if result.ok:
+            success_count += 1
+        elif result.timed_out:
+            timed_out_count += 1
     fail_count = len(results) - success_count
-    timed_out_count = sum(1 for r in results if r.timed_out and not r.ok)
+    p50_ms, p95_ms = _latency_percentiles(latencies)
 
     return {
         "total": len(results),
         "success": success_count,
         "failed": fail_count,
         "timed_out": timed_out_count,
-        "p50_ms": round(statistics.median(latencies), 2) if latencies else 0.0,
-        "p95_ms": round(percentile(latencies, 95.0), 2),
+        "p50_ms": p50_ms,
+        "p95_ms": p95_ms,
     }
 
 

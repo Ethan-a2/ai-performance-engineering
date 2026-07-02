@@ -7,13 +7,23 @@ see the incremental benefit on Blackwell (B200).
 """
 
 import argparse
-import time
-from typing import Dict, Tuple
+from typing import Callable, Dict, Tuple
 
 import torch
 
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine, KVCache
+
+
+def _time_cuda_region_seconds(fn: Callable[[], None]) -> float:
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
+    start.record(current_stream)
+    fn()
+    end.record(current_stream)
+    end.synchronize()
+    return start.elapsed_time(end) / 1000.0
 
 
 def configure_mode(mode: str, config) -> Dict[str, bool]:
@@ -97,26 +107,25 @@ def bench_once(
     prompt = torch.randint(0, cfg.vocab_size, (batch_size, prompt_len), device=device, dtype=torch.long)
 
     # Prefill
-    torch.cuda.synchronize()
-    t0 = time.time()
-    _ = model(prompt, kv_cache=kv_cache)
-    torch.cuda.synchronize()
-    t1 = time.time()
-    prefill_tok_s = (batch_size * prompt_len) / (t1 - t0)
+    prefill_seconds = _time_cuda_region_seconds(lambda: model(prompt, kv_cache=kv_cache))
+    prefill_tok_s = (batch_size * prompt_len) / prefill_seconds
 
     # Decode steady-state (T=1)
     decode_tokens = torch.randint(0, cfg.vocab_size, (batch_size, decode_len), device=device, dtype=torch.long)
-    torch.cuda.synchronize()
-    t2 = time.time()
-    for t in range(decode_len):
-        step_ids = decode_tokens[:, t:t+1]
-        if engine is None:
-            _ = model(step_ids, kv_cache=kv_cache)
-        else:
-            _ = engine._execute_decode(step_ids, kv_cache)
-    torch.cuda.synchronize()
-    t3 = time.time()
-    decode_tok_s = (batch_size * decode_len) / (t3 - t2)
+    decode_token_steps = tuple(
+        decode_tokens[:, t:t + 1]
+        for t in range(decode_len)
+    )
+
+    def _run_decode() -> None:
+        for step_ids in decode_token_steps:
+            if engine is None:
+                _ = model(step_ids, kv_cache=kv_cache)
+            else:
+                _ = engine._execute_decode(step_ids, kv_cache)
+
+    decode_seconds = _time_cuda_region_seconds(_run_decode)
+    decode_tok_s = (batch_size * decode_len) / decode_seconds
     return prefill_tok_s, decode_tok_s
 
 
@@ -134,8 +143,8 @@ def run_benchmark(args):
             engine = Engine(model, tokenizer, enable_batch_decode=False)
         # Warmup
         _ = bench_once(model, args.batch_size, args.prompt_len, args.decode_len, device, engine=engine)
-        prefill_accum = []
-        decode_accum = []
+        prefill_total = 0.0
+        decode_total = 0.0
         for _ in range(args.iters):
             prefill_tok_s, decode_tok_s = bench_once(
                 model,
@@ -145,14 +154,14 @@ def run_benchmark(args):
                 device,
                 engine=engine,
             )
-            prefill_accum.append(prefill_tok_s)
-            decode_accum.append(decode_tok_s)
+            prefill_total += prefill_tok_s
+            decode_total += decode_tok_s
         results.append(
             dict(
                 mode=mode,
                 enabled=enabled,
-                prefill_tok_s=sum(prefill_accum) / len(prefill_accum),
-                decode_tok_s=sum(decode_accum) / len(decode_accum),
+                prefill_tok_s=prefill_total / args.iters,
+                decode_tok_s=decode_total / args.iters,
             )
         )
     return results

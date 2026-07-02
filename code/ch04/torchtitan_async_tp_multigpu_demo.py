@@ -26,8 +26,6 @@ Async-TP currently requires:
   * torch.compile mode that includes the model ("max-autotune" by default below).
 """
 
-import os
-
 from core.common.device_utils import resolve_local_rank
 
 from ch04.distributed_helper import run_main_with_skip_status, setup_single_gpu_env
@@ -159,10 +157,9 @@ def main() -> None:
     compiled_model = torch.compile(model, mode=args.compile_mode)
 
     optimizer = torch.optim.AdamW(compiled_model.parameters(), lr=3e-4, fused=True)
-    loss_fn = torch.nn.MSELoss()
 
     x = torch.randn(args.batch_size, args.hidden_dim, device=device)
-    target = torch.zeros_like(x)
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -172,7 +169,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
 
         out = compiled_model(x)
-        loss = loss_fn(out, target)
+        loss = out.square().mean()
         loss.backward()
         optimizer.step()
 
@@ -180,8 +177,10 @@ def main() -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000
 
         if dist.get_rank() == 0:
+            loss_value_buffer[0].copy_(loss.detach())
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
             print(
-                f"[step {step:02d}] loss={loss.item():.5f} "
+                f"[step {step:02d}] loss={loss_value:.5f} "
                 f"(Async-TP micro-pipelined step took {elapsed_ms:.2f} ms)"
             )
 

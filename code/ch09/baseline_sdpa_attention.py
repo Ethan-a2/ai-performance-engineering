@@ -68,8 +68,11 @@ class BaselineSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         self.query = None
         self.key = None
+        self._key_t = None
         self.value = None
         self.output = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._scale = 0.0
         
         # SDPA benchmark - fixed dimensions for attention comparison
         
@@ -89,23 +92,25 @@ class BaselineSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.query = torch.randn(shape, device=self.device, dtype=torch.float16)
         self.key = torch.randn(shape, device=self.device, dtype=torch.float16)
         self.value = torch.randn(shape, device=self.device, dtype=torch.float16)
+        self._key_t = self.key.transpose(-2, -1)
+        self._verify_output_buffer = torch.empty_like(self.query)
+        self._scale = 1.0 / (self.head_dim ** 0.5)
         
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
         """Naive attention: 3 separate kernels, 2 HBM round-trips."""
         with self._nvtx_range("baseline_sdpa_attention"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Kernel 1: Q @ K^T -> attn_scores (written to HBM)
                 # Shape: [B, H, S, D] @ [B, H, D, S] -> [B, H, S, S]
                 attn_scores = torch.matmul(
                     self.query, 
-                    self.key.transpose(-2, -1)
+                    self._key_t
                 )
                 
                 # Scale (fused with matmul in optimized version)
-                scale = 1.0 / (self.head_dim ** 0.5)
-                attn_scores = attn_scores * scale
+                attn_scores.mul_(self._scale)
                 
                 # Kernel 2: Softmax (reads attn_scores from HBM, writes back)
                 attn_weights = F.softmax(attn_scores, dim=-1)
@@ -118,13 +123,16 @@ class BaselineSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output before verification")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "query": self.query,
                 "key": self.key,
                 "value": self.value,
             },
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             parameter_count=0,
             precision_flags={
@@ -139,7 +147,10 @@ class BaselineSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.query = None
         self.key = None
+        self._key_t = None
         self.value = None
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
@@ -180,4 +191,3 @@ class BaselineSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineSDPAAttentionBenchmark()
-

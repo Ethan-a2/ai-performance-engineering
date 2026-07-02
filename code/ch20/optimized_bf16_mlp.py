@@ -17,7 +17,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
@@ -37,11 +36,13 @@ class OptimizedModel(nn.Module):
     def forward(self, x):
         # Keep math identical to the baseline so verification is meaningful.
         x = self.fc1(x)
-        x = torch.relu(x)
+        x = torch.relu_(x)
         x = self.fc2(x)
-        x = torch.relu(x)
+        x = torch.relu_(x)
         x = self.fc3(x)
-        x = x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        norm = x.norm(dim=-1, keepdim=True)
+        norm.clamp_(min=1e-8)
+        x.div_(norm)
         return x
 
 
@@ -58,6 +59,8 @@ class OptimizedBF16MLPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._x_model_dtype: Optional[torch.Tensor] = None
         self._model_dtype: Optional[torch.dtype] = None
         self.output: Optional[torch.Tensor] = None
+        self._materialization_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.batch_size = 128
         self.hidden_dim = 2048  # Match baseline
         tokens = self.batch_size * self.hidden_dim
@@ -65,6 +68,8 @@ class OptimizedBF16MLPBenchmark(VerificationPayloadMixin, BaseBenchmark):
             requests_per_iteration=float(self.batch_size),
             tokens_per_iteration=float(tokens),
         )
+        self._payload_parameter_count = 0
+        self._verification_payload = None
     
     def setup(self) -> None:
         torch.manual_seed(42)
@@ -74,13 +79,16 @@ class OptimizedBF16MLPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._verification_payload = None
         self._model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         self.model = OptimizedModel(hidden_dim=self.hidden_dim).to(self.device, dtype=self._model_dtype).eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         self.x = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float32)
         self._refresh_model_input()
         self.output = None
+        self._materialization_buffer = torch.empty((), device=self.device, dtype=self._model_dtype)
+        self._verify_output_buffer = torch.empty_like(self.x, dtype=torch.float32)
         
         # Warmup
         for _ in range(10):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self._x_model_dtype)
 
     def _refresh_model_input(self) -> None:
@@ -90,23 +98,30 @@ class OptimizedBF16MLPBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def benchmark_fn(self) -> None:
         assert self.model is not None and self.x is not None and self._x_model_dtype is not None
+        assert self._materialization_buffer is not None
 
-        if getattr(self, "_verification_payload", None) is not None:
+        if self._verification_payload is not None:
             self._refresh_model_input()
 
         with self._nvtx_range("multiple_techniques_optimized"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Optimization: Single forward pass (no redundant compute)
                 self.output = self.model(self._x_model_dtype)
-                _ = self.output.sum()  # Force materialization
+                torch.sum(self.output, dim=(0, 1), out=self._materialization_buffer)
 
     def capture_verification_payload(self) -> None:
-        assert self.model is not None and self.x is not None and self.output is not None
+        assert (
+            self.model is not None
+            and self.x is not None
+            and self.output is not None
+            and self._verify_output_buffer is not None
+        )
+        self._verify_output_buffer.copy_(self.output, non_blocking=False)
         self._set_verification_payload(
             inputs={"x": self.x},
-            output=self.output.float(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(0.5, 6.0),
             precision_flags={
                 "fp16": False,
@@ -121,6 +136,8 @@ class OptimizedBF16MLPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.x = None
         self._x_model_dtype = None
         self._model_dtype = None
+        self._materialization_buffer = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:

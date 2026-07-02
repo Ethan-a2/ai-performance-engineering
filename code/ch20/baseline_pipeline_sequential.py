@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from functools import partial
+from typing import Optional
+
 import torch
 import torch.nn as nn
-
-
-from typing import Optional
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.common.device_utils import require_cuda_device
@@ -16,6 +15,7 @@ from core.harness.benchmark_harness import (
     BenchmarkConfig,
     WorkloadMetadata,
 )
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 resolve_device = partial(require_cuda_device, "CUDA required for ch20")
 
@@ -46,12 +46,21 @@ class BaselinePipelineSequentialBenchmark(VerificationPayloadMixin, BaseBenchmar
         self.stages = None
         self.inputs = None
         self.output = None
+        self.microbatches: Optional[list[torch.Tensor]] = None
+        self._microbatch_groups: list[tuple[int, torch.Tensor]] = []
+        self._last_outputs: Optional[list[torch.Tensor]] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._last_output_count: int = 0
         self.batch_size = 512
         self.hidden_dim = 1536
         self.num_stages = 4
         self.repeats = 6
+        self._repeat_range = range(self.repeats)
         self.num_microbatches = 8
         self.register_workload_metadata(requests_per_iteration=float(self.batch_size))
+        self._payload_parameter_count = 0
+        self._enable_nvtx = False
     
     def get_workload_metadata(self) -> Optional[WorkloadMetadata]:
         """Describe workload units processed per iteration."""
@@ -81,48 +90,75 @@ class BaselinePipelineSequentialBenchmark(VerificationPayloadMixin, BaseBenchmar
             SimpleStage(self.hidden_dim).to(self.device).half()
             for _ in range(self.num_stages)
         ]).eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.stages.parameters())
         
         self.inputs = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float16)
+        self.microbatches = [chunk.contiguous() for chunk in self.inputs.chunk(self.num_microbatches, dim=0)]
+        self._microbatch_groups = list(enumerate(self.microbatches))
+        self._output_buffer = torch.empty_like(self.inputs)
+        self._verify_output_buffer = torch.empty_like(self._output_buffer, dtype=torch.float32)
+        self._last_outputs = [
+            torch.empty(0, device=self.device, dtype=torch.float16)
+            for _ in range(self.num_microbatches)
+        ]
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
+        self._repeat_range = range(self.repeats)
     
-    def _run_pipeline_once(self, microbatches: list[torch.Tensor]) -> list[torch.Tensor]:
-        assert self.stages is not None
-        outputs: list[torch.Tensor] = []
-        for microbatch in microbatches:
+    def _run_pipeline_once(self) -> list[torch.Tensor]:
+        assert self.stages is not None and self._last_outputs is not None
+        if len(self._microbatch_groups) != self.num_microbatches:
+            raise RuntimeError("Microbatch schedule not initialized")
+        for microbatch_idx, microbatch in self._microbatch_groups:
             x = microbatch
             for stage in self.stages:
                 x = stage(x)
-            outputs.append(x)
-        return outputs
+            self._last_outputs[microbatch_idx] = x
+        self._last_output_count = len(self._microbatch_groups)
+        return self._last_outputs
 
     def benchmark_fn(self) -> None:
         """Benchmark the GPU-native sequential microbatch pipeline."""
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
+        assert self.inputs is not None and self.stages is not None and self.microbatches is not None
 
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        assert self.inputs is not None and self.stages is not None
-        base_microbatches = [chunk.contiguous() for chunk in self.inputs.chunk(self.num_microbatches, dim=0)]
-
-        with nvtx_range("baseline_pipeline_sequential", enable=enable_nvtx):
-            with torch.no_grad():
-                for _ in range(self.repeats):
-                    outputs = self._run_pipeline_once(base_microbatches)
-                self.output = torch.cat([out.detach() for out in outputs], dim=0)
+        with nvtx_range("baseline_pipeline_sequential", enable=self._enable_nvtx):
+            with torch.inference_mode():
+                for _ in self._repeat_range:
+                    self._run_pipeline_once()
 
     def capture_verification_payload(self) -> None:
-        if self.inputs is None or self.output is None or self.stages is None:
+        if (
+            self.inputs is None
+            or self._last_outputs is None
+            or self._output_buffer is None
+            or self._verify_output_buffer is None
+            or self.stages is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
+        if self._last_output_count != len(self._last_outputs):
+            raise RuntimeError("Incomplete pipeline outputs before verification capture")
+        torch.cat(self._last_outputs, dim=0, out=self._output_buffer)
+        self.output = self._output_buffer.detach()
+        self._verify_output_buffer.copy_(self.output, non_blocking=False)
         self._set_verification_payload(
             inputs={"inputs": self.inputs},
-            output=self.output.float(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.stages.parameters()) if self.stages is not None else 0,
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(0.1, 1.0),
         )
     
     def teardown(self) -> None:
         """Cleanup."""
-        del self.stages, self.inputs
+        self.stages = None
+        self.inputs = None
+        self.output = None
+        self.microbatches = None
+        self._microbatch_groups = []
+        self._last_outputs = None
+        self._output_buffer = None
+        self._verify_output_buffer = None
+        self._last_output_count = 0
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:

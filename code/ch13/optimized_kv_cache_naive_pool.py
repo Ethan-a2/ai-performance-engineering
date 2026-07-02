@@ -14,9 +14,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from ch13.kv_cache_workload import get_workload
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
-from ch13.kv_cache_workload import get_workload
 
 WORKLOAD = get_workload()
 
@@ -103,14 +103,44 @@ class SimpleAttentionLayer(nn.Module):
         super().__init__()
         self.output = None
         self._verify_input = None
+        self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.qkv = nn.Linear(hidden_dim, hidden_dim * 3, dtype=dtype)
         self.proj = nn.Linear(hidden_dim, hidden_dim, dtype=dtype)
+        self._qkv_buffer: Optional[torch.Tensor] = None
+        self._qkv_weight_t: Optional[torch.Tensor] = None
+
+    def prepare_inference(self) -> None:
+        self._qkv_weight_t = self.qkv.weight.t()
+
+    def _qkv_buffer_for(self, x: torch.Tensor) -> torch.Tensor:
+        rows = int(x.size(0) * x.size(1))
+        width = self.hidden_dim * 3
+        if (
+            self._qkv_buffer is None
+            or self._qkv_buffer.device != x.device
+            or self._qkv_buffer.dtype != x.dtype
+            or self._qkv_buffer.size(0) < rows
+        ):
+            self._qkv_buffer = torch.empty(rows, width, device=x.device, dtype=x.dtype)
+        return self._qkv_buffer[:rows]
+
+    def _project_qkv(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            return self.qkv(x)
+        if self._qkv_weight_t is None:
+            self.prepare_inference()
+        x_2d = x.reshape(x.size(0) * x.size(1), self.hidden_dim)
+        qkv_2d = self._qkv_buffer_for(x)
+        qkv = torch.matmul(x_2d, self._qkv_weight_t, out=qkv_2d)
+        if self.qkv.bias is not None:
+            qkv.add_(self.qkv.bias)
+        return qkv.view(x.size(0), x.size(1), self.hidden_dim * 3)
     
     def forward(self, x: torch.Tensor, kv_cache: OptimizedKVCache, request_id: str, layer_idx: int, cache_pos: int) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = x.shape
-        qkv = self.qkv(x)
+        qkv = self._project_qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -123,7 +153,11 @@ class SimpleAttentionLayer(nn.Module):
         cached_k, cached_v = kv_cache.get(request_id, layer_idx, 0, cache_pos + 1)
 
         out = torch.nn.functional.scaled_dot_product_attention(q, cached_k, cached_v, dropout_p=0.0, is_causal=False)
-        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_dim)
+        out = out.transpose(1, 2)
+        if seq_len == 1:
+            out = out.view(batch_size, seq_len, hidden_dim)
+        else:
+            out = out.contiguous().view(batch_size, seq_len, hidden_dim)
         return self.proj(out)
 
 
@@ -135,8 +169,17 @@ class OptimizedKVCacheNaivePoolBenchmark(VerificationPayloadMixin, BaseBenchmark
         self.model: Optional[nn.Module] = None
         self.kv_cache: Optional[OptimizedKVCache] = None
         self.inputs: Optional[list[torch.Tensor]] = None
+        self._input_count = 0
+        self._request_ids: list[str] = []
+        self._input_token_views: list[list[torch.Tensor]] = []
+        self._input_token_steps: list[list[tuple[int, torch.Tensor]]] = []
+        self._request_token_groups: list[tuple[str, list[tuple[int, torch.Tensor]]]] = []
+        self._request_group_counts: tuple[int, int, int] = (0, 0, 0)
+        self._expected_request_group_counts: tuple[int, int, int] = (0, 0, 0)
+        self._layer_groups: list[tuple[int, nn.Module]] = []
         self.output: Optional[torch.Tensor] = None
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.workload = WORKLOAD
         self.num_layers = self.workload.num_layers
         self.num_heads = self.workload.num_heads
@@ -167,6 +210,9 @@ class OptimizedKVCacheNaivePoolBenchmark(VerificationPayloadMixin, BaseBenchmark
                 for _ in range(self.num_layers)
             ]
         ).to(self.device).eval()
+        for layer in self.model:
+            layer.prepare_inference()
+        self._layer_groups = list(enumerate(self.model))
         self.parameter_count = sum(p.numel() for p in self.model.parameters())
         
         self.kv_cache = OptimizedKVCache(
@@ -183,6 +229,34 @@ class OptimizedKVCacheNaivePoolBenchmark(VerificationPayloadMixin, BaseBenchmark
         for seq_len in self.sequence_lengths:
             x = torch.randn(self.batch_size, seq_len, self.hidden_dim, device=self.device, dtype=self.workload.dtype)
             self.inputs.append(x)
+        self._input_count = len(self.inputs)
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            1,
+            self.hidden_dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._request_ids = [f"req_{seq_idx}" for seq_idx in range(len(self.inputs))]
+        self._input_token_views = [
+            list(x.split(1, dim=1))
+            for x in self.inputs
+        ]
+        self._input_token_steps = [
+            list(enumerate(token_views))
+            for token_views in self._input_token_views
+        ]
+        self._request_token_groups = list(zip(self._request_ids, self._input_token_steps, strict=True))
+        self._request_group_counts = (
+            len(self._request_ids),
+            len(self._input_token_views),
+            len(self._request_token_groups),
+        )
+        self._expected_request_group_counts = (
+            self._input_count,
+            self._input_count,
+            self._input_count,
+        )
         if self.inputs:
             self._verify_input = self.inputs[0].detach().clone()
         
@@ -191,29 +265,34 @@ class OptimizedKVCacheNaivePoolBenchmark(VerificationPayloadMixin, BaseBenchmark
     def benchmark_fn(self) -> None:
         if self.model is None or self.kv_cache is None or self.inputs is None:
             raise RuntimeError("Benchmark not configured")
+        if self._request_group_counts != self._expected_request_group_counts:
+            raise RuntimeError("Request token groups not initialized")
+        if not self._layer_groups:
+            raise RuntimeError("Layer groups not initialized")
 
-        with self._nvtx_range("kv_cache_naive_pool"):
-            for seq_idx, x in enumerate(self.inputs):
-                request_id = f"req_{seq_idx}"
-                seq_len = x.size(1)
+        with torch.inference_mode(), self._nvtx_range("kv_cache_naive_pool"):
+            for request_id, token_steps in self._request_token_groups:
                 self.kv_cache.allocate(request_id)
 
-                for pos in range(seq_len):
-                    token = x[:, pos:pos+1, :]
-                    hidden = token
-                    for layer_idx, layer in enumerate(self.model):
+                for pos, token_view in token_steps:
+                    hidden = token_view
+                    for layer_idx, layer in self._layer_groups:
                         hidden = layer(hidden, self.kv_cache, request_id, layer_idx, pos)
 
                 self.kv_cache.free(request_id)
         # Capture output from the final forward for verification
-        self.output = hidden.detach().clone()
+        self.output = hidden
         if self._verify_input is None:
             raise RuntimeError("Verification input not initialized")
 
     def capture_verification_payload(self) -> None:
+        if self._verify_input is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("Verification input/output not initialized")
+        with torch.inference_mode():
+            self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.float(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -229,6 +308,17 @@ class OptimizedKVCacheNaivePoolBenchmark(VerificationPayloadMixin, BaseBenchmark
         self.model = None
         self.kv_cache = None
         self.inputs = None
+        self._input_count = 0
+        self._request_ids = []
+        self._input_token_views = []
+        self._input_token_steps = []
+        self._request_token_groups = []
+        self._request_group_counts = (0, 0, 0)
+        self._expected_request_group_counts = (0, 0, 0)
+        self._layer_groups = []
+        self.output = None
+        self._verify_input = None
+        self._verify_output_buffer = None
         super().teardown()
     
     def get_config(self) -> BenchmarkConfig:

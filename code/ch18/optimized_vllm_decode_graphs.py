@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Dict, Iterable, Tuple, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 # Workaround for importlib.util.spec_from_file_location loading:
 # Register this module in sys.modules so @dataclass works correctly
@@ -28,9 +28,9 @@ except ImportError as exc:
         "Ensure the benchmark is executed from repo root with `ch18` on PYTHONPATH."
     ) from exc
 
-from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig  # noqa: E402
-from core.benchmark.verification_mixin import VerificationPayloadMixin
 from ch18.decode_kernels import DEVICE, build_decode_kernel  # noqa: E402
+from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig  # noqa: E402
 
 # Keep a moderately coarse bucket set that limits padding overhead while still
 # reducing shape churn relative to the ragged baseline.
@@ -46,17 +46,6 @@ def pick_bucket(size: int) -> int:
     return BUCKETS[-1]
 
 
-def pad_to_bucket(tensor: torch.Tensor, bucket: int) -> Tuple[torch.Tensor, torch.Tensor | None]:
-    """Pad to the bucket size and return a mask for the real rows."""
-    if tensor.size(0) == bucket:
-        return tensor, None
-    pad = bucket - tensor.size(0)
-    padding = torch.empty((pad, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
-    mask = torch.ones(bucket, dtype=torch.bool, device=tensor.device)
-    mask[tensor.size(0) :] = False
-    return torch.cat([tensor, padding], dim=0), mask
-
-
 @dataclass
 class BucketWorkspace:
     batch: int
@@ -65,7 +54,6 @@ class BucketWorkspace:
     tokens_kv: torch.Tensor | None = None
     tokens: torch.Tensor | None = None
     kv: torch.Tensor | None = None
-    mask: torch.Tensor | None = None
     logits: torch.Tensor | None = None
     tmp: torch.Tensor | None = None
     stream: torch.cuda.Stream | None = None
@@ -79,7 +67,6 @@ class BucketWorkspace:
         self.tokens_kv = torch.empty((2, self.batch, self.hidden), device=self.device, dtype=dtype)
         self.tokens = self.tokens_kv[0]
         self.kv = self.tokens_kv[1]
-        self.mask = torch.ones(self.batch, dtype=torch.bool, device=self.device)
         # Populate once and reuse to avoid per-step RNG overhead in the optimized path.
         self.tokens_kv.normal_(mean=0.0, std=1.0)
         if torch.cuda.is_available():
@@ -95,13 +82,12 @@ class BucketWorkspace:
 
     @property
     def bytes(self) -> int:
-        if self.logits is None or self.tmp is None or self.tokens is None or self.kv is None or self.mask is None:
+        if self.logits is None or self.tmp is None or self.tokens is None or self.kv is None:
             return 0
         return (
             (self.logits.numel() + self.tmp.numel()) * self.logits.element_size()
             + self.tokens.numel() * self.tokens.element_size()
             + self.kv.numel() * self.kv.element_size()
-            + self.mask.numel() * self.mask.element_size()
         )
 
 
@@ -157,6 +143,9 @@ class OptimizedDecodeDriver:
         self.workspaces: Dict[int, BucketWorkspace] = {}
         self.captured_shapes: set[Tuple[int, int]] = set()
         self._vllm_kernel = self._resolve_vllm_kernel()
+        self._seq_lens_profiles: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._trace_schedule: list[Tuple[int, BucketWorkspace, Optional[torch.Tensor]]] = []
+        self._prepare_trace_schedule()
 
     def _resolve_vllm_kernel(self):
         if getattr(self.decode_kernel, "backend", None) != "vllm":
@@ -173,24 +162,49 @@ class OptimizedDecodeDriver:
             self.workspaces[bucket] = BucketWorkspace(batch=bucket, hidden=self.hidden)
         return self.workspaces[bucket]
 
-    def run(self) -> DecodeMetrics:
-        metrics = DecodeMetrics()
+    def seq_lens_profile(self, batch_size: int, bucket: int) -> torch.Tensor:
+        if self._vllm_kernel is None:
+            raise RuntimeError("vLLM seq_lens profile requested without a vLLM kernel")
+        key = (batch_size, bucket)
+        profile = self._seq_lens_profiles.get(key)
+        if profile is None:
+            seq_lens = self._vllm_kernel.seq_lens
+            profile = torch.empty(bucket, device=seq_lens.device, dtype=seq_lens.dtype)
+            profile[:batch_size].fill_(self._vllm_kernel.block_size)
+            if bucket > batch_size:
+                profile[batch_size:bucket].zero_()
+            self._seq_lens_profiles[key] = profile
+        return profile
+
+    def _prepare_trace_schedule(self) -> None:
+        self._trace_schedule = []
         for batch_size in self.trace:
             bucket = pick_bucket(batch_size)
-            ws = self.workspace_for(bucket)
+            workspace = self.workspace_for(bucket)
+            seq_lens_profile = (
+                self.seq_lens_profile(batch_size, bucket)
+                if self._vllm_kernel is not None
+                else None
+            )
+            self._trace_schedule.append((batch_size, workspace, seq_lens_profile))
+
+    def run(self) -> DecodeMetrics:
+        metrics = DecodeMetrics()
+        for batch_size, ws, seq_lens_profile in self._trace_schedule:
             was_initialized = ws.initialized
             ws.ensure()
 
             if ws.tokens is None or ws.kv is None or ws.tokens_kv is None:
                 raise RuntimeError("workspace not initialized")
             if self._vllm_kernel is not None:
+                if seq_lens_profile is None:
+                    raise RuntimeError("vLLM seq_lens profile missing from trace schedule")
                 # Mark padded rows as "inactive" by setting seq_lens=0 for them.
                 # This keeps bucketed shapes stable (good for CUDA graphs / workspace reuse)
                 # without paying full attention cost on dummy rows.
                 seq_lens = self._vllm_kernel.seq_lens
-                seq_lens[:batch_size].fill_(self._vllm_kernel.block_size)
-                if bucket > batch_size:
-                    seq_lens[batch_size:bucket].zero_()
+                bucket = ws.batch
+                seq_lens[:bucket].copy_(seq_lens_profile)
             # Keep the compute path aligned with the baseline (no masking); the
             # benchmark's outputs are metrics, not decoded logits.
             logits = self.decode_kernel(ws.tokens, ws.kv, None)
@@ -252,6 +266,10 @@ class OptimizedVLLMDecodeGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark
         self._driver: Optional[OptimizedDecodeDriver] = None
         self._last_metrics: Optional[DecodeMetrics] = None
         self.output: Optional[torch.Tensor] = None
+        self._output_values: Optional[list[float]] = None
+        self._payload_output_values = [float(len(self._trace)), float(sum(self._trace))]
+        self._output_tensor: Optional[torch.Tensor] = None
+        self._trace_tensor: Optional[torch.Tensor] = None
         self._verification_payload = None
         self.register_workload_metadata(requests_per_iteration=1.0)
 
@@ -265,20 +283,25 @@ class OptimizedVLLMDecodeGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark
     def setup(self) -> None:
         torch.manual_seed(self.seed)
         self._driver = OptimizedDecodeDriver(trace=self._trace, hidden=self.hidden)
+        self._output_tensor = torch.empty(len(self._payload_output_values), dtype=torch.float32)
+        self._trace_tensor = torch.tensor(self._trace, device=DEVICE)
 
     def benchmark_fn(self) -> None:
         if self._driver is None:
             raise RuntimeError("FAIL FAST: optimized decode driver not initialized")
         self._last_metrics = self._driver.run()
-        total_tokens = float(sum(self._trace))
-        self.output = torch.tensor(
-            [float(len(self._trace)), total_tokens],
-            dtype=torch.float32,
-        )
+        self._output_values = self._payload_output_values
 
     def capture_verification_payload(self) -> None:
+        if self._output_values is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        if self._output_tensor is None or self._trace_tensor is None:
+            raise RuntimeError("setup() must initialize verification tensors")
+        for idx, value in enumerate(self._output_values):
+            self._output_tensor[idx] = value
+        self.output = self._output_tensor
         self._set_verification_payload(
-            inputs={"trace": torch.tensor(self._trace, device=DEVICE)},
+            inputs={"trace": self._trace_tensor},
             output=self.output,
             batch_size=1,
             parameter_count=0,
@@ -304,5 +327,3 @@ class OptimizedVLLMDecodeGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedVLLMDecodeGraphsBenchmark()
-
-

@@ -28,6 +28,7 @@ from core.harness.benchmark_harness import (  # noqa: E402
     WorkloadMetadata,
 )
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 
 class MultiLayerNet(nn.Module):
@@ -40,8 +41,8 @@ class MultiLayerNet(nn.Module):
         self.fc3 = nn.Linear(size, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
+        x = torch.relu_(self.fc1(x))
+        x = torch.relu_(self.fc2(x))
         return self.fc3(x)
 
 
@@ -61,6 +62,9 @@ class BaselineNoOverlapBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.initialized = False
         self.batch_size = 128
         self.hidden_size = 1024
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
+        self._model_parameters: tuple[nn.Parameter, ...] = ()
         tokens = self.batch_size * self.hidden_size
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
@@ -83,7 +87,11 @@ class BaselineNoOverlapBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.manual_seed(42)
         model = MultiLayerNet(self.hidden_size).to(self.device)
         self.model = model
-        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
+        self._model_parameters = tuple(self.model.parameters())
+        self.optimizer = optim.SGD(self._model_parameters, lr=0.01)
+        self._payload_parameter_count = sum(p.numel() for p in self._model_parameters)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
 
         self.data = torch.randn(self.batch_size, self.hidden_size, device=self.device)
         self.target = torch.randn(self.batch_size, 1, device=self.device)
@@ -91,33 +99,27 @@ class BaselineNoOverlapBenchmark(VerificationPayloadMixin, BaseBenchmark):
     
     def benchmark_fn(self) -> None:
         """Benchmark a no-overlap step with synchronous gradient all-reduce."""
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range("no_overlap", enable=enable_nvtx):
+        with nvtx_range("no_overlap", enable=self._enable_nvtx):
             output = self.model(self.data)
             loss = nn.functional.mse_loss(output, self.target)
             loss.backward()
-            for param in self.model.parameters():
+            for param in self._model_parameters:
                 if param.grad is None:
                     continue
                 dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
                 param.grad.mul_(1.0 / self.world_size)
             self.optimizer.step()
             self.optimizer.zero_grad()
-        self.output = output.detach()
+        self.output = output.detach_()
 
     def capture_verification_payload(self) -> None:
         if self.data is None or self.target is None or self.output is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        param_count = sum(p.numel() for p in self.model.parameters()) if self.model is not None else 0
         self._set_verification_payload(
             inputs={"data": self.data, "target": self.target},
             output=self.output,
             batch_size=int(self.batch_size),
-            parameter_count=param_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -136,6 +138,7 @@ class BaselineNoOverlapBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.optimizer = None
         self.data = None
         self.target = None
+        self._model_parameters = ()
         torch.cuda.empty_cache()
         self._config = None
     

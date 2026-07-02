@@ -8,11 +8,17 @@ code/ch14/compiled_code_output/
 code/ch14/torch_compile_debug/
 code/ch16/gpt_oss_120b_results.json
 code/ch16/gpt_quick_results.txt
+zymtrace-official/
+.env
+.env.local
+code/third_party/mlperf_inference/
+code/third_party/mlperf_training/
 BENCHMARK_*.json
 code/cluster/results/structured/mcp_cluster_smoke_test*
 .venv/
 .pytest_cache/
 manuscript_diffs/
+.torch_inductor/
 .torch_extensions/
 update_log.md
 perf_review_findings.md
@@ -50,3 +56,4 @@ code/third_party/pytorch-src/
 code/third_party/pytorch-src/
 code/vendor/pytorch-src/
 *.json.bak
+.claude/settings.local.json

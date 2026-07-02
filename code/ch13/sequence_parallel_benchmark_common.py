@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.distributed as dist
@@ -97,36 +97,48 @@ def run_sequence_parallel(
         device=device,
         dtype=config.dtype,
     )
-    gather_buf = [
-        torch.empty_like(x_local)
-        for _ in range(world_size)
-    ]
+    full_sequence_gather_buf = None
+    if not sequence_parallel:
+        full_sequence_gather_buf = torch.empty(
+            world_size * config.batch_size,
+            seq_per_rank,
+            config.hidden_size,
+            device=device,
+            dtype=config.dtype,
+        )
+    layer_triples = tuple(zip(up_proj, down_proj, norms, strict=True))
 
     def _step() -> torch.Tensor:
         x = x_local
-        for layer_idx in range(config.num_layers):
-            hidden_local = torch.nn.functional.gelu(up_proj[layer_idx](x), approximate="tanh")
-            out_partial = down_proj[layer_idx](hidden_local)
+        for up_layer, down_layer, norm in layer_triples:
+            hidden_local = torch.nn.functional.gelu(up_layer(x), approximate="tanh")
+            out_partial = down_layer(hidden_local)
             dist.all_reduce(out_partial)
             if sequence_parallel:
-                x = norms[layer_idx](out_partial)
+                x = norm(out_partial)
             else:
-                dist.all_gather(gather_buf, out_partial)
-                full_sequence = torch.cat(gather_buf, dim=1)
-                full_sequence = norms[layer_idx](full_sequence)
-                start = rank * seq_per_rank
-                end = start + seq_per_rank
-                x = full_sequence[:, start:end]
+                if full_sequence_gather_buf is None:
+                    raise RuntimeError("full_sequence gather buffer missing for TP-only path")
+                dist.all_gather_into_tensor(full_sequence_gather_buf, out_partial)
+                full_sequence_by_rank = full_sequence_gather_buf.view(
+                    world_size,
+                    config.batch_size,
+                    seq_per_rank,
+                    config.hidden_size,
+                )
+                full_sequence = norm(full_sequence_by_rank)
+                x = full_sequence[rank]
         return x
 
-    for _ in range(max(warmup, 0)):
-        _step()
-    torch.cuda.synchronize(device)
+    with torch.inference_mode():
+        for _ in range(max(warmup, 0)):
+            _step()
+        torch.cuda.synchronize(device)
 
-    start = time.perf_counter()
-    for _ in range(max(iters, 1)):
-        _step()
-    torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        for _ in range(max(iters, 1)):
+            _step()
+        torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
 
     if rank == 0:

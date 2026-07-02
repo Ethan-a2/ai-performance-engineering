@@ -11,7 +11,6 @@ from pathlib import Path
 from contextlib import nullcontext
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
@@ -112,6 +111,7 @@ def main():
     num_steps = min(args.steps, len(dataloader))
     total_tokens = 0
     start_time = perf_counter()
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
 
     for step, batch in enumerate(dataloader):
         if step >= num_steps:
@@ -137,9 +137,11 @@ def main():
         total_tokens += batch["input_ids"].numel()
 
         if step % 10 == 0 and is_main:
+            loss_value_buffer[0].copy_(loss.detach())
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
             print(
                 f"[optimized-ddp-flash] step {step}/{num_steps} "
-                f"loss={loss.item():.4f} "
+                f"loss={loss_value:.4f} "
                 f"tokens/step={batch['input_ids'].numel():,}"
             )
 

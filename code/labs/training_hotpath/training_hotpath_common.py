@@ -138,40 +138,47 @@ def build_metric_inputs(workload: MetricReductionWorkload, device: torch.device)
     return preds, targets
 
 
-def scalar_metric_reduction(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def scalar_metric_reduction(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     responders = preds.shape[-1]
-    pred_sq = []
-    target_sq = []
-    covar = []
+    result = out if out is not None else preds.new_empty(responders * 3)
     for index in range(responders):
         pred_col = preds[..., index]
         target_col = targets[..., index]
-        pred_sq.append((pred_col * pred_col).sum())
-        target_sq.append((target_col * target_col).sum())
-        covar.append((pred_col * target_col).sum())
-    return torch.cat(
-        (
-            torch.stack(pred_sq, dim=0),
-            torch.stack(target_sq, dim=0),
-            torch.stack(covar, dim=0),
-        ),
-        dim=0,
-    )
+        result[index] = (pred_col * pred_col).sum()
+        result[responders + index] = (target_col * target_col).sum()
+        result[2 * responders + index] = (pred_col * target_col).sum()
+    return result
 
 
-def vectorized_metric_reduction(preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def vectorized_metric_reduction(
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     pred_flat = preds.reshape(-1, preds.shape[-1])
     target_flat = targets.reshape(-1, targets.shape[-1])
-    pred_sq = (pred_flat * pred_flat).sum(dim=0)
-    target_sq = (target_flat * target_flat).sum(dim=0)
-    covar = (pred_flat * target_flat).sum(dim=0)
-    return torch.cat((pred_sq, target_sq, covar), dim=0)
+    if torch.is_grad_enabled() and (preds.requires_grad or targets.requires_grad):
+        pred_sq = (pred_flat * pred_flat).sum(dim=0)
+        target_sq = (target_flat * target_flat).sum(dim=0)
+        covar = (pred_flat * target_flat).sum(dim=0)
+        return torch.cat((pred_sq, target_sq, covar), dim=0)
+
+    responders = preds.shape[-1]
+    result = out if out is not None else preds.new_empty(responders * 3)
+    torch.sum(pred_flat * pred_flat, dim=0, out=result[:responders])
+    torch.sum(target_flat * target_flat, dim=0, out=result[responders : 2 * responders])
+    torch.sum(pred_flat * target_flat, dim=0, out=result[2 * responders :])
+    return result
 
 
 def build_gradient_inputs(
     workload: GradientReductionWorkload,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     cpu_generator = torch.Generator()
     cpu_generator.manual_seed(4242)
     lengths = torch.randint(
@@ -181,11 +188,12 @@ def build_gradient_inputs(
         generator=cpu_generator,
         dtype=torch.int64,
     )
-    offsets = torch.zeros(workload.num_segments + 1, dtype=torch.int64)
+    offsets = torch.empty(workload.num_segments + 1, dtype=torch.int64)
+    offsets[0] = 0
     offsets[1:] = torch.cumsum(lengths, dim=0)
     total = int(offsets[-1].item())
     values = torch.randn(total, generator=cpu_generator, dtype=torch.float32)
-    return values.to(device=device), offsets.to(device=device)
+    return values.to(device=device), offsets.to(device=device), total
 
 
 def build_segment_metadata(offsets: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -204,11 +212,16 @@ def baseline_segment_abs_mean(
     segment_ids: torch.Tensor,
     segment_lengths: torch.Tensor,
     out: torch.Tensor,
+    abs_buf: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Baseline torch segmented reduction without host round-trips."""
 
-    out.zero_()
-    out.scatter_add_(0, segment_ids, flat.abs())
+    if abs_buf is not None and not (torch.is_grad_enabled() and flat.requires_grad):
+        torch.abs(flat, out=abs_buf)
+        values = abs_buf
+    else:
+        values = flat.abs()
+    out.scatter_reduce_(0, segment_ids, values, reduce="sum", include_self=False)
     out.div_(segment_lengths.clamp_min(1.0))
     return out
 
@@ -221,6 +234,14 @@ def active_mask_and_rows(
     active_mask = positions[None, :] < seq_lens[:, None]
     active_rows = active_mask.reshape(-1).nonzero(as_tuple=False).squeeze(1).to(torch.int64)
     return active_mask, active_rows
+
+
+def _silu_mul_in_place_if_safe(up: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and up.requires_grad:
+        return F.silu(up) * gate
+    F.silu(up, inplace=True)
+    up.mul_(gate)
+    return up
 
 
 class DenseLinear(nn.Module):
@@ -239,15 +260,67 @@ class PackedLinear(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(out_features, in_features, generator=generator) * 0.02)
         self.bias = nn.Parameter(torch.randn(out_features, generator=generator) * 0.01)
+        self._packed_input: Optional[torch.Tensor] = None
+        self._packed_output: Optional[torch.Tensor] = None
+        self._restored_output: Optional[torch.Tensor] = None
+
+    def _workspace(
+        self,
+        name: str,
+        shape: tuple[int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        cached = getattr(self, name)
+        if (
+            isinstance(cached, torch.Tensor)
+            and cached.device == device
+            and cached.dtype == dtype
+            and cached.dim() == len(shape)
+            and cached.size(0) >= shape[0]
+            and tuple(cached.shape[1:]) == tuple(shape[1:])
+        ):
+            return cached[: shape[0]]
+        workspace = torch.empty(shape, device=device, dtype=dtype)
+        setattr(self, name, workspace)
+        return workspace
 
     def forward(self, x: torch.Tensor, *, active_rows: torch.Tensor, extension) -> torch.Tensor:
         if extension is None:
             raise RuntimeError("PackedLinear requires the training_hotpath CUDA extension")
         total_rows = x.shape[0] * x.shape[1]
         flat = x.reshape(total_rows, x.shape[-1]).contiguous()
-        packed = extension.pack_rows(flat, active_rows)
-        packed_out = F.linear(packed, self.weight, self.bias)
-        restored = extension.scatter_rows(packed_out.contiguous(), active_rows, total_rows)
+        if torch.is_grad_enabled() and (
+            x.requires_grad or self.weight.requires_grad or self.bias.requires_grad
+        ):
+            packed = extension.pack_rows(flat, active_rows)
+            packed_out = F.linear(packed, self.weight, self.bias)
+            restored = extension.scatter_rows(packed_out.contiguous(), active_rows, total_rows)
+            return restored.reshape(x.shape[0], x.shape[1], packed_out.shape[-1])
+
+        packed = self._workspace(
+            "_packed_input",
+            (active_rows.numel(), flat.shape[1]),
+            device=flat.device,
+            dtype=flat.dtype,
+        )
+        packed = extension.pack_rows_out(flat, active_rows, packed)
+        packed_out = self._workspace(
+            "_packed_output",
+            (packed.shape[0], self.weight.shape[0]),
+            device=packed.device,
+            dtype=packed.dtype,
+        )
+        torch.mm(packed, self.weight.t(), out=packed_out)
+        packed_out.add_(self.bias)
+        restored = self._workspace(
+            "_restored_output",
+            (total_rows, packed_out.shape[1]),
+            device=packed_out.device,
+            dtype=packed_out.dtype,
+        )
+        restored = extension.scatter_rows_out(packed_out, active_rows, total_rows, restored)
         return restored.reshape(x.shape[0], x.shape[1], packed_out.shape[-1])
 
 
@@ -276,7 +349,8 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        active_mask: torch.Tensor,
+        active_attn_mask: torch.Tensor,
+        active_mask_column: torch.Tensor,
         active_rows: torch.Tensor,
         extension,
     ) -> torch.Tensor:
@@ -287,17 +361,16 @@ class TransformerBlock(nn.Module):
         query = query.view(batch_size, num_tokens, self.num_heads, self.head_size).transpose(1, 2)
         key = key.view(batch_size, num_tokens, self.num_heads, self.head_size).transpose(1, 2)
         value = value.view(batch_size, num_tokens, self.num_heads, self.head_size).transpose(1, 2)
-        attn_mask = active_mask[:, None, None, :]
-        attn = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
+        attn = F.scaled_dot_product_attention(query, key, value, attn_mask=active_attn_mask)
         attn = attn.transpose(1, 2).reshape(batch_size, num_tokens, self.hidden_size)
         x = x + self.out_proj(attn, active_rows=active_rows, extension=extension)
-        x = x * active_mask.unsqueeze(-1)
+        x = x * active_mask_column
 
         y = self.ln2(x)
         up, gate = self.up_gate(y, active_rows=active_rows, extension=extension).chunk(2, dim=-1)
-        y = F.silu(up) * gate
+        y = _silu_mul_in_place_if_safe(up, gate)
         x = x + self.down(y, active_rows=active_rows, extension=extension)
-        return x * active_mask.unsqueeze(-1)
+        return x * active_mask_column
 
 
 class ToyTransformer(nn.Module):
@@ -328,28 +401,42 @@ class ToyTransformer(nn.Module):
         active_mask: torch.Tensor,
         active_rows: torch.Tensor,
         extension,
+        active_mask_column: torch.Tensor | None = None,
+        active_attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if active_mask_column is None:
+            active_mask_column = active_mask.unsqueeze(-1)
+        if active_attn_mask is None:
+            active_attn_mask = active_mask[:, None, None, :]
         x = self.input_proj(x, active_rows=active_rows, extension=extension)
-        x = x * active_mask.unsqueeze(-1)
+        x = x * active_mask_column
         for block in self.blocks:
-            x = block(x, active_mask=active_mask, active_rows=active_rows, extension=extension)
+            x = block(
+                x,
+                active_attn_mask=active_attn_mask,
+                active_mask_column=active_mask_column,
+                active_rows=active_rows,
+                extension=extension,
+            )
         x = self.output_proj(x, active_rows=active_rows, extension=extension)
-        return x * active_mask.unsqueeze(-1)
+        return x * active_mask_column
 
 
 def build_padding_inputs(
     workload: PaddingAwareWorkload,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     cpu_generator = torch.Generator()
     cpu_generator.manual_seed(4242)
-    seq_lens = torch.randint(
+    seq_lens_cpu = torch.randint(
         workload.min_num_tokens,
         workload.max_num_tokens + 1,
         (workload.batch_size,),
         generator=cpu_generator,
         dtype=torch.int64,
-    ).to(device=device)
+    )
+    active_tokens = int(seq_lens_cpu.sum().item())
+    seq_lens = seq_lens_cpu.to(device=device)
     inputs = torch.randn(
         workload.batch_size,
         workload.max_num_tokens,
@@ -358,11 +445,17 @@ def build_padding_inputs(
         dtype=torch.float32,
     ).to(device=device)
     active_mask, active_rows = active_mask_and_rows(seq_lens, workload.max_num_tokens)
-    return inputs, seq_lens, active_rows
+    return inputs, seq_lens, active_mask, active_rows, active_tokens
 
 
 class MetricReductionVectorizedBenchmark(VerificationPayloadMixin, BaseBenchmark):
-    """Benchmark scalar vs vectorized per-output metric aggregation."""
+    """Benchmark scalar per-output metric aggregation vs a fused single-pass reduction.
+
+    The optimized arm calls the lab extension's metric_reduction_fused kernel:
+    one read of preds and targets produces all three per-responder sums with
+    fp32 accumulation, instead of three separate mul+sum passes (plus
+    temporaries) over the same 25 MB of inputs.
+    """
 
     preferred_ncu_replay_mode = "application"
 
@@ -374,6 +467,7 @@ class MetricReductionVectorizedBenchmark(VerificationPayloadMixin, BaseBenchmark
         self.preds: Optional[torch.Tensor] = None
         self.targets: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._extension = None
         self._custom_metrics: dict[str, float] = {}
         self._refresh_workload_metadata()
 
@@ -385,11 +479,16 @@ class MetricReductionVectorizedBenchmark(VerificationPayloadMixin, BaseBenchmark
         if not torch.cuda.is_available():
             raise RuntimeError("labs.training_hotpath metric-reduction benchmarks require CUDA")
         self.preds, self.targets = build_metric_inputs(self.workload, self.device)
-        self.output = None
+        self.output = torch.empty(self.workload.responders * 3, device=self.device, dtype=torch.float32)
+        if self.optimized:
+            self._extension = load_training_hotpath_extension()
+            self._extension.metric_reduction_fused_out(self.preds, self.targets, self.output)
+        else:
+            self._extension = None
         total = self.workload.batch_size * self.workload.max_num_tokens * self.workload.responders
         self._custom_metrics = {
             "metric_reduction.is_vectorized": 1.0 if self.optimized else 0.0,
-            "metric_reduction.uses_cuda_extension": 0.0,
+            "metric_reduction.uses_cuda_extension": 1.0 if self.optimized else 0.0,
             "metric_reduction.responders": float(self.workload.responders),
             "metric_reduction.total_elements": float(total),
         }
@@ -398,11 +497,16 @@ class MetricReductionVectorizedBenchmark(VerificationPayloadMixin, BaseBenchmark
     def benchmark_fn(self) -> None:
         if self.preds is None or self.targets is None:
             raise RuntimeError("Metric inputs not initialized")
-        self.output = (
-            vectorized_metric_reduction(self.preds, self.targets)
-            if self.optimized
-            else scalar_metric_reduction(self.preds, self.targets)
-        )
+        if self.optimized:
+            if self._extension is None:
+                raise RuntimeError("CUDA extension not loaded")
+            if self.output is None:
+                raise RuntimeError("Metric output buffer not initialized")
+            self.output = self._extension.metric_reduction_fused_out(self.preds, self.targets, self.output)
+        else:
+            if self.output is None:
+                raise RuntimeError("Metric output buffer not initialized")
+            self.output = scalar_metric_reduction(self.preds, self.targets, self.output)
 
     def capture_verification_payload(self) -> None:
         if self.output is None or self.preds is None or self.targets is None:
@@ -420,6 +524,7 @@ class MetricReductionVectorizedBenchmark(VerificationPayloadMixin, BaseBenchmark
         self.preds = None
         self.targets = None
         self.output = None
+        self._extension = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -467,6 +572,7 @@ class MetricReductionCudaBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.segment_ids: Optional[torch.Tensor] = None
         self.segment_lengths: Optional[torch.Tensor] = None
         self._baseline_out: Optional[torch.Tensor] = None
+        self._baseline_abs: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._extension = None
         self._custom_metrics: dict[str, float] = {}
@@ -480,16 +586,20 @@ class MetricReductionCudaBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def setup(self) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("labs.training_hotpath metric-reduction benchmarks require CUDA")
-        self.flat, self.offsets = build_gradient_inputs(self.workload, self.device)
+        self.flat, self.offsets, total = build_gradient_inputs(self.workload, self.device)
         self.segment_ids, self.segment_lengths = build_segment_metadata(self.offsets)
         self._baseline_out = torch.empty(self.workload.num_segments, device=self.device, dtype=torch.float32)
-        self.output = None
+        self._baseline_abs = torch.empty_like(self.flat) if not self.optimized else None
+        self.output = (
+            torch.empty(self.workload.num_segments, device=self.device, dtype=torch.float32)
+            if self.optimized
+            else None
+        )
         if self.optimized:
             self._extension = load_training_hotpath_extension()
-            self._extension.segment_abs_mean(self.flat, self.offsets)
+            self._extension.segment_abs_mean_out(self.flat, self.offsets, self.output)
         else:
             self._extension = None
-        total = int(self.offsets[-1].item()) if self.offsets is not None else 0
         self._custom_metrics = {
             "metric_reduction.is_fused_cuda": 1.0 if self.optimized else 0.0,
             "metric_reduction.uses_cuda_extension": 1.0 if self.optimized else 0.0,
@@ -504,15 +614,26 @@ class MetricReductionCudaBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if self.optimized:
             if self._extension is None:
                 raise RuntimeError("CUDA extension not loaded")
-            self.output = self._extension.segment_abs_mean(self.flat, self.offsets)
+            if self.output is None:
+                raise RuntimeError("Segment output buffer not initialized")
+            self.output = self._extension.segment_abs_mean_out(
+                self.flat,
+                self.offsets,
+                self.output,
+            )
         else:
-            if self.segment_ids is None or self.segment_lengths is None or self._baseline_out is None:
+            if (
+                self.segment_ids is None
+                or self.segment_lengths is None
+                or self._baseline_out is None
+            ):
                 raise RuntimeError("Baseline segment metadata not initialized")
             self.output = baseline_segment_abs_mean(
                 self.flat,
                 self.segment_ids,
                 self.segment_lengths,
                 self._baseline_out,
+                self._baseline_abs,
             )
 
     def capture_verification_payload(self) -> None:
@@ -533,6 +654,7 @@ class MetricReductionCudaBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.segment_ids = None
         self.segment_lengths = None
         self._baseline_out = None
+        self._baseline_abs = None
         self.output = None
         self._extension = None
         torch.cuda.empty_cache()
@@ -582,8 +704,11 @@ class PaddingAwareTransformerBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model: Optional[ToyTransformer] = None
         self.output: Optional[torch.Tensor] = None
         self._active_mask: Optional[torch.Tensor] = None
+        self._active_mask_column: Optional[torch.Tensor] = None
+        self._active_attn_mask: Optional[torch.Tensor] = None
         self._extension = None
         self._custom_metrics: dict[str, float] = {}
+        self._payload_parameter_count = 0
         self._refresh_workload_metadata()
 
     def _refresh_workload_metadata(self) -> None:
@@ -593,17 +718,23 @@ class PaddingAwareTransformerBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def setup(self) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("labs.training_hotpath padding-aware transformer benchmark requires CUDA")
-        self.inputs, self.seq_lens, self.active_rows = build_padding_inputs(self.workload, self.device)
-        active_mask, _ = active_mask_and_rows(self.seq_lens, self.workload.max_num_tokens)
-        self._active_mask = active_mask
+        (
+            self.inputs,
+            self.seq_lens,
+            self._active_mask,
+            self.active_rows,
+            active_tokens,
+        ) = build_padding_inputs(self.workload, self.device)
+        self._active_mask_column = self._active_mask.unsqueeze(-1)
+        self._active_attn_mask = self._active_mask[:, None, None, :]
         self._extension = load_training_hotpath_extension() if self.optimized else None
         if self._extension is not None:
             flat = self.inputs.reshape(-1, self.inputs.shape[-1]).contiguous()
             packed = self._extension.pack_rows(flat, self.active_rows)
             self._extension.scatter_rows(packed, self.active_rows, flat.shape[0])
         self.model = ToyTransformer(self.workload, optimized=self.optimized, device=self.device).to(self.device)
+        self._payload_parameter_count = sum(parameter.numel() for parameter in self.model.parameters())
         self.output = None
-        active_tokens = int(self.seq_lens.sum().item())
         total_tokens = self.workload.batch_size * self.workload.max_num_tokens
         active_fraction = active_tokens / float(total_tokens)
         self._custom_metrics = {
@@ -616,14 +747,25 @@ class PaddingAwareTransformerBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        if self.inputs is None or self.seq_lens is None or self.active_rows is None or self.model is None:
+        if (
+            self.inputs is None
+            or self.seq_lens is None
+            or self.active_rows is None
+            or self.model is None
+            or self._active_mask is None
+            or self._active_mask_column is None
+            or self._active_attn_mask is None
+        ):
             raise RuntimeError("Padding-aware benchmark state not initialized")
-        self.output = self.model(
-            self.inputs,
-            active_mask=self._active_mask,
-            active_rows=self.active_rows,
-            extension=self._extension,
-        )
+        with torch.inference_mode():
+            self.output = self.model(
+                self.inputs,
+                active_mask=self._active_mask,
+                active_rows=self.active_rows,
+                extension=self._extension,
+                active_mask_column=self._active_mask_column,
+                active_attn_mask=self._active_attn_mask,
+            )
 
     def capture_verification_payload(self) -> None:
         if self.output is None or self.inputs is None or self.seq_lens is None:
@@ -632,7 +774,7 @@ class PaddingAwareTransformerBenchmark(VerificationPayloadMixin, BaseBenchmark):
             inputs={"inputs": self.inputs, "seq_lens": self.seq_lens},
             output=self.output,
             batch_size=self.workload.batch_size,
-            parameter_count=sum(parameter.numel() for parameter in self.model.parameters()) if self.model is not None else 0,
+            parameter_count=self._payload_parameter_count,
             precision_flags={"fp16": False, "bf16": False, "tf32": torch.backends.cuda.matmul.allow_tf32},
             output_tolerance=(1e-5, 1e-5),
         )
@@ -645,6 +787,8 @@ class PaddingAwareTransformerBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.output = None
         self._extension = None
         self._active_mask = None
+        self._active_mask_column = None
+        self._active_attn_mask = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-import torch
 from typing import Optional
+
+import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (  # noqa: E402
@@ -12,6 +13,7 @@ from core.harness.benchmark_harness import (  # noqa: E402
     BenchmarkConfig,
     WorkloadMetadata,
 )
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 
 class BaselineAttentionEagerSDPABenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -35,8 +37,16 @@ class BaselineAttentionEagerSDPABenchmark(VerificationPayloadMixin, BaseBenchmar
             tokens_per_iteration=float(tokens),
         )
         self.output = None
+        self._last_outputs: Optional[list[torch.Tensor]] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._head_inputs: Optional[list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None
+        self._attention_view_counts: tuple[int, int] = (0, 0)
+        self._expected_attention_view_counts: tuple[int, int] = (0, 0)
+        self._attention_scale = 0.0
         self.parameter_count: int = 0
         self._verification_payload = None
+        self._enable_nvtx = False
         self.register_workload_metadata(
             requests_per_iteration=float(self.seq_len),
             tokens_per_iteration=float(tokens),
@@ -47,53 +57,85 @@ class BaselineAttentionEagerSDPABenchmark(VerificationPayloadMixin, BaseBenchmar
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         shape = (self.seq_len, self.num_heads, self.head_dim)
         self.q = torch.randn(shape, device=self.device, dtype=self.dtype)
         self.k = torch.randn(shape, device=self.device, dtype=self.dtype)
         self.v = torch.randn(shape, device=self.device, dtype=self.dtype)
+        self._attention_scale = 1.0 / math.sqrt(self.head_dim)
+        self._head_inputs = [
+            (self.q[:, head, :], self.k[:, head, :].transpose(0, 1), self.v[:, head, :])
+            for _ in range(self.repeat_passes)
+            for head in range(self.num_heads)
+        ]
+        self._last_outputs = [
+            torch.empty(0, device=self.device, dtype=self.dtype)
+            for _ in range(self.num_heads * self.repeat_passes)
+        ]
+        expected_outputs = self.num_heads * self.repeat_passes
+        self._attention_view_counts = (
+            len(self._last_outputs),
+            len(self._head_inputs),
+        )
+        self._expected_attention_view_counts = (expected_outputs, expected_outputs)
+        self._output_buffer = torch.empty(
+            (1, self.seq_len, self.embed_dim * self.repeat_passes),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self._verify_output_buffer = torch.empty_like(self._output_buffer)
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
         """Benchmark: per-head attention computed serially."""
-        # Use conditional NVTX ranges - only enabled when profiling
-
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-
-        with nvtx_range("baseline_attention_eager_sdpa", enable=enable_nvtx):
+        with (
+            torch.inference_mode(),
+            nvtx_range("baseline_attention_eager_sdpa", enable=self._enable_nvtx),
+        ):
             if self.q is None or self.k is None or self.v is None:
                 raise RuntimeError("Tensors not initialized")
-            scale = 1.0 / math.sqrt(self.head_dim)
-            outputs = []
-            for _ in range(self.repeat_passes):
-                for head in range(self.num_heads):
-                    qh = self.q[:, head, :]
-                    kh = self.k[:, head, :]
-                    vh = self.v[:, head, :]
-                    scores = torch.matmul(qh, kh.transpose(0, 1)) * scale
-                    attn = torch.softmax(scores, dim=-1)
-                    outputs.append(torch.matmul(attn, vh))
-            stacked = torch.stack(outputs, dim=1)
-            self._last = float(stacked.sum())
-            # Flatten heads into the embedding dimension to match optimized output
-            self.output = stacked.permute(1, 0, 2).reshape(
-                1, self.seq_len, self.embed_dim * self.repeat_passes
-            ).contiguous()
-        if self.output is None or self.q is None or self.k is None or self.v is None:
+            if (
+                self._last_outputs is None
+                or self._head_inputs is None
+                or self._attention_view_counts != self._expected_attention_view_counts
+            ):
+                raise RuntimeError("Head input/output views not initialized")
+            output_idx = 0
+            for qh, kh_t, vh in self._head_inputs:
+                scores = torch.matmul(qh, kh_t)
+                scores.mul_(self._attention_scale)
+                attn = torch.softmax(scores, dim=-1)
+                self._last_outputs[output_idx] = torch.matmul(attn, vh)
+                output_idx += 1
+        if self._last_outputs is None or self.q is None or self.k is None or self.v is None:
             raise RuntimeError("Verification input/output not initialized")
 
     def capture_verification_payload(self) -> None:
+        if self._last_outputs is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        if self._output_buffer is None:
+            raise RuntimeError("setup() must initialize verification output buffer")
+        output_flat = self._output_buffer.view(-1)
+        write_offset = 0
+        for head_output in self._last_outputs:
+            values = head_output.reshape(-1)
+            next_offset = write_offset + values.numel()
+            output_flat[write_offset:next_offset].copy_(values)
+            write_offset = next_offset
+        if write_offset != output_flat.numel():
+            raise RuntimeError("unexpected attention output shape")
+        self.output = self._output_buffer
+        if self._verify_output_buffer is None:
+            raise RuntimeError("setup() must initialize verification output payload buffer")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "q": self.q.detach(),
                 "k": self.k.detach(),
                 "v": self.v.detach(),
             },
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=1,
             parameter_count=0,
             precision_flags={
@@ -111,6 +153,13 @@ class BaselineAttentionEagerSDPABenchmark(VerificationPayloadMixin, BaseBenchmar
         self.q = None
         self.k = None
         self.v = None
+        self.output = None
+        self._last_outputs = None
+        self._output_buffer = None
+        self._verify_output_buffer = None
+        self._head_inputs = None
+        self._attention_view_counts = (0, 0)
+        self._expected_attention_view_counts = (0, 0)
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

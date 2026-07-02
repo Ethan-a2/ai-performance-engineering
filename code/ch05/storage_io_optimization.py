@@ -17,12 +17,12 @@ class DummyDataset(Dataset):
     def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, int]:
         # Use empty + fill for better performance than randn
         image = torch.empty(3, 224, 224)
         # Simple deterministic pattern based on index for reproducibility
         image.fill_(float((index % 256) / 255.0))
-        label = torch.tensor(index % 10, dtype=torch.long)
+        label = index % 10
         return image, label
 
 
@@ -31,10 +31,11 @@ def make_dataloader(dataset: Dataset,
                     num_workers: int = 4,
                     *,
                     pin_memory: bool = True,
-                    prefetch_factor: int = 4,
+                    prefetch_factor: int | None = 4,
                     persistent_workers: bool = True) -> DataLoader:
     if num_workers == 0:
-        prefetch_factor = 2
+        prefetch_factor = None
+        persistent_workers = False
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -83,16 +84,16 @@ def main() -> None:
     model = torch.nn.Sequential(
         torch.nn.Flatten(),
         torch.nn.Linear(3 * 224 * 224, 512),
-        torch.nn.ReLU(),
+        torch.nn.ReLU(inplace=True),
         torch.nn.Linear(512, 10),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     criterion = torch.nn.CrossEntropyLoss()
 
-    start = time.time()
+    start = time.perf_counter()
     train_epoch(model, loader, device, optimizer, criterion)
     torch.cuda.synchronize() if device.type == "cuda" else None
-    print(f"Epoch time: {time.time() - start:.2f}s")
+    print(f"Epoch time: {time.perf_counter() - start:.2f}s")
 
 
 if __name__ == "__main__":

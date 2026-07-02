@@ -40,6 +40,8 @@ class BaselineTrtLlmPhi35MoeBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.pad_token_id: int = 0
         self._generated_output_ids: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
         tokens = float(self.prompt_len + self.max_new_tokens)
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
@@ -71,9 +73,15 @@ class BaselineTrtLlmPhi35MoeBenchmark(VerificationPayloadMixin, BaseBenchmark):
             prompt_len=self.prompt_len,
             batch_size=self.batch_size,
         )
-        self.prompt_lengths = [int(length) for length in attention_mask.sum(dim=1).tolist()]
+        self.prompt_lengths = [input_ids.size(1)] * self.batch_size
         self.input_ids = input_ids.to(self.device)
         self.attention_mask = attention_mask.to(self.device)
+        self._verify_output_buffer = torch.empty(
+            1,
+            verification_token_prefix_length(self.max_new_tokens),
+            dtype=torch.long,
+            device="cpu",
+        )
 
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
@@ -98,28 +106,33 @@ class BaselineTrtLlmPhi35MoeBenchmark(VerificationPayloadMixin, BaseBenchmark):
                     use_cache=True,
                     return_dict_in_generate=True,
                 )
-                self._generated_output_ids = outputs.sequences.detach()
+                self._generated_output_ids = outputs.sequences
                 self.output = self._generated_output_ids
         if self._generated_output_ids is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
-        if self._generated_output_ids is None or self.input_ids is None or self.prompt_lengths is None:
+        if (
+            self._generated_output_ids is None
+            or self.input_ids is None
+            or self.prompt_lengths is None
+            or self._verify_output_buffer is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
-        verify_output = slice_generated_token_ids(
+        generated_prefix = slice_generated_token_ids(
             self._generated_output_ids[:1],
             prompt_lengths=[self.prompt_lengths[0]],
             max_new_tokens=self.max_new_tokens,
             pad_token_id=self.pad_token_id,
-        )[:, : verification_token_prefix_length(self.max_new_tokens)].detach().cpu().clone()
+        )[:, : self._verify_output_buffer.shape[1]]
+        self._verify_output_buffer.copy_(generated_prefix, non_blocking=False)
         # Keep signature fields backend-agnostic so baseline Transformers and optimized
         # TRT-LLM engine runs compare on equivalent workload semantics.
-        parameter_count = 0
         self._set_verification_payload(
             inputs={"input_ids": self.input_ids},
-            output=verify_output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=int(self.batch_size),
-            parameter_count=parameter_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": True,
                 "bf16": False,
@@ -137,6 +150,7 @@ class BaselineTrtLlmPhi35MoeBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.prompt_lengths = None
         self._generated_output_ids = None
         self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

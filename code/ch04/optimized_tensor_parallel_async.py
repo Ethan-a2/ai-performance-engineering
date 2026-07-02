@@ -84,6 +84,36 @@ def _build_layers(hidden: int, hidden_per_rank: int, num_layers: int, device: to
     return shard, proj, aux
 
 
+def _cached_weight_t(layer: nn.Linear) -> torch.Tensor:
+    weight_t = getattr(layer, "_cached_weight_t", None)
+    if (
+        weight_t is None
+        or weight_t.data_ptr() != layer.weight.data_ptr()
+        or weight_t.device != layer.weight.device
+        or weight_t.dtype != layer.weight.dtype
+    ):
+        weight_t = layer.weight.t()
+        layer._cached_weight_t = weight_t
+    return weight_t
+
+
+def _linear_no_bias_into(layer: nn.Linear, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    torch.matmul(x, _cached_weight_t(layer), out=out)
+    return out
+
+
+def _replicate_tensor_parallel_shard(
+    local_out: torch.Tensor,
+    world_size: int,
+    full_out: torch.Tensor,
+) -> torch.Tensor:
+    hidden_per_rank = local_out.shape[-1]
+    full_out.view(*local_out.shape[:-1], world_size, hidden_per_rank).copy_(
+        local_out.unsqueeze(-2)
+    )
+    return full_out
+
+
 def _run_worker(
     iters: int,
     warmup: int,
@@ -108,29 +138,37 @@ def _run_worker(
     inputs = torch.randn(batch, seq_length, hidden, device=device, dtype=torch.bfloat16)
     gather_list = [torch.empty(batch, seq_length, hidden_per_rank, device=device, dtype=torch.bfloat16)
                    for _ in range(world_size)]
+    full_out = torch.empty(batch, seq_length, hidden, device=device, dtype=torch.bfloat16)
+    local_out_buffer = torch.empty(batch, seq_length, hidden_per_rank, device=device, dtype=torch.bfloat16)
+    aux_out_buffer = torch.empty(batch, seq_length, hidden, device=device, dtype=torch.bfloat16)
+    proj_out_buffer = torch.empty_like(aux_out_buffer)
     comm_stream = torch.cuda.Stream()
+    layer_range = range(num_layers)
 
     def _step() -> None:
         x = inputs
-        for layer_idx in range(num_layers):
-            local_out = shard_layers[layer_idx](x)
-            comm_stream.wait_stream(torch.cuda.current_stream())
+        current_stream = torch.cuda.current_stream()
+        for layer_idx in layer_range:
+            local_out = _linear_no_bias_into(shard_layers[layer_idx], x, local_out_buffer)
+            comm_stream.wait_stream(current_stream)
             with torch.cuda.stream(comm_stream):
                 work = dist.all_gather(gather_list, local_out, async_op=True)
-            aux_out = aux_layers[layer_idx](x)
+            aux_out = _linear_no_bias_into(aux_layers[layer_idx], x, aux_out_buffer)
             work.wait()
-            full_out = torch.cat(gather_list, dim=-1)
-            proj_out = proj_layers[layer_idx](full_out)
-            x = proj_out + aux_out
+            torch.cat(gather_list, dim=-1, out=full_out)
+            proj_out = _linear_no_bias_into(proj_layers[layer_idx], full_out, proj_out_buffer)
+            proj_out.add_(aux_out)
+            x = proj_out
 
-    for _ in range(max(warmup, 0)):
-        _step()
-    torch.cuda.synchronize(device)
+    with torch.inference_mode():
+        for _ in range(max(warmup, 0)):
+            _step()
+        torch.cuda.synchronize(device)
 
-    start = time.perf_counter()
-    for _ in range(max(iters, 1)):
-        _step()
-    torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        for _ in range(max(iters, 1)):
+            _step()
+        torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
 
     tokens_per_iter = batch * seq_length
@@ -180,9 +218,15 @@ class OptimizedTensorParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._aux_layers: Optional[nn.ModuleList] = None
         self._input: Optional[torch.Tensor] = None
         self._output: Optional[torch.Tensor] = None
+        self._full_out: Optional[torch.Tensor] = None
+        self._local_out: Optional[torch.Tensor] = None
+        self._aux_out: Optional[torch.Tensor] = None
+        self._proj_out: Optional[torch.Tensor] = None
         self._world_size = 1
         self._hidden = _DEFAULT_HIDDEN
         self._hidden_per_rank = _DEFAULT_HIDDEN
+        self._payload_parameter_count = 0
+        self._layer_range = range(_DEFAULT_LAYERS)
 
     def setup(self) -> None:
         require_min_gpus(2, "optimized_tensor_parallel_async.py")
@@ -197,6 +241,7 @@ class OptimizedTensorParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             _DEFAULT_LAYERS,
             self.device,
         )
+        self._payload_parameter_count = 3 * _DEFAULT_LAYERS * (self._hidden * self._hidden)
         self._input = torch.randn(
             _DEFAULT_BATCH,
             _DEFAULT_SEQ,
@@ -204,28 +249,54 @@ class OptimizedTensorParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             device=self.device,
             dtype=torch.bfloat16,
         )
+        self._full_out = torch.empty(
+            _DEFAULT_BATCH,
+            _DEFAULT_SEQ,
+            self._hidden,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        self._local_out = torch.empty(
+            _DEFAULT_BATCH,
+            _DEFAULT_SEQ,
+            self._hidden_per_rank,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        self._aux_out = torch.empty_like(self._full_out)
+        self._proj_out = torch.empty_like(self._full_out)
 
     def benchmark_fn(self) -> None:
-        if self._input is None or self._shard_layers is None or self._proj_layers is None or self._aux_layers is None:
+        if (
+            self._input is None
+            or self._shard_layers is None
+            or self._proj_layers is None
+            or self._aux_layers is None
+            or self._full_out is None
+            or self._local_out is None
+            or self._aux_out is None
+            or self._proj_out is None
+        ):
             raise RuntimeError("setup() must run before benchmark_fn()")
-        x = self._input
-        for layer_idx in range(_DEFAULT_LAYERS):
-            local_out = self._shard_layers[layer_idx](x)
-            full_out = torch.cat([local_out] * self._world_size, dim=-1)
-            aux_out = self._aux_layers[layer_idx](x)
-            proj_out = self._proj_layers[layer_idx](full_out)
-            x = proj_out + aux_out
+        with torch.inference_mode():
+            x = self._input
+            for layer_idx in self._layer_range:
+                local_out = _linear_no_bias_into(self._shard_layers[layer_idx], x, self._local_out)
+                _replicate_tensor_parallel_shard(local_out, self._world_size, self._full_out)
+                aux_out = _linear_no_bias_into(self._aux_layers[layer_idx], x, self._aux_out)
+                proj_out = _linear_no_bias_into(self._proj_layers[layer_idx], self._full_out, self._proj_out)
+                proj_out.add_(aux_out)
+                x = proj_out
         self._output = x
 
     def capture_verification_payload(self) -> None:
         if self._output is None or self._input is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
-        param_count = 3 * _DEFAULT_LAYERS * (self._hidden * self._hidden)
         self._set_verification_payload(
             inputs={"input": self._input},
             output=self._output,
             batch_size=_DEFAULT_BATCH,
-            parameter_count=int(param_count),
+            parameter_count=self._payload_parameter_count,
             precision_flags=PrecisionFlags(bf16=True, tf32=False),
             output_tolerance=(0.1, 1.0),
             signature_overrides={
@@ -253,6 +324,10 @@ class OptimizedTensorParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._aux_layers = None
         self._input = None
         self._output = None
+        self._full_out = None
+        self._local_out = None
+        self._aux_out = None
+        self._proj_out = None
         torch.cuda.empty_cache()
 
     def validate_result(self) -> Optional[str]:

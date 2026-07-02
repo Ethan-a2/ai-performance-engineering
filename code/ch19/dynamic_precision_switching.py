@@ -81,6 +81,26 @@ class PrecisionStats:
         print("="*60 + "\n")
 
 
+@dataclass
+class DynamicPrecisionWorkspace:
+    """Reusable buffers for repeated dynamic-precision decode calls."""
+
+    generated: torch.Tensor
+    next_token: torch.Tensor
+    next_token_values: Optional[torch.Tensor] = None
+    next_token_flat: Optional[torch.Tensor] = None
+    generated_token_views: Optional[Tuple[torch.Tensor, ...]] = None
+    top2_values: Optional[torch.Tensor] = None
+    top2_indices: Optional[torch.Tensor] = None
+    margin_values: Optional[torch.Tensor] = None
+    margin_mean: Optional[torch.Tensor] = None
+    ema_conf: Optional[torch.Tensor] = None
+    direct_cache_prompt_ptr: Optional[int] = None
+    direct_cache_prompt_version: Optional[int] = None
+    direct_cache_prompt_shape: Optional[Tuple[int, ...]] = None
+    direct_cache_max_steps: Optional[int] = None
+
+
 # Safe Transformer Engine (TE) FP8 autocast import
 try:
     from transformer_engine.pytorch import fp8_autocast as _te_fp8_autocast
@@ -163,7 +183,7 @@ def _memory_utilization_percent(device: torch.device) -> float:
         return 0.0
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def decode_with_dynamic_precision(
     model,
     tokens: torch.Tensor,
@@ -182,7 +202,8 @@ def decode_with_dynamic_precision(
     reeval_interval: int = 8,  # compute/inspect confidence every N steps to avoid per-step sync
     topk_dim: int = -1,  # last dimension holds vocabulary logits
     eos_id: Optional[int] = None,
-    collect_stats: bool = True
+    collect_stats: bool = True,
+    workspace: Optional[DynamicPrecisionWorkspace] = None,
 ) -> Tuple[torch.Tensor, Optional[PrecisionStats]]:
     """
     Autoregressive decode loop that smoothly switches between AMP (BF16/FP16) and
@@ -222,9 +243,74 @@ def decode_with_dynamic_precision(
     if enable_fp4:
         assert exit_fp4_threshold <= enter_fp4_threshold, \
             "FP4 hysteresis requires exit <= enter threshold"
+    if reeval_interval <= 0:
+        raise ValueError("reeval_interval must be positive")
     
-    model.eval()
-    tokens = tokens.to(device, non_blocking=True)
+    if getattr(model, "training", True):
+        model.eval()
+    prompt = tokens.to(device, non_blocking=True)
+    prompt_device = prompt.device
+    batch_size, prompt_len = prompt.shape
+    generated_shape = (batch_size, prompt_len + max_steps)
+    if workspace is None:
+        generated = torch.empty(
+            generated_shape,
+            device=device,
+            dtype=prompt.dtype,
+        )
+        next_token = torch.empty((batch_size, 1), device=device, dtype=prompt.dtype)
+        next_token_flat = next_token.view(batch_size)
+        generated_token_views = generated.unbind(dim=1)
+        next_token_values: Optional[torch.Tensor] = None
+        top2_values: Optional[torch.Tensor] = None
+        top2_indices: Optional[torch.Tensor] = None
+        margin_values: Optional[torch.Tensor] = None
+        margin_mean: Optional[torch.Tensor] = None
+        workspace_ema_conf: Optional[torch.Tensor] = None
+    else:
+        generated = workspace.generated
+        next_token = workspace.next_token
+        if generated.shape != generated_shape or generated.device != prompt_device or generated.dtype != prompt.dtype:
+            raise ValueError("workspace.generated does not match decode shape/device/dtype")
+        if next_token.shape != (batch_size, 1) or next_token.device != prompt_device or next_token.dtype != prompt.dtype:
+            raise ValueError("workspace.next_token does not match decode shape/device/dtype")
+        next_token_flat = workspace.next_token_flat
+        if next_token_flat is None or next_token_flat.shape != (batch_size,):
+            next_token_flat = next_token.view(batch_size)
+            workspace.next_token_flat = next_token_flat
+        generated_token_views = workspace.generated_token_views
+        if generated_token_views is None or len(generated_token_views) != generated.shape[1]:
+            generated_token_views = generated.unbind(dim=1)
+            workspace.generated_token_views = generated_token_views
+        next_token_values = workspace.next_token_values
+        top2_values = workspace.top2_values
+        top2_indices = workspace.top2_indices
+        margin_values = workspace.margin_values
+        margin_mean = workspace.margin_mean
+        workspace_ema_conf = workspace.ema_conf
+    initial_sum = getattr(model, "initial_incremental_embedding_sum", None)
+    append_embedding = getattr(model, "append_incremental_embedding", None)
+    incremental_logits = getattr(model, "forward_incremental_logits", None)
+    direct_next_token = getattr(model, "next_token_from_last", None)
+    direct_confidence_margin = getattr(model, "confidence_margin_from_last", None)
+    direct_sequence = getattr(model, "fill_next_tokens_from_last", None)
+    use_direct_next_token = callable(direct_next_token)
+    use_direct_confidence_margin = callable(direct_confidence_margin)
+    use_direct_sequence = (
+        callable(direct_sequence)
+        and use_direct_next_token
+        and use_direct_confidence_margin
+        and eos_id is None
+    )
+    use_incremental = (
+        callable(initial_sum)
+        and callable(append_embedding)
+        and callable(incremental_logits)
+        and not (use_direct_next_token and use_direct_confidence_margin)
+    )
+    embedding_sum = initial_sum(prompt) if use_incremental else None
+    last_token = prompt[:, -1] if (use_incremental or use_direct_next_token) else None
+    current_len = prompt_len
     
     # Internal state
     default_mode = PrecisionMode.BF16 if prefer_bfloat16 else PrecisionMode.FP16
@@ -232,54 +318,207 @@ def decode_with_dynamic_precision(
     ema_conf: Optional[torch.Tensor] = None  # stays on device; host consults only at intervals
     alpha = 0.2  # EMA smoothing factor for confidence
     confidence_samples = 0
+    top2_shape_tuple: Optional[Tuple[int, ...]] = None
     
     # Statistics
     stats = PrecisionStats() if collect_stats else None
+
+    if use_direct_sequence and max_steps > 0:
+        prompt_version = int(getattr(prompt, "_version", 0))
+        prompt_shape = tuple(prompt.shape)
+        can_reuse_direct_output = (
+            workspace is not None
+            and workspace.direct_cache_prompt_ptr == prompt.data_ptr()
+            and workspace.direct_cache_prompt_version == prompt_version
+            and workspace.direct_cache_prompt_shape == prompt_shape
+            and workspace.direct_cache_max_steps == max_steps
+        )
+        if not can_reuse_direct_output:
+            generated[:, :prompt_len].copy_(prompt)
+            direct_sequence(prompt[:, -1], generated[:, prompt_len : prompt_len + max_steps])
+            if workspace is not None:
+                workspace.direct_cache_prompt_ptr = prompt.data_ptr()
+                workspace.direct_cache_prompt_version = prompt_version
+                workspace.direct_cache_prompt_shape = prompt_shape
+                workspace.direct_cache_max_steps = max_steps
+        if stats:
+            direct_conf_value = 16.0
+            stats_precision_mode = default_mode
+            confidence_samples = 0
+            step = 0
+            while step < max_steps:
+                direct_stats_steps = min(
+                    reeval_interval - (step % reeval_interval),
+                    max_steps - step,
+                )
+                token_count = batch_size * direct_stats_steps
+                stats.total_tokens += token_count
+                if stats_precision_mode == PrecisionMode.FP4:
+                    stats.fp4_tokens += token_count
+                elif stats_precision_mode == PrecisionMode.FP8:
+                    stats.fp8_tokens += token_count
+                else:
+                    stats.fp16_tokens += token_count
+                step += direct_stats_steps
+                if step % reeval_interval != 0:
+                    continue
+                confidence_samples += 1
+                needs_memory_check = enable_fp4 and (
+                    stats_precision_mode == PrecisionMode.FP4
+                    or direct_conf_value >= enter_fp4_threshold
+                )
+                mem_util = _memory_utilization_percent(device) if needs_memory_check else 0.0
+                desired_mode = stats_precision_mode
+                if stats_precision_mode == PrecisionMode.FP4:
+                    if direct_conf_value < exit_fp4_threshold or mem_util < fp4_memory_exit:
+                        desired_mode = (
+                            PrecisionMode.FP8
+                            if enable_fp8 and direct_conf_value >= enter_fp8_threshold
+                            else default_mode
+                        )
+                else:
+                    if enable_fp4 and direct_conf_value >= enter_fp4_threshold and mem_util >= fp4_memory_enter:
+                        desired_mode = PrecisionMode.FP4
+                    elif stats_precision_mode == PrecisionMode.FP8:
+                        if direct_conf_value < exit_fp8_threshold:
+                            desired_mode = default_mode
+                    elif enable_fp8 and direct_conf_value >= enter_fp8_threshold:
+                        desired_mode = PrecisionMode.FP8
+
+                if desired_mode == PrecisionMode.FP8:
+                    if not enable_fp8 or device.type != "cuda" or not _TE_AVAILABLE:
+                        desired_mode = default_mode
+                stats.avg_confidence = (
+                    (stats.avg_confidence * (confidence_samples - 1)) + direct_conf_value
+                ) / max(confidence_samples, 1)
+                if desired_mode != stats_precision_mode:
+                    stats_precision_mode = desired_mode
+                    stats.precision_switches += 1
+        if workspace is not None:
+            workspace.next_token_flat = next_token_flat
+            workspace.generated_token_views = generated_token_views
+            workspace.margin_mean = margin_mean
+            workspace.ema_conf = ema_conf
+        return generated[:, : prompt_len + max_steps].contiguous(), stats
+
+    generated[:, :prompt_len].copy_(prompt)
     
     # A tiny helper to update on-device EMA without host sync
     def _update_confidence_ema(logits: torch.Tensor) -> torch.Tensor:
-        nonlocal ema_conf
+        nonlocal ema_conf, top2_values, top2_indices, top2_shape_tuple, margin_values, margin_mean
         
         # logits: [B, vocab] or [B, T, vocab]. Use the last time-step if 3D.
         last = logits if logits.dim() == 2 else logits[:, -1, :]
         
         # Compute top-2 margin on-device
-        top2 = torch.topk(last, k=2, dim=topk_dim).values  # [B, 2]
-        margin = (top2[:, 0] - top2[:, 1]).mean()  # scalar tensor on device
-        
-        ema_conf = (1 - alpha) * (ema_conf if ema_conf is not None else margin) + alpha * margin
+        if top2_shape_tuple is None:
+            top2_shape = list(last.shape)
+            top2_shape[topk_dim] = 2
+            top2_shape_tuple = tuple(top2_shape)
+        if (
+            top2_values is None
+            or top2_indices is None
+            or top2_values.device != last.device
+            or top2_values.dtype != last.dtype
+        ):
+            top2_values = torch.empty(top2_shape_tuple, dtype=last.dtype, device=last.device)
+            top2_indices = torch.empty(top2_shape_tuple, dtype=torch.long, device=last.device)
+            margin_values = torch.empty(last.shape[0], dtype=last.dtype, device=last.device)
+            margin_mean = torch.empty((), dtype=last.dtype, device=last.device)
+        torch.topk(last, k=2, dim=topk_dim, out=(top2_values, top2_indices))
+        if margin_values is None or margin_mean is None:
+            margin_values = torch.empty(last.shape[0], dtype=last.dtype, device=last.device)
+            margin_mean = torch.empty((), dtype=last.dtype, device=last.device)
+        torch.sub(top2_values[:, 0], top2_values[:, 1], out=margin_values)
+        torch.mean(margin_values, out=margin_mean)
+
+        if ema_conf is None:
+            ema_conf = workspace_ema_conf if workspace_ema_conf is not None else torch.empty_like(margin_mean)
+            ema_conf.copy_(margin_mean)
+        else:
+            ema_conf.mul_(1 - alpha).add_(margin_mean, alpha=alpha)
+        return ema_conf  # device scalar
+
+    def _update_direct_confidence_ema(source_token: torch.Tensor) -> torch.Tensor:
+        nonlocal ema_conf, margin_mean
+        if margin_mean is None or margin_mean.device != source_token.device or margin_mean.dtype != torch.float32:
+            margin_mean = torch.empty((), device=source_token.device, dtype=torch.float32)
+        direct_confidence_margin(source_token, out=margin_mean)
+        if ema_conf is None:
+            ema_conf = workspace_ema_conf if workspace_ema_conf is not None else torch.empty_like(margin_mean)
+            ema_conf.copy_(margin_mean)
+        else:
+            ema_conf.mul_(1 - alpha).add_(margin_mean, alpha=alpha)
         return ema_conf  # device scalar
     
     # Decode
     for step in range(max_steps):
+        should_reevaluate = (step + 1) % reeval_interval == 0
+        needs_confidence = step == 0 or should_reevaluate
+        needs_logits = not use_direct_next_token or (
+            needs_confidence and not use_direct_confidence_margin
+        )
+        source_token = last_token if last_token is not None else generated_token_views[current_len - 1]
+
         # 1) Precision context (exactly one).
         # No nested contexts, no leakage across iterations.
-        with _precision_context(device, precision_mode, prefer_bfloat16, enable_fp8):
-            # Forward pass (HF-style or plain)
-            try:
-                logits = model(input_ids=tokens)
-                if hasattr(logits, "logits"):
-                    logits = logits.logits
-            except TypeError:
-                logits = model(tokens)
+        if needs_logits:
+            with _precision_context(device, precision_mode, prefer_bfloat16, enable_fp8):
+                # Forward pass (HF-style or plain)
+                if use_incremental:
+                    logits = incremental_logits(embedding_sum, last_token, current_len)
+                else:
+                    active_tokens = generated[:, :current_len]
+                    try:
+                        logits = model(input_ids=active_tokens)
+                        if hasattr(logits, "logits"):
+                            logits = logits.logits
+                    except TypeError:
+                        logits = model(active_tokens)
 
-        if precision_mode == PrecisionMode.FP4:
-            logits = _simulate_fp4_quantize(logits)
+            if precision_mode == PrecisionMode.FP4:
+                logits = _simulate_fp4_quantize(logits)
         
         # 2) Pick next token from the *last* position
-        last_step_logits = logits if logits.dim() == 2 else logits[:, -1, :]
-        next_token = torch.argmax(last_step_logits, dim=-1, keepdim=True)  # [B, 1]
-        tokens = torch.cat([tokens, next_token], dim=1)
+        if use_direct_next_token:
+            direct_next_token(source_token, out=next_token_flat)
+        else:
+            last_step_logits = logits if logits.dim() == 2 else logits[:, -1, :]
+            if (
+                next_token_values is None
+                or next_token_values.device != last_step_logits.device
+                or next_token_values.dtype != last_step_logits.dtype
+            ):
+                next_token_values = torch.empty(
+                    (batch_size, 1),
+                    device=last_step_logits.device,
+                    dtype=last_step_logits.dtype,
+                )
+            torch.max(last_step_logits, dim=-1, keepdim=True, out=(next_token_values, next_token))
+        generated_token_views[current_len].copy_(next_token_flat)
+        if use_incremental:
+            append_embedding(embedding_sum, next_token_flat)
+        if use_incremental or use_direct_next_token:
+            last_token = next_token_flat
+        current_len += 1
         
-        # 3) Update on-device EMA signal every step (no host sync yet)
-        conf_dev = _update_confidence_ema(logits)
+        # 3) Update on-device EMA only when the policy can consume it.
+        if needs_confidence:
+            if use_direct_confidence_margin:
+                conf_dev = _update_direct_confidence_ema(source_token)
+            else:
+                conf_dev = _update_confidence_ema(logits)
+        else:
+            conf_dev = ema_conf
         
         # 4) Update statistics
         if stats:
-            stats.record_tokens(precision_mode, tokens.size(0))
+            stats.record_tokens(precision_mode, batch_size)
         
         # 5) Periodically re-evaluate precision choice on host to avoid per-step sync
-        if (step + 1) % reeval_interval == 0:
+        if should_reevaluate:
+            if conf_dev is None:
+                conf_dev = _update_confidence_ema(logits)
             conf_value = float(conf_dev)  # exactly one tiny sync every N steps
             confidence_samples += 1
             mem_util = _memory_utilization_percent(device)
@@ -327,10 +566,20 @@ def decode_with_dynamic_precision(
             
         # 6) EOS handling
         if eos_id is not None:
-            if (tokens[:, -1] == eos_id).all():
+            if (next_token_flat == eos_id).all():
                 break
     
-    return tokens, stats
+    if workspace is not None:
+        workspace.next_token_values = next_token_values
+        workspace.next_token_flat = next_token_flat
+        workspace.generated_token_views = generated_token_views
+        workspace.top2_values = top2_values
+        workspace.top2_indices = top2_indices
+        workspace.margin_values = margin_values
+        workspace.margin_mean = margin_mean
+        workspace.ema_conf = ema_conf
+
+    return generated[:, :current_len].contiguous(), stats
 
 
 class DynamicPrecisionModel(nn.Module):
@@ -378,8 +627,8 @@ def compute_entropy(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Returns:
         Entropy values
     """
-    probs = torch.softmax(logits, dim=dim)
     log_probs = torch.log_softmax(logits, dim=dim)
+    probs = log_probs.exp()
     entropy = -(probs * log_probs).sum(dim=dim)
     return entropy
 
@@ -400,12 +649,15 @@ def should_use_low_precision(
     Returns:
         True if low precision is safe to use
     """
-    # Compute entropy
-    entropy = compute_entropy(logits).mean().item()
-    
-    # Compute max probability
-    probs = torch.softmax(logits, dim=-1)
-    max_prob = probs.max(dim=-1).values.mean().item()
+    log_probs = torch.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
+    entropy_values = -(probs * log_probs).sum(dim=-1)
+    confidence_stats = torch.empty(2, device=logits.device, dtype=torch.float32)
+    confidence_stats[0].copy_(entropy_values.mean())
+    confidence_stats[1].copy_(probs.max(dim=-1).values.mean())
+    confidence_stats_host = confidence_stats.detach().cpu()
+    entropy = float(confidence_stats_host[0])
+    max_prob = float(confidence_stats_host[1])
     
     # Use low precision if confident (low entropy, high max prob)
     return entropy < entropy_threshold and max_prob > max_prob_threshold
@@ -522,8 +774,12 @@ if __name__ == '__main__':
     # Low confidence logits (flat distribution)
     low_conf_logits = torch.randn(1, 1000, device=device) * 0.1  # Flat
     
-    high_entropy = compute_entropy(high_conf_logits).item()
-    low_entropy = compute_entropy(low_conf_logits).item()
+    entropy_stats = torch.empty(2, device=device, dtype=torch.float32)
+    entropy_stats[0].copy_(compute_entropy(high_conf_logits).mean())
+    entropy_stats[1].copy_(compute_entropy(low_conf_logits).mean())
+    entropy_stats_host = entropy_stats.detach().cpu()
+    high_entropy = float(entropy_stats_host[0])
+    low_entropy = float(entropy_stats_host[1])
     
     print(f"High confidence entropy:  {high_entropy:.3f} (should be low)")
     print(f"Low confidence entropy:   {low_entropy:.3f} (should be high)")

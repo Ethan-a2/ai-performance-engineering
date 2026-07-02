@@ -31,6 +31,21 @@ class GradientSharder:
         self.optimizer = optimizer
         self.params = [p for group in optimizer.param_groups for p in group["params"]]
         self._shard_parameters()
+        self.local_index_set = set(self.local_indices)
+        self._reduce_inputs: dict[int, torch.Tensor] = {}
+        self._shard_grads: dict[int, torch.Tensor] = {}
+        world_size = get("ws")
+        for idx, param in enumerate(self.params):
+            self._reduce_inputs[idx] = torch.empty(
+                param.numel() * world_size,
+                device=param.device,
+                dtype=param.dtype,
+            )
+            self._shard_grads[idx] = torch.empty(
+                param.numel(),
+                device=param.device,
+                dtype=param.dtype,
+            )
         self.communication_time = 0.0
         self.step_time = 0.0
 
@@ -51,6 +66,7 @@ class GradientSharder:
     def step(self, closure=None):
         step_start = time.perf_counter()
         comm_start = step_start
+        world_size = get("ws")
 
         for idx, param in enumerate(self.params):
             grad = param.grad
@@ -58,12 +74,15 @@ class GradientSharder:
                 continue
 
             flattened = grad.data.contiguous().view(-1)
-            in_tensor = torch.cat([flattened for _ in range(get("ws"))], dim=0)
-            shard_grad = torch.empty_like(flattened)
+            in_tensor = self._reduce_inputs[idx]
+            in_tensor.view(world_size, -1).copy_(flattened.unsqueeze(0))
+
+            shard_grad = self._shard_grads[idx]
             dist.reduce_scatter_tensor(shard_grad, in_tensor, op=dist.ReduceOp.SUM)
 
-            if idx in self.local_indices:
-                param.grad = (shard_grad / get("ws")).view_as(grad.data)
+            if idx in self.local_index_set:
+                shard_grad.div_(world_size)
+                param.grad = shard_grad.view_as(grad.data)
             else:
                 param.grad = None
 
@@ -72,8 +91,8 @@ class GradientSharder:
 
         self.optimizer.step(closure)
 
-        shard_size = len(self.params) // get("ws")
-        remainder = len(self.params) % get("ws")
+        shard_size = len(self.params) // world_size
+        remainder = len(self.params) % world_size
         for idx, param in enumerate(self.params):
             if idx < (shard_size + 1) * remainder:
                 owner = idx // (shard_size + 1)
@@ -91,7 +110,7 @@ class GradientSharder:
 def _build_model(hidden_size: int, device):
     layers = []
     for _ in range(6):
-        layers.extend([nn.Linear(hidden_size, hidden_size), nn.ReLU()])
+        layers.extend([nn.Linear(hidden_size, hidden_size), nn.ReLU(inplace=True)])
     layers.append(nn.Linear(hidden_size, hidden_size))
     return nn.Sequential(*layers).to(device)
 
@@ -103,11 +122,13 @@ def _build_adamw(params) -> AdamW:
 def train(model, optimizer, batch_size, device, steps, label):
     rank = get("rank")
     input_dim = model[0].in_features
+    x = torch.empty(batch_size, input_dim, device=device)
+    y = torch.empty_like(x)
 
     optimizer.zero_grad()
-    warm_x = torch.randn(batch_size, input_dim, device=device)
-    warm_y = torch.randn_like(warm_x)
-    nn.functional.mse_loss(model(warm_x), warm_y).backward()
+    x.normal_()
+    y.normal_()
+    nn.functional.mse_loss(model(x), y).backward()
     optimizer.step()
     torch.cuda.synchronize()
 
@@ -120,8 +141,8 @@ def train(model, optimizer, batch_size, device, steps, label):
         torch.cuda.reset_peak_memory_stats(device)
         optimizer.zero_grad()
 
-        x = torch.randn(batch_size, input_dim, device=device)
-        y = torch.randn_like(x)
+        x.normal_()
+        y.normal_()
         loss = nn.functional.mse_loss(model(x), y)
         loss.backward()
         optimizer.step()

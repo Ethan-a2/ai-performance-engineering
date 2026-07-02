@@ -21,12 +21,12 @@ import argparse
 import json
 import math
 import random
-import statistics
 import time
 import sys
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 from labs.dynamic_router.router_round_robin import BaselineRouter, Request
 from labs.dynamic_router.router_policy import Router, SequenceInfo
@@ -65,8 +65,8 @@ class VirtualGPU:
     numa_node: Optional[int] = None
     host_kv_local_gb: float = 24.0
     host_kv_remote_gb: float = 4.0
-    prefill_q: List[PrefillTask] = field(default_factory=list)
-    decode_q: List[DecodeTask] = field(default_factory=list)
+    prefill_q: Deque[PrefillTask] = field(default_factory=deque)
+    decode_q: Deque[DecodeTask] = field(default_factory=deque)
     ttft_ema: float = 0.0
     tpot_ema: float = 0.0
     queue_depth_sum: float = 0.0
@@ -101,7 +101,7 @@ class VirtualGPU:
             task.remaining_time -= tick_s
             if task.remaining_time <= 0:
                 completed_prefills.append(task.req_id)
-                self.prefill_q.pop(0)
+                self.prefill_q.popleft()
 
         # Process decode tasks (simple FCFS, one-at-a-time)
         if self.decode_q:
@@ -111,7 +111,7 @@ class VirtualGPU:
             decode_events.append((task.req_id, tokens, not task.first_token_emitted))
             task.first_token_emitted = True
             if task.remaining_tokens <= 0:
-                self.decode_q.pop(0)
+                self.decode_q.popleft()
 
         return completed_prefills, decode_events
 
@@ -216,11 +216,8 @@ def build_optimized_router(gpus: Dict[str, VirtualGPU], queue_urgency: float, co
     return r
 
 
-def _percentile(data: List[float], pct: float) -> float:
-    if not data:
-        return 0.0
+def _percentile_from_ordered(data_sorted: List[float], pct: float) -> float:
     assert 0.0 <= pct <= 100.0
-    data_sorted = sorted(data)
     k = (len(data_sorted) - 1) * (pct / 100.0)
     f = math.floor(k)
     c = math.ceil(k)
@@ -229,6 +226,20 @@ def _percentile(data: List[float], pct: float) -> float:
     d0 = data_sorted[int(f)] * (c - k)
     d1 = data_sorted[int(c)] * (k - f)
     return d0 + d1
+
+
+def _percentile(data: List[float], pct: float) -> float:
+    if not data:
+        return 0.0
+    data.sort()
+    return _percentile_from_ordered(data, pct)
+
+
+def _percentiles(data: List[float], pcts: Tuple[float, ...]) -> Tuple[float, ...]:
+    if not data:
+        return tuple(0.0 for _ in pcts)
+    data.sort()
+    return tuple(_percentile_from_ordered(data, pct) for pct in pcts)
 
 
 def _poisson(lam: float) -> int:
@@ -267,6 +278,7 @@ def simulate(
     requests: Dict[str, RequestState] = {}
     next_id = 0
     completed_ttfts: List[float] = []
+    completed_ttft_total = 0.0
     completed_count = 0
     good_requests = 0
     good_tokens = 0
@@ -334,16 +346,23 @@ def simulate(
                     state.ttft_ms = (now - state.admitted_at) * 1000.0
                     state.decode_started_at = now
                     completed_ttfts.append(state.ttft_ms)
+                    completed_ttft_total += state.ttft_ms
                     ttft_samples.append(state.ttft_ms)
                 state.decode_finished_at = now
             gpu.update_smoothed_metrics(ttft_samples, tokens_emitted)
 
         # 4) Optional: migrate (optimized only)
         if optimized and tick % 5 == 0:
+            active_decode_ids_by_gpu = {
+                gid: {task.req_id for task in gpu.decode_q}
+                for gid, gpu in gpus.items()
+                if gpu.decode_q
+            }
             active = []
             for state in requests.values():
                 if state.ttft_ms is not None and state.decode_gpu is not None:
-                    if any(t.req_id == state.req.req_id for t in gpus[state.decode_gpu].decode_q):
+                    decode_ids = active_decode_ids_by_gpu.get(state.decode_gpu)
+                    if decode_ids is not None and state.req.req_id in decode_ids:
                         active.append(
                             SequenceInfo(
                                 seq_id=state.req.req_id,
@@ -360,15 +379,20 @@ def simulate(
                 for idx, task in enumerate(src_gpu.decode_q):
                     if task.req_id == rid:
                         dst_gpu.decode_q.append(task)
-                        src_gpu.decode_q.pop(idx)
+                        del src_gpu.decode_q[idx]
                         break
 
         # 5) Clean up finished requests
+        active_request_ids = {
+            task.req_id
+            for gpu in gpus.values()
+            for queue in (gpu.prefill_q, gpu.decode_q)
+            for task in queue
+        }
         finished = [
             rid
             for rid, state in requests.items()
-            if state.req.req_id
-            not in [t.req_id for gpu in gpus.values() for t in gpu.prefill_q + gpu.decode_q]
+            if state.req.req_id not in active_request_ids
         ]
         for rid in finished:
             if mode == "baseline":
@@ -387,10 +411,17 @@ def simulate(
 
         # Optional slow logging
         if log_interval and log_interval > 0 and tick % log_interval == 0:
-            avg_ttft = [
-                s.ttft_ms for s in requests.values() if s.ttft_ms is not None
-            ]
-            ttft_str = f"{sum(avg_ttft)/len(avg_ttft):.1f} ms" if avg_ttft else "n/a"
+            active_ttft_total = 0.0
+            active_ttft_count = 0
+            for state in requests.values():
+                if state.ttft_ms is not None:
+                    active_ttft_total += state.ttft_ms
+                    active_ttft_count += 1
+            ttft_str = (
+                f"{active_ttft_total / active_ttft_count:.1f} ms"
+                if active_ttft_count
+                else "n/a"
+            )
             if optimized:
                 scores = {gid: g.queue_depth_avg() for gid, g in gpus.items() if g.is_decode}
                 print(
@@ -426,20 +457,34 @@ def simulate(
     }
 
     if completed_ttfts:
+        ttft_p50, ttft_p95 = _percentiles(completed_ttfts, (50.0, 95.0))
         summary.update(
             {
-                "ttft_ms_mean": statistics.mean(completed_ttfts),
-                "ttft_ms_p50": _percentile(completed_ttfts, 50.0),
-                "ttft_ms_p95": _percentile(completed_ttfts, 95.0),
+                "ttft_ms_mean": completed_ttft_total / len(completed_ttfts),
+                "ttft_ms_p50": ttft_p50,
+                "ttft_ms_p95": ttft_p95,
             }
         )
     else:
         summary.update({"ttft_ms_mean": 0.0, "ttft_ms_p50": 0.0, "ttft_ms_p95": 0.0})
 
-    decode_tpots = [g.tpot_ema for g in gpus.values() if g.is_decode]
-    prefill_tpots = [g.tpot_ema for g in gpus.values() if g.is_prefill]
-    summary["avg_decode_tpot_tok_per_s"] = statistics.mean(decode_tpots) if decode_tpots else 0.0
-    summary["avg_prefill_tpot_tok_per_s"] = statistics.mean(prefill_tpots) if prefill_tpots else 0.0
+    decode_tpot_total = 0.0
+    decode_tpot_count = 0
+    prefill_tpot_total = 0.0
+    prefill_tpot_count = 0
+    for gpu in gpus.values():
+        if gpu.is_decode:
+            decode_tpot_total += gpu.tpot_ema
+            decode_tpot_count += 1
+        if gpu.is_prefill:
+            prefill_tpot_total += gpu.tpot_ema
+            prefill_tpot_count += 1
+    summary["avg_decode_tpot_tok_per_s"] = (
+        decode_tpot_total / decode_tpot_count if decode_tpot_count else 0.0
+    )
+    summary["avg_prefill_tpot_tok_per_s"] = (
+        prefill_tpot_total / prefill_tpot_count if prefill_tpot_count else 0.0
+    )
 
     total_hours = num_ticks * TICK_SECONDS / 3600.0
     total_cost = sum(g.hourly_cost for g in gpus.values()) * total_hours

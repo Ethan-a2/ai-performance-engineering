@@ -7,6 +7,7 @@ performance. FlexAttention must be compiled to generate fused kernels;
 without compilation it materializes the full attention matrix.
 """
 import os
+import sys
 
 try:
     pass
@@ -24,7 +25,6 @@ except Exception:
 import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-import time
 
 from core.utils.compile_utils import enable_tf32, compile_model
 
@@ -105,7 +105,7 @@ class FlexAttentionWRONG(nn.Module):
         def sliding_window(b, h, q_idx, kv_idx):
             return (q_idx - kv_idx).abs() <= self.window_size
         
-        block_mask = create_block_mask(sliding_window, B, H, T, T)
+        block_mask = create_block_mask(sliding_window, B, H, T, T, device=Q.device)
         
         # WITHOUT torch.compile - this is SLOW!
         return flex_attention(Q, K, V, block_mask=block_mask)
@@ -125,7 +125,7 @@ class FlexAttentionCORRECT(nn.Module):
         B, H, T, D = Q.shape
         
         # Create block mask using pre-defined function
-        block_mask = create_block_mask(self.mask_fn, B, H, T, T)
+        block_mask = create_block_mask(self.mask_fn, B, H, T, T, device=Q.device)
         
         # Will be compiled by torch.compile wrapper - generates fused kernel!
         return flex_attention(Q, K, V, block_mask=block_mask)
@@ -146,14 +146,18 @@ def benchmark_attention(model, Q, K, V, name, num_warmup=50, num_iters=200):
     torch.cuda.synchronize()
     
     # Benchmark
-    start = time.perf_counter()
+    count = max(num_iters, 1)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     with torch.inference_mode():
-        for _ in range(num_iters):
+        current_stream = torch.cuda.current_stream(Q.device)
+        start.record(current_stream)
+        for _ in range(count):
             _ = model(Q, K, V)
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+        end.record(current_stream)
+    end.synchronize()
     
-    avg_time_ms = (elapsed / num_iters) * 1000
+    avg_time_ms = start.elapsed_time(end) / count
     
     print(f"  Average time: {avg_time_ms:.2f} ms")
     

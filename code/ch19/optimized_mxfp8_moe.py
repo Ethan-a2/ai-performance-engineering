@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -18,7 +17,6 @@ from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range  # noqa: E402
 from ch19 import arch_config  # noqa: E402
 from ch19.mxfp8_moe_common import (  # noqa: E402
-    MX_BLOCK_SIZE,
     balanced_assignments,
     bucket_by_expert,
     require_blackwell,
@@ -41,6 +39,13 @@ except Exception as exc:  # pragma: no cover
 _log = logger.get_logger(__name__)
 
 
+def _flat_topk_token_ids(num_tokens: int, top_k: int, device: torch.device) -> torch.Tensor:
+    token_ids = torch.arange(num_tokens * top_k, device=device, dtype=torch.int64)
+    if top_k > 1:
+        token_ids.div_(top_k, rounding_mode="floor")
+    return token_ids
+
+
 class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
     """MXFP8 MoE forward path with grouped GEMMs and fused quantization in TE."""
 
@@ -60,7 +65,9 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.bucket_indices: Optional[torch.Tensor] = None
         self.expert_order: Optional[torch.Tensor] = None
         self.bucket_token_ids: Optional[torch.Tensor] = None
+        self._bucket_token_scatter_index: Optional[torch.Tensor] = None
         self.gating_weights: Optional[torch.Tensor] = None
+        self._gating_weight_factors: Optional[torch.Tensor] = None
         self.m_splits: List[int] = []
         self.weights: Optional[torch.Tensor] = None
         self.layer: Optional[GroupedLinear] = None
@@ -68,9 +75,15 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._graph_out: Optional[torch.Tensor] = None
         self._graph_weight: Optional[torch.Tensor] = None
+        self._graph_weight_factors: Optional[torch.Tensor] = None
+        self._graph_weighted_out: Optional[torch.Tensor] = None
         self._restored_out: Optional[torch.Tensor] = None
         self._restored_weight: Optional[torch.Tensor] = None
+        self._restored_weight_factors: Optional[torch.Tensor] = None
+        self._weighted_out: Optional[torch.Tensor] = None
         self._verification_payload = None
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
         self.register_workload_metadata(requests_per_iteration=1.0)
 
     @staticmethod
@@ -101,25 +114,21 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
             offsets.append((cursor, cursor + m))
             cursor += m
         order = sorted(range(len(m_splits)), key=lambda i: m_splits[i], reverse=True)
-        reordered_inputs: List[torch.Tensor] = []
-        reordered_indices: List[torch.Tensor] = []
-        reordered_splits: List[int] = []
-        reordered_experts: List[int] = []
-        reordered_token_ids: List[torch.Tensor] = []
-        reordered_weights: List[torch.Tensor] = []
+        reordered_splits = [m_splits[idx] for idx in order]
+        order_tensor = torch.tensor(order, device=bucketed.device, dtype=torch.int64)
+        base_rows = torch.arange(bucketed.shape[0], device=bucketed.device, dtype=torch.int64)
+        row_order = torch.empty_like(base_rows)
+        row_cursor = 0
         for idx in order:
             start, end = offsets[idx]
-            reordered_inputs.append(bucketed.narrow(0, start, m_splits[idx]))
-            reordered_indices.append(bucket_indices.narrow(0, start, m_splits[idx]))
-            reordered_splits.append(m_splits[idx])
-            reordered_experts.append(expert_order[idx].item())
-            reordered_token_ids.append(bucket_token_ids.narrow(0, start, m_splits[idx]))
-            reordered_weights.append(gating_weights.narrow(0, start, m_splits[idx]))
-        new_bucketed = torch.cat(reordered_inputs, dim=0)
-        new_indices = torch.cat(reordered_indices, dim=0)
-        new_order = torch.tensor(reordered_experts, device=bucketed.device, dtype=torch.int64)
-        new_token_ids = torch.cat(reordered_token_ids, dim=0)
-        new_weights = torch.cat(reordered_weights, dim=0)
+            width = end - start
+            row_order.narrow(0, row_cursor, width).copy_(base_rows.narrow(0, start, width))
+            row_cursor += width
+        new_bucketed = bucketed.index_select(0, row_order)
+        new_indices = bucket_indices.index_select(0, row_order)
+        new_order = expert_order.index_select(0, order_tensor)
+        new_token_ids = bucket_token_ids.index_select(0, row_order)
+        new_weights = gating_weights.index_select(0, row_order)
         return new_bucketed, reordered_splits, new_indices, new_order, new_token_ids, new_weights
 
     def _maybe_log_missing_te(self) -> None:
@@ -136,28 +145,36 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("SKIPPED: MXFP8 path disabled via arch_config.USE_TE_FP8.")
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         self.inputs = torch.randn(
             self.num_tokens, self.hidden_dim, device=self.device, dtype=torch.bfloat16
         )
         self.weights = torch.randn(
             self.num_experts, self.ffn_dim, self.hidden_dim, device=self.device, dtype=torch.bfloat16
         )
+        self._payload_parameter_count = self.weights.numel()
         base_assign = balanced_assignments(
             num_tokens=self.num_tokens, num_experts=self.num_experts, device=self.device
         )
         top_k = max(1, int(self.top_k))
+        token_ids = _flat_topk_token_ids(self.num_tokens, top_k, self.device)
         if top_k == 1:
             assignments = base_assign
             expanded_inputs = self.inputs
-            token_ids = torch.arange(self.num_tokens, device=self.device, dtype=torch.int64)
             gating_weights = torch.ones(self.num_tokens, device=self.device, dtype=torch.float16)
         else:
-            expert_matrix = [(base_assign + offset) % self.num_experts for offset in range(top_k)]
-            assignments = torch.stack(expert_matrix, dim=-1).reshape(-1)
-            expanded_inputs = self.inputs.repeat_interleave(top_k, dim=0)
-            token_ids = torch.arange(self.num_tokens, device=self.device, dtype=torch.int64).repeat_interleave(
-                top_k
+            offsets = torch.arange(top_k, device=self.device, dtype=base_assign.dtype)
+            assignment_matrix = torch.empty(
+                self.num_tokens,
+                top_k,
+                device=self.device,
+                dtype=base_assign.dtype,
             )
+            torch.add(base_assign.unsqueeze(1), offsets, out=assignment_matrix)
+            torch.remainder(assignment_matrix, self.num_experts, out=assignment_matrix)
+            assignments = assignment_matrix.reshape(-1)
+            expanded_inputs = self.inputs.index_select(0, token_ids)
             gating_weights = torch.full(
                 (self.num_tokens * top_k,),
                 1.0 / float(top_k),
@@ -178,7 +195,12 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.bucket_indices = bucket_indices
         self.expert_order = expert_order
         self.bucket_token_ids = bucket_token_ids
+        self._bucket_token_scatter_index = bucket_token_ids.unsqueeze(-1).expand(
+            bucketed.shape[0],
+            self.ffn_dim,
+        )
         self.gating_weights = gating_weights
+        self._gating_weight_factors = gating_weights.unsqueeze(-1)
         self.m_splits = m_splits
 
         ordered_weights = self.weights.index_select(0, self.expert_order)
@@ -190,18 +212,20 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 bias=False,
                 params_dtype=torch.bfloat16,
             ).to(self.device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 for idx in range(len(self.m_splits)):
                     weight_param = getattr(self.layer, f"weight{idx}")
                     weight_param.copy_(ordered_weights[idx])
 
         self._calibrate_fp8()
-        if self.use_cuda_graphs:
-            self._capture_graph()
         self._restored_out = torch.empty(
             (self.num_tokens, self.ffn_dim), device=self.device, dtype=torch.float16
         )
         self._restored_weight = torch.empty((self.num_tokens,), device=self.device, dtype=torch.float16)
+        self._restored_weight_factors = self._restored_weight.unsqueeze(-1)
+        self._weighted_out = torch.empty((bucketed.shape[0], self.ffn_dim), device=self.device, dtype=torch.float16)
+        if self.use_cuda_graphs:
+            self._capture_graph()
         self.register_workload_metadata(tokens_per_iteration=float(self.num_tokens))
         torch.cuda.synchronize(self.device)
 
@@ -222,7 +246,13 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
             and self.bucketed_inputs is not None
             and self.bucket_indices is not None
             and self.bucket_token_ids is not None
+            and self._bucket_token_scatter_index is not None
             and self.gating_weights is not None
+            and self._gating_weight_factors is not None
+            and self._restored_out is not None
+            and self._restored_weight is not None
+            and self._restored_weight_factors is not None
+            and self._weighted_out is not None
         )
         with te_autocast(enabled=True, recipe=self.recipe):
             bucketed_out = self.layer(
@@ -237,15 +267,29 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
             weights=self.gating_weights,
             out=self._restored_out,
             weight_out=self._restored_weight,
+            weighted_out=self._weighted_out,
+            bucket_token_ids_expanded=self._bucket_token_scatter_index,
+            weights_expanded=self._gating_weight_factors,
+            weight_out_expanded=self._restored_weight_factors,
         )
 
     def _capture_graph(self) -> None:
-        assert self.bucket_token_ids is not None and self.gating_weights is not None
+        assert (
+            self.bucketed_inputs is not None
+            and self.bucket_token_ids is not None
+            and self._bucket_token_scatter_index is not None
+            and self.gating_weights is not None
+            and self._gating_weight_factors is not None
+        )
         self._graph = torch.cuda.CUDAGraph()
         self._graph_out = torch.empty(
             (self.num_tokens, self.ffn_dim), device=self.device, dtype=torch.float16
         )
         self._graph_weight = torch.empty((self.num_tokens,), device=self.device, dtype=torch.float16)
+        self._graph_weight_factors = self._graph_weight.unsqueeze(-1)
+        self._graph_weighted_out = torch.empty(
+            (self.bucketed_inputs.shape[0], self.ffn_dim), device=self.device, dtype=torch.float16
+        )
         torch.cuda.synchronize(self.device)
         with torch.cuda.graph(self._graph):
             with te_autocast(enabled=True, recipe=self.recipe):
@@ -261,11 +305,14 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 weights=self.gating_weights,
                 out=self._graph_out,
                 weight_out=self._graph_weight,
+                weighted_out=self._graph_weighted_out,
+                bucket_token_ids_expanded=self._bucket_token_scatter_index,
+                weights_expanded=self._gating_weight_factors,
+                weight_out_expanded=self._graph_weight_factors,
             )
 
     def benchmark_fn(self) -> None:
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        with nvtx_range("mxfp8_moe_optimized", enable=enable_nvtx):
+        with torch.inference_mode(), nvtx_range("mxfp8_moe_optimized", enable=self._enable_nvtx):
             if self.use_cuda_graphs and self._graph is not None and self._graph_out is not None:
                 self._graph.replay()
                 self.output = self._graph_out
@@ -279,7 +326,7 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
             inputs={"inputs": self.inputs},
             output=self.output.to(torch.float16) if self.output is not None else self.output,
             batch_size=self.num_tokens,
-            parameter_count=self.weights.numel() if self.weights is not None else 0,
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(0.5, 20.0),
             precision_flags={"fp16": False, "bf16": True, "fp8": True, "tf32": False},
         )
@@ -310,14 +357,20 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.bucket_indices = None
         self.expert_order = None
         self.bucket_token_ids = None
+        self._bucket_token_scatter_index = None
         self.gating_weights = None
+        self._gating_weight_factors = None
         self.m_splits = []
         self.layer = None
         self._graph = None
         self._graph_out = None
         self._graph_weight = None
+        self._graph_weight_factors = None
+        self._graph_weighted_out = None
         self._restored_out = None
         self._restored_weight = None
+        self._restored_weight_factors = None
+        self._weighted_out = None
         torch.cuda.empty_cache()
 
     def validate_result(self) -> Optional[str]:
@@ -348,4 +401,3 @@ class OptimizedMXFP8MoEBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedMXFP8MoEBenchmark()
-

@@ -26,7 +26,10 @@ class OptimizedAttentionILPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.attention_terms: Optional[torch.Tensor] = None
         self._buf0: Optional[torch.Tensor] = None
         self._buf1: Optional[torch.Tensor] = None
+        self._output_view0: Optional[torch.Tensor] = None
+        self._output_view1: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.workload = WORKLOAD
         self.batch = self.workload.attention_batch
         self.embed_dim = self.workload.attention_embed_dim
@@ -34,6 +37,7 @@ class OptimizedAttentionILPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.head_dim = self.embed_dim // self.num_heads
         self.tokens = self.workload.attention_tokens
         self.repeats = 8
+        self._repeat_range = range(self.repeats)
         self.score_terms = self.batch * self.tokens * self.num_heads * self.head_dim
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch),
@@ -59,6 +63,9 @@ class OptimizedAttentionILPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.attention_terms = (query * key * 0.1).contiguous().reshape(-1)
         self._buf0 = torch.empty_like(self.attention_terms)
         self._buf1 = torch.empty_like(self.attention_terms)
+        self._output_view0 = self._buf0[:4096]
+        self._output_view1 = self._buf1[:4096]
+        self._verify_output_buffer = torch.empty_like(self._output_view0)
         self.output = None
         self._synchronize()
 
@@ -67,20 +74,24 @@ class OptimizedAttentionILPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         assert self._extension is not None
         assert self.attention_terms is not None
         assert self._buf0 is not None and self._buf1 is not None
-        with self._nvtx_range("optimized_attention_ilp"):
+        assert self._output_view0 is not None and self._output_view1 is not None
+        with torch.inference_mode(), self._nvtx_range("optimized_attention_ilp"):
             src: torch.Tensor = self.attention_terms
             buf0: torch.Tensor = self._buf0
             buf1: torch.Tensor = self._buf1
             dst: torch.Tensor = buf0
-            for _ in range(self.repeats):
+            for _ in self._repeat_range:
                 self._extension.unrolled_ilp(dst, src)
                 src, dst = dst, (buf1 if dst is buf0 else buf0)
-        self.output = src[:4096].detach().clone()
+        self.output = self._output_view0 if src is buf0 else self._output_view1
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output before verification")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"attention_terms": self.attention_terms},
-            output=self.output.detach(),
+            output=self._verify_output_buffer,
             batch_size=self.batch,
             parameter_count=0,
             output_tolerance=(1e-5, 1e-5),
@@ -92,7 +103,10 @@ class OptimizedAttentionILPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.attention_terms = None
         self._buf0 = None
         self._buf1 = None
+        self._output_view0 = None
+        self._output_view1 = None
         self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

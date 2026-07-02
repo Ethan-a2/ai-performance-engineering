@@ -26,7 +26,7 @@ def get_device(use_cuda: bool = True) -> torch.device:
 
 
 # Adapted from https://github.com/linkedin/Liger-Kernel/blob/main/test/utils.py
-@torch.no_grad()
+@torch.inference_mode()
 def verbose_allclose(
     received: torch.Tensor, expected: torch.Tensor, rtol=1e-05, atol=1e-08, max_print=5
 ) -> list[str]:
@@ -74,17 +74,18 @@ def verbose_allclose(
         torch.logical_or(posinf_mismatched, neginf_mismatched),
     )
 
-    mismatched_indices = torch.nonzero(mismatched)
+    mismatched_indices = torch.nonzero(mismatched, as_tuple=False)
 
     # Count the number of mismatched elements
-    num_mismatched = mismatched.count_nonzero().item()
+    num_mismatched = int(mismatched_indices.shape[0])
 
     # Generate detailed information if there are mismatches
     if num_mismatched >= 1:
         mismatch_details = [f"Number of mismatched elements: {num_mismatched}"]
 
-        for index in mismatched_indices[:max_print]:
-            i = tuple(index.tolist())
+        mismatch_index_rows = mismatched_indices[:max_print].detach().cpu().tolist()
+        for index in mismatch_index_rows:
+            i = tuple(int(dim) for dim in index)
             mismatch_details.append(f"ERROR AT {i}: {received[i]} {expected[i]}")
         if num_mismatched > max_print:
             mismatch_details.append(
@@ -95,7 +96,7 @@ def verbose_allclose(
     return []
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def verbose_allequal(
     received: torch.Tensor, expected: torch.Tensor, max_print: int = 5
 ):
@@ -111,17 +112,18 @@ def verbose_allequal(
          Empty string if tensors are equal, otherwise detailed error information
     """
     mismatched = torch.not_equal(received, expected)
-    mismatched_indices = torch.nonzero(mismatched)
+    mismatched_indices = torch.nonzero(mismatched, as_tuple=False)
 
     # Count the number of mismatched elements
-    num_mismatched = mismatched.count_nonzero().item()
+    num_mismatched = int(mismatched_indices.shape[0])
 
     # Generate detailed information if there are mismatches
     if num_mismatched >= 1:
         mismatch_details = [f"Number of mismatched elements: {num_mismatched}"]
 
-        for index in mismatched_indices[:max_print]:
-            i = tuple(index.tolist())
+        mismatch_index_rows = mismatched_indices[:max_print].detach().cpu().tolist()
+        for index in mismatch_index_rows:
+            i = tuple(int(dim) for dim in index)
             mismatch_details.append(f"ERROR AT {i}: {received[i]} {expected[i]}")
         if num_mismatched > max_print:
             mismatch_details.append(
@@ -180,17 +182,22 @@ class DeterministicContext:
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = self.cublas
 
 
+_L2_FLUSH_BUFFERS: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _clear_l2_cache_numel(numel: int) -> None:
+    device_index = torch.cuda.current_device()
+    key = (device_index, int(numel))
+    buffer = _L2_FLUSH_BUFFERS.get(key)
+    if buffer is None or buffer.device.index != device_index:
+        buffer = torch.empty(numel, device=f"cuda:{device_index}", dtype=torch.float32)
+        _L2_FLUSH_BUFFERS[key] = buffer
+    buffer.zero_()
+
+
 def clear_l2_cache():
-    # import cupy as cp
-    # cp.cuda.runtime.deviceSetLimit(cp.cuda.runtime.cudaLimitPersistingL2CacheSize, 0)
-    # create a large dummy tensor
-    dummy = torch.randn((1024, 1024, 1024), device="cuda")
-    del dummy
+    _clear_l2_cache_numel(1024 * 1024 * 1024)
 
 
 def clear_l2_cache_large():
-    # import cupy as cp
-    # cp.cuda.runtime.deviceSetLimit(cp.cuda.runtime.cudaLimitPersistingL2CacheSize, 0)
-    # create a large dummy tensor
-    dummy = torch.randn((16000, 1024, 1024), device="cuda")
-    del dummy
+    _clear_l2_cache_numel(16000 * 1024 * 1024)

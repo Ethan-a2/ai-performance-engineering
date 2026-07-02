@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 
 from core.common.device_utils import resolve_local_rank
@@ -11,12 +10,12 @@ from time import perf_counter
 from contextlib import nullcontext
 
 import torch
-import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pathlib import Path
 
 from core.benchmark.gpu_requirements import require_min_gpus
+from core.utils.compile_utils import get_optimal_compile_mode
 
 try:
     from arch_config import prefer_sdpa_backends  # type: ignore
@@ -108,13 +107,21 @@ def main():
     )
 
     if args.compile:
-        ddp_model = torch.compile(ddp_model, mode="max-autotune", fullgraph=True, dynamic=False)
+        # get_optimal_compile_mode keeps max-autotune on the pinned toolchain but
+        # falls back to "default" on sm_103 + Triton >= 3.6 (unloadable tcgen05).
+        ddp_model = torch.compile(
+            ddp_model,
+            mode=get_optimal_compile_mode("max-autotune"),
+            fullgraph=True,
+            dynamic=False,
+        )
 
     optimizer = _maybe_fused_adamw(ddp_model.parameters(), args.learning_rate)
 
     num_steps = min(args.steps, len(dataloader))
     total_tokens = 0
     start_time = perf_counter()
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
 
     for step, batch in enumerate(dataloader):
         if step >= num_steps:
@@ -142,9 +149,11 @@ def main():
         total_tokens += batch["input_ids"].numel()
 
         if step % 10 == 0 and is_main:
+            loss_value_buffer[0].copy_(loss.detach())
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
             print(
                 f"[optimized-ddp] step {step}/{num_steps} "
-                f"loss={loss.item():.4f} "
+                f"loss={loss_value:.4f} "
                 f"tokens/step={batch['input_ids'].numel():,}"
             )
 

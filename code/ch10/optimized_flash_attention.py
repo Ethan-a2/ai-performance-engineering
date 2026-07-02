@@ -83,20 +83,150 @@ class TiledAttentionModule(nn.Module):
         self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self._q_buffer: Optional[torch.Tensor] = None
+        self._k_buffer: Optional[torch.Tensor] = None
+        self._v_buffer: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._q_forward_view: Optional[torch.Tensor] = None
+        self._k_forward_view: Optional[torch.Tensor] = None
+        self._v_forward_view: Optional[torch.Tensor] = None
+        self._output_forward_view: Optional[torch.Tensor] = None
+        self._q_proj_weight_t: Optional[torch.Tensor] = None
+        self._k_proj_weight_t: Optional[torch.Tensor] = None
+        self._v_proj_weight_t: Optional[torch.Tensor] = None
+        self._out_proj_weight_t: Optional[torch.Tensor] = None
+
+    def cache_weight_views(self) -> None:
+        self._q_proj_weight_t = self.q_proj.weight.t()
+        self._k_proj_weight_t = self.k_proj.weight.t()
+        self._v_proj_weight_t = self.v_proj.weight.t()
+        self._out_proj_weight_t = self.out_proj.weight.t()
+
+    def _workspace(
+        self,
+        name: str,
+        shape: tuple[int, int, int],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        batch_size, seq_len, width = (int(shape[0]), int(shape[1]), int(shape[2]))
+        numel = batch_size * seq_len * width
+        buffer = getattr(self, name)
+        if (
+            not isinstance(buffer, torch.Tensor)
+            or buffer.device != device
+            or buffer.dtype != dtype
+            or buffer.numel() < numel
+        ):
+            buffer = torch.empty(numel, device=device, dtype=dtype)
+            setattr(self, name, buffer)
+        return buffer[:numel].view(batch_size, seq_len, width)
+
+    def _ensure_projection_buffers(
+        self,
+        x: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        shape = (batch_size, seq_len, self.hidden_dim)
+        q = self._workspace("_q_buffer", shape, device=x.device, dtype=x.dtype)
+        k = self._workspace("_k_buffer", shape, device=x.device, dtype=x.dtype)
+        v = self._workspace("_v_buffer", shape, device=x.device, dtype=x.dtype)
+        output = self._workspace("_output_buffer", shape, device=x.device, dtype=x.dtype)
+        return q, k, v, output
+
+    def prepare_projection_buffers(self, x: torch.Tensor) -> None:
+        batch_size, seq_len, _ = x.shape
+        (
+            self._q_forward_view,
+            self._k_forward_view,
+            self._v_forward_view,
+            self._output_forward_view,
+        ) = self._ensure_projection_buffers(x, batch_size, seq_len)
 
     def _project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project input into [batch, seq, heads, head_dim] tensors."""
         batch_size, seq_len, _ = x.shape
-        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
-        return q.contiguous(), k.contiguous(), v.contiguous()
+        if torch.is_grad_enabled():
+            q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+            k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+            v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+            return q, k, v
+
+        q_buffer, k_buffer, v_buffer, _output_buffer = self._ensure_projection_buffers(
+            x,
+            batch_size,
+            seq_len,
+        )
+        if (
+            self._q_proj_weight_t is None
+            or self._k_proj_weight_t is None
+            or self._v_proj_weight_t is None
+        ):
+            self.cache_weight_views()
+        return self._project_qkv_into_buffers(x, q_buffer, k_buffer, v_buffer, batch_size, seq_len)
+
+    def _project_qkv_prepared(
+        self,
+        x: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = x.shape
+        q_buffer = self._q_forward_view
+        k_buffer = self._k_forward_view
+        v_buffer = self._v_forward_view
+        if q_buffer is None or k_buffer is None or v_buffer is None:
+            raise RuntimeError("forward_prepared() requires prepare_projection_buffers()")
+        if (
+            self._q_proj_weight_t is None
+            or self._k_proj_weight_t is None
+            or self._v_proj_weight_t is None
+        ):
+            self.cache_weight_views()
+        return self._project_qkv_into_buffers(x, q_buffer, k_buffer, v_buffer, batch_size, seq_len)
+
+    def _project_qkv_into_buffers(
+        self,
+        x: torch.Tensor,
+        q_buffer: torch.Tensor,
+        k_buffer: torch.Tensor,
+        v_buffer: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q = torch.matmul(x, self._q_proj_weight_t, out=q_buffer)
+        k = torch.matmul(x, self._k_proj_weight_t, out=k_buffer)
+        v = torch.matmul(x, self._v_proj_weight_t, out=v_buffer)
+        return (
+            q.view(batch_size, seq_len, self.num_heads, self.head_dim),
+            k.view(batch_size, seq_len, self.num_heads, self.head_dim),
+            v.view(batch_size, seq_len, self.num_heads, self.head_dim),
+        )
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
         """Project [batch, seq, heads, head_dim] attention output back to hidden_dim."""
         batch_size, seq_len, _, _ = attn_output.shape
         merged = attn_output.reshape(batch_size, seq_len, self.hidden_dim)
-        return self.out_proj(merged)
+        if torch.is_grad_enabled():
+            return self.out_proj(merged)
+        _q_buffer, _k_buffer, _v_buffer, output_buffer = self._ensure_projection_buffers(
+            merged,
+            batch_size,
+            seq_len,
+        )
+        if self._out_proj_weight_t is None:
+            self.cache_weight_views()
+        return torch.matmul(merged, self._out_proj_weight_t, out=output_buffer)
+
+    def _project_output_prepared(self, attn_output: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _, _ = attn_output.shape
+        output_buffer = self._output_forward_view
+        if output_buffer is None:
+            raise RuntimeError("forward_prepared() requires prepare_projection_buffers()")
+        if self._out_proj_weight_t is None:
+            self.cache_weight_views()
+        merged = attn_output.reshape(batch_size, seq_len, self.hidden_dim)
+        return torch.matmul(merged, self._out_proj_weight_t, out=output_buffer)
         
     def forward(self, x: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
         """Forward pass using tiled attention.
@@ -128,6 +258,20 @@ class TiledAttentionModule(nn.Module):
         # Reshape back: [batch, seq, hidden]
         return self._project_output(attn_output.transpose(1, 2).contiguous())
 
+    def forward_prepared(self, x: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            return self.forward(x, is_causal=is_causal)
+        q, k, v = self._project_qkv_prepared(x)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal,
+        )
+        return self._project_output_prepared(attn_output.transpose(1, 2).contiguous())
+
     def forward_external_flash(
         self,
         x: torch.Tensor,
@@ -147,6 +291,31 @@ class TiledAttentionModule(nn.Module):
         if isinstance(attn_output, tuple):
             attn_output = attn_output[0]
         return self._project_output(attn_output.contiguous())
+
+    def forward_external_flash_prepared(
+        self,
+        x: torch.Tensor,
+        flash_attn_func: Callable[..., torch.Tensor],
+        *,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            return self.forward_external_flash(
+                x,
+                flash_attn_func,
+                is_causal=is_causal,
+            )
+        q, k, v = self._project_qkv_prepared(x)
+        attn_output = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            causal=is_causal,
+        )
+        if isinstance(attn_output, tuple):
+            attn_output = attn_output[0]
+        return self._project_output_prepared(attn_output.contiguous())
 
 
 class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -187,6 +356,7 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             tokens_per_iteration=float(tokens),
         )
         self.output = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self._sdpa_backends: Optional[list[SDPBackend]] = None
         self._attention_runner: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
         self._external_flash_func: Optional[Callable[..., torch.Tensor]] = None
@@ -215,7 +385,7 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def _try_sdpa_backend(self, candidate: list[SDPBackend]) -> bool:
         if self.model is None or self.input is None:
             raise RuntimeError("setup() must initialize model and input before selecting SDPA backends")
-        with torch.no_grad(), sdpa_backend_context(candidate):
+        with torch.inference_mode(), sdpa_backend_context(candidate):
             _ = self.model(self.input[:1], is_causal=self.use_causal)
         self._sdpa_backends = candidate
         self._selected_backend_name = candidate[0].name.lower()
@@ -252,7 +422,7 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             try:
                 module = __import__(module_name, fromlist=["flash_attn_func"])
                 flash_attn_func = getattr(module, "flash_attn_func")
-                with torch.no_grad():
+                with torch.inference_mode():
                     _ = self.model.forward_external_flash(
                         self.input[:1],
                         flash_attn_func,
@@ -261,7 +431,7 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 self._external_flash_func = flash_attn_func
                 self._selected_engine_name = engine_name
                 self._selected_backend_name = engine_name
-                self._attention_runner = lambda x: self.model.forward_external_flash(
+                self._attention_runner = lambda x: self.model.forward_external_flash_prepared(
                     x,
                     flash_attn_func,
                     is_causal=self.use_causal,
@@ -290,11 +460,11 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
                         "FAIL FAST: FlashAttention required for ch10 but no FlashAttention backend available on SM100. Install flash-attn>=2.7 or flash-attn-3."
                     ) from exc
                 self._selected_engine_name = "sdpa"
-                self._attention_runner = lambda x: self.model(x, is_causal=self.use_causal)
+                self._attention_runner = lambda x: self.model.forward_prepared(x, is_causal=self.use_causal)
                 return
         self._resolve_sdpa_backends()
         self._selected_engine_name = "sdpa"
-        self._attention_runner = lambda x: self.model(x, is_causal=self.use_causal)
+        self._attention_runner = lambda x: self.model.forward_prepared(x, is_causal=self.use_causal)
 
     def _run_attention(self, x: torch.Tensor) -> torch.Tensor:
         if self._attention_runner is None:
@@ -316,16 +486,19 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             num_heads=self.num_heads,
             dropout=0.0,
         ).to(self.device).half().eval()
+        self.model.cache_weight_views()
         
         # Input tensor in FP16
         self.input = torch.randn(
             self.batch_size, self.seq_len, self.hidden_dim,
             device=self.device, dtype=torch.float16
         )
+        self._verify_output_buffer = torch.empty_like(self.input, dtype=torch.float32)
+        self.model.prepare_projection_buffers(self.input)
         self._resolve_attention_runner()
         
         # Warmup the selected tiled attention engine.
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(3):
                 _ = self._run_attention(self.input)
         
@@ -334,16 +507,19 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def benchmark_fn(self) -> None:
         """Benchmark: Tiled attention computation."""
         with self._nvtx_range("optimized_tiled_attention"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 self.output = self._run_attention(self.input)
         
         if self.output is None or self.input is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self.input},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             precision_flags={
                 "fp16": True,
@@ -358,6 +534,8 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         """Teardown: Clean up resources."""
         self.model = None
         self.input = None
+        self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:
@@ -406,8 +584,8 @@ class OptimizedFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             return "Input not initialized"
         
         # Verify tiled attention produces valid output
-        with torch.no_grad():
-            output = self._run_attention(self.input[:1])
+        with torch.inference_mode():
+            output = self._run_attention(self.input)
             if torch.isnan(output).any():
                 return "NaN values in attention output"
         

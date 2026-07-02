@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -67,6 +67,8 @@ class PlacementMetrics:
 
     ttft_ms: List[float]
     decode_ms: List[float]
+    ttft_total_ms: float
+    decode_total_ms: float
     prefill_collective_ms: float
     decode_collective_ms: float
     kv_transfer_ms: float
@@ -114,15 +116,30 @@ class PlacementSimulator:
 
         prefill_collective_ms = 0.0
         decode_collective_ms = 0.0
+        ttft_total_ms = 0.0
+        decode_total_ms = 0.0
         kv_transfer_ms = 0.0
         remote_expert_ms = 0.0
         cross_node_kv_moves = 0
         cross_node_collectives = 0
         tokens_processed = 0
 
-        for sess_idx in range(sessions):
-            prompt_tokens = int(torch.randint(cfg.prompt_tokens[0], cfg.prompt_tokens[1] + 1, (1,), generator=g).item())
-            decode_tokens = int(torch.randint(cfg.decode_tokens[0], cfg.decode_tokens[1] + 1, (1,), generator=g).item())
+        prompt_token_samples = torch.randint(
+            cfg.prompt_tokens[0],
+            cfg.prompt_tokens[1] + 1,
+            (sessions,),
+            generator=g,
+        ).tolist()
+        decode_token_samples = torch.randint(
+            cfg.decode_tokens[0],
+            cfg.decode_tokens[1] + 1,
+            (sessions,),
+            generator=g,
+        ).tolist()
+
+        for sess_idx, (prompt_tokens, decode_tokens) in enumerate(
+            zip(prompt_token_samples, decode_token_samples)
+        ):
             tokens_processed += prompt_tokens + decode_tokens
 
             prefill_node = self.nodes[sess_idx % len(self.nodes)]
@@ -143,6 +160,7 @@ class PlacementSimulator:
                 span_nodes=cfg.prefill_span_nodes,
             )
             ttft_ms.append(ttft)
+            ttft_total_ms += ttft
             prefill_collective_ms += pref_collective
             if cfg.prefill_tp_size > 1 and cfg.prefill_span_nodes:
                 cross_node_collectives += 1
@@ -173,7 +191,9 @@ class PlacementSimulator:
                 remote_expert_fraction=cfg.remote_expert_fraction,
                 moe_top_k=cfg.moe_top_k,
             )
-            decode_ms.append(decode_time + kv_ms)
+            total_decode_ms = decode_time + kv_ms
+            decode_ms.append(total_decode_ms)
+            decode_total_ms += total_decode_ms
             decode_collective_ms += decode_collective
             remote_expert_ms += expert_penalty
             if cfg.decode_tp_size > 1 and cfg.decode_span_nodes:
@@ -182,6 +202,8 @@ class PlacementSimulator:
         return PlacementMetrics(
             ttft_ms=ttft_ms,
             decode_ms=decode_ms,
+            ttft_total_ms=ttft_total_ms,
+            decode_total_ms=decode_total_ms,
             prefill_collective_ms=prefill_collective_ms,
             decode_collective_ms=decode_collective_ms,
             kv_transfer_ms=kv_transfer_ms,
@@ -275,7 +297,7 @@ class PlacementSimulator:
 
     @staticmethod
     def _dtype_bytes(dtype: torch.dtype) -> int:
-        return torch.tensor([], dtype=dtype).element_size()
+        return torch.finfo(dtype).bits // 8
 
     @staticmethod
     def _allreduce_ms(bytes_total: float, bw_gbps: float, *, shards: int) -> float:
@@ -292,15 +314,27 @@ class PlacementSimulator:
         return (bytes_total * 8.0 / 1e9) / bw_gbps * 1000.0
 
 
-def percentile(data: List[float], pct: float) -> float:
-    """Lightweight percentile helper that tolerates empty lists."""
-    if not data:
-        return 0.0
+def _percentile_from_ordered(xs: List[float], pct: float) -> float:
     assert 0.0 <= pct <= 100.0
-    xs = sorted(data)
     k = (len(xs) - 1) * (pct / 100.0)
     lower = math.floor(k)
     upper = math.ceil(k)
     if lower == upper:
         return xs[int(k)]
     return xs[lower] * (upper - k) + xs[upper] * (k - lower)
+
+
+def percentile(data: List[float], pct: float) -> float:
+    """Lightweight percentile helper that tolerates empty lists."""
+    if not data:
+        return 0.0
+    data.sort()
+    return _percentile_from_ordered(data, pct)
+
+
+def percentiles(data: List[float], pcts: Tuple[float, ...]) -> Tuple[float, ...]:
+    """Compute several percentiles after sorting the input once."""
+    if not data:
+        return tuple(0.0 for _ in pcts)
+    data.sort()
+    return tuple(_percentile_from_ordered(data, pct) for pct in pcts)

@@ -87,6 +87,52 @@ def test_clustered_attention_custom_impl_from_flag():
     assert out.shape == (1, 2, config.vocab_size)
 
 
+def test_gpt_reuses_position_offsets_for_padded_kv_cache():
+    model = GPT(_cfg(use_padded_attention=True))
+
+    first = model._position_offsets_for(4, torch.device("cpu"))
+    first_ptr = first.data_ptr()
+    second = model._position_offsets_for(3, torch.device("cpu"))
+
+    assert second.data_ptr() == first_ptr
+    torch.testing.assert_close(second, torch.arange(3, dtype=torch.long))
+
+    grown = model._position_offsets_for(8, torch.device("cpu"))
+    assert grown.numel() == 8
+    assert grown.data_ptr() != first_ptr
+    torch.testing.assert_close(grown, torch.arange(8, dtype=torch.long))
+
+
+def test_gpt_generate_reuses_sampling_buffers(monkeypatch):
+    model = GPT(_cfg())
+    token_batches = iter(([5, 6], [7, 8]))
+    forward_calls = []
+
+    def fake_forward(ids, *args, **kwargs):
+        forward_calls.append((tuple(ids.shape), kwargs.get("kv_cache") is not None))
+        token = next(current_tokens)
+        logits = torch.zeros((1, ids.size(1), model.config.vocab_size), dtype=torch.float32)
+        logits[:, -1, token] = 1.0
+        return logits
+
+    current_tokens = iter(next(token_batches))
+    monkeypatch.setattr(model, "forward", fake_forward)
+
+    assert list(model.generate([1], max_tokens=2, temperature=0.0)) == [5, 6]
+    assert forward_calls == [((1, 1), True), ((1, 1), True)]
+    next_ids_ptr = model._generate_next_ids.data_ptr()
+    max_values_ptr = model._generate_max_values.data_ptr()
+    token_host = model._generate_token_host
+
+    current_tokens = iter(next(token_batches))
+    forward_calls.clear()
+    assert list(model.generate([2], max_tokens=2, temperature=0.0)) == [7, 8]
+    assert forward_calls == [((1, 1), True), ((1, 1), True)]
+    assert model._generate_next_ids.data_ptr() == next_ids_ptr
+    assert model._generate_max_values.data_ptr() == max_values_ptr
+    assert model._generate_token_host is token_host
+
+
 def test_persistent_decode_kernel_stub_raises():
     config = _cfg(use_persistent_decode_kernel=True, allow_kernel_stub_fallback=False)
     model = GPT(config)

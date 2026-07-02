@@ -31,10 +31,11 @@ REQUIREMENTS:
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (
@@ -42,7 +43,6 @@ from core.harness.benchmark_harness import (
     BenchmarkConfig,
     WorkloadMetadata,
 )
-import torch.nn.functional as F
 
 
 class SlidingWindowSelfAttention(nn.Module):
@@ -77,7 +77,7 @@ class SlidingWindowSelfAttention(nn.Module):
         
         # Try to import flex_attention
         try:
-            from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+            from torch.nn.attention.flex_attention import create_block_mask, flex_attention
             self._has_flex = True
             self._flex_attention = torch.compile(flex_attention)
             self._create_block_mask = create_block_mask
@@ -170,7 +170,7 @@ class SlidingWindowSelfAttention(nn.Module):
             mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, chunk_q, chunk_kv]
             
             # Apply mask
-            scores = scores.masked_fill(~mask, float('-inf'))
+            scores.masked_fill_(~mask, float('-inf'))
             
             # Softmax and weighted sum
             attn = F.softmax(scores, dim=-1)
@@ -200,8 +200,7 @@ class SlidingWindowSelfAttention(nn.Module):
         # QKV projection
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, S, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
         
         # Choose attention implementation
         if self._has_flex and self.use_flex_attention:
@@ -306,12 +305,13 @@ def benchmark_sliding_window():
         # Benchmark sliding
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream(device)
         
-        start.record()
+        start.record(current_stream)
         for _ in range(10):
             _ = sliding_attn(x)
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         
         sliding_ms = start.elapsed_time(end) / 10
         sliding_mem = torch.cuda.max_memory_allocated() / 1e9
@@ -322,21 +322,19 @@ def benchmark_sliding_window():
         
         # Benchmark full attention (may OOM for long sequences)
         try:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
-                diagonal=1
-            )
+            pos = torch.arange(seq_len, device=device)
+            causal_mask = pos.unsqueeze(0) > pos.unsqueeze(1)
             
             # Warmup
             for _ in range(3):
                 _ = full_attn(x, x, x, attn_mask=causal_mask)
             torch.cuda.synchronize()
             
-            start.record()
+            start.record(current_stream)
             for _ in range(10):
                 _ = full_attn(x, x, x, attn_mask=causal_mask)
-            end.record()
-            torch.cuda.synchronize()
+            end.record(current_stream)
+            end.synchronize()
             
             full_ms = start.elapsed_time(end) / 10
             full_mem = torch.cuda.max_memory_allocated() / 1e9
@@ -390,8 +388,7 @@ class OptimizedSDPAAttention(nn.Module):
         # QKV projection
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, S, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
         
         # SDPA with Flash Attention - O(n) memory, fused kernels
         # is_causal=True enables causal masking efficiently
@@ -453,15 +450,14 @@ class SlidingWindowDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         # Warmup - important for Flash Attention kernel selection
         for _ in range(10):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self.x)
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
         """Benchmark: SDPA/Flash Attention forward pass."""
-        with torch.no_grad():
+        with torch.inference_mode():
             self.output = self.model(self.x)
-            self._last = float(self.output.sum())
         if self.output is None or self.x is None:
             raise RuntimeError("benchmark_fn() must produce output")
 
@@ -511,4 +507,3 @@ class SlidingWindowDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> BaseBenchmark:
     """Factory function for benchmark discovery."""
     return SlidingWindowDemoBenchmark()
-

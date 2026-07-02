@@ -7,7 +7,7 @@ which inflates memory and increases communication later.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -25,8 +25,13 @@ class BaselineOptimizerReplicatedBenchmark(VerificationPayloadMixin, BaseBenchma
         self.models: List[nn.Linear] = []
         self.momentum: List[torch.Tensor] = []
         self.inputs: List[torch.Tensor] = []
+        self._update_groups: List[Tuple[nn.Linear, torch.Tensor, torch.Tensor]] = []
+        self._model_count = 0
+        self._update_group_count = 0
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.batch_size = 8
         self.hidden = 512
+        self._payload_parameter_count = 0
         tokens = self.batch_size * self.hidden
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
@@ -45,14 +50,24 @@ class BaselineOptimizerReplicatedBenchmark(VerificationPayloadMixin, BaseBenchma
             self.models.append(model)
             self.momentum.append(buf)
             self.inputs.append(torch.randn(self.batch_size, self.hidden, device=device, dtype=torch.float32))
+        self._model_count = len(self.models)
+        self._update_groups = list(zip(self.models, self.momentum, self.inputs, strict=True))
+        self._update_group_count = self._model_count
+        self._verify_output_buffer = torch.empty(
+            (32, 32),
+            device=self.models[0].weight.device,
+            dtype=self.models[0].weight.dtype,
+        )
+        self._payload_parameter_count = sum(p.numel() for model in self.models for p in model.parameters())
         self._synchronize()
 
     def benchmark_fn(self) -> None:
-        assert len(self.models) == len(self.momentum) == len(self.inputs)
+        if self._update_group_count <= 0 or self._update_group_count != self._model_count:
+            raise RuntimeError("setup() must initialize optimizer update groups")
         with self._nvtx_range("baseline_optimizer_replicated"):
-            for model, mom, x in zip(self.models, self.momentum, self.inputs):
+            for model, mom, x in self._update_groups:
                 y = model(x)
-                loss = y.pow(2).mean()
+                loss = y.square().mean()
                 loss.backward()
                 # Local momentum update (per-GPU state)
                 with torch.no_grad():
@@ -66,12 +81,15 @@ class BaselineOptimizerReplicatedBenchmark(VerificationPayloadMixin, BaseBenchma
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
         model0 = self.models[0]
         x0 = self.inputs[0]
-        output = model0.weight[:32, :32].detach().clone()
+        if self._verify_output_buffer is None:
+            raise RuntimeError("setup() must initialize verification output buffer")
+        weight_probe = model0.weight[:32, :32].detach()
+        self._verify_output_buffer.copy_(weight_probe)
         self._set_verification_payload(
             inputs={"x": x0},
-            output=output,
+            output=self._verify_output_buffer,
             batch_size=int(self.batch_size),
-            parameter_count=sum(p.numel() for m in self.models for p in m.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -85,6 +103,10 @@ class BaselineOptimizerReplicatedBenchmark(VerificationPayloadMixin, BaseBenchma
         self.models.clear()
         self.momentum.clear()
         self.inputs.clear()
+        self._update_groups = []
+        self._model_count = 0
+        self._update_group_count = 0
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -122,5 +144,3 @@ class BaselineOptimizerReplicatedBenchmark(VerificationPayloadMixin, BaseBenchma
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineOptimizerReplicatedBenchmark()
-
-

@@ -46,27 +46,28 @@ Error Recovery:
 Author: Blackwell Performance Engineering Team
 """
 
+import os
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from queue import PriorityQueue
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+from core.benchmark.utils import scalar_tensor_to_float
+from core.benchmark.gpu_requirements import require_min_gpus
+from core.harness.arch_config import prefer_flash_sdpa
 from core.optimization.symmetric_memory_patch import (
     SymmetricMemoryHandle,
     maybe_create_symmetric_memory_handle,
 )
 from core.utils.compile_utils import compile_callable, compile_model
-from core.benchmark.gpu_requirements import require_min_gpus
-from core.harness.arch_config import prefer_flash_sdpa
 
-
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
-from collections import deque
-import time
-import threading
-from queue import Queue, PriorityQueue
-import numpy as np
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
 try:
     from torch.nn.attention.flex_attention import flex_attention
 except ImportError:
@@ -184,6 +185,32 @@ class DemoCausalLM(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, vocab_size),
         )
+        self._key_stack_buffer: Optional[torch.Tensor] = None
+        self._value_stack_buffer: Optional[torch.Tensor] = None
+        self._local_key_slots: List[torch.Tensor] = []
+        self._local_value_slots: List[torch.Tensor] = []
+
+    def _stack_layer_outputs(self, tensors: List[torch.Tensor], buffer_name: str) -> torch.Tensor:
+        if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+            return torch.stack(tensors, dim=0)
+
+        first = tensors[0]
+        shape = (len(tensors), *first.shape)
+        numel = 1
+        for dim in shape:
+            numel *= int(dim)
+        buffer = getattr(self, buffer_name)
+        if (
+            buffer is None
+            or buffer.device != first.device
+            or buffer.dtype != first.dtype
+            or buffer.numel() < numel
+        ):
+            buffer = torch.empty(numel, dtype=first.dtype, device=first.device)
+            setattr(self, buffer_name, buffer)
+        buffer_view = buffer[:numel].view(shape)
+        torch.stack(tensors, dim=0, out=buffer_view)
+        return buffer_view
 
     def forward(
         self,
@@ -203,8 +230,12 @@ class DemoCausalLM(nn.Module):
                 raise ValueError("input_lengths size must match batch size")
             current_lengths = input_lengths
 
-        local_keys: List[torch.Tensor] = []
-        local_values: List[torch.Tensor] = []
+        layer_count = len(self.layers)
+        if len(self._local_key_slots) != layer_count:
+            self._local_key_slots = [hidden] * layer_count
+            self._local_value_slots = [hidden] * layer_count
+        local_keys = self._local_key_slots
+        local_values = self._local_value_slots
 
         for layer_idx, layer in enumerate(self.layers):
             layer_cache = None
@@ -216,11 +247,11 @@ class DemoCausalLM(nn.Module):
                     raise ValueError("past_kv layer cache length must match batch size")
 
             hidden, key_local, value_local = layer(hidden, layer_cache, input_lengths=current_lengths)
-            local_keys.append(key_local)
-            local_values.append(value_local)
+            local_keys[layer_idx] = key_local
+            local_values[layer_idx] = value_local
 
-        key_stack = torch.stack(local_keys, dim=0)    # (layers, batch, local_heads, seq, head_dim)
-        value_stack = torch.stack(local_values, dim=0)
+        key_stack = self._stack_layer_outputs(local_keys, "_key_stack_buffer")
+        value_stack = self._stack_layer_outputs(local_values, "_value_stack_buffer")
 
         final_hidden = self.final_norm(hidden)
         logits = self.lm_head(final_hidden[:, -1, :])
@@ -412,7 +443,7 @@ class ShardedKVCacheManager:
             "value": self._kv_gather_value_scratch,
         }
 
-        bytes_per_element = torch.tensor(0, dtype=dtype).element_size()
+        bytes_per_element = torch.finfo(dtype).bits // 8
         page_memory_mb = (
             2.0 * num_layers * page_size * self.heads_per_gpu * head_dim * bytes_per_element
         ) / (1024 * 1024)
@@ -623,7 +654,7 @@ class ShardedKVCacheManager:
             return None
         view = remote[:, :, :valid, :]
         try:
-            return float(view.norm().item())
+            return scalar_tensor_to_float(view.norm())
         except Exception:
             return None
 
@@ -724,8 +755,75 @@ class TensorParallelAttention(nn.Module):
         self._valid_mask_workspace: Optional[torch.Tensor] = None
         self._attn_k_workspace: Optional[torch.Tensor] = None
         self._attn_v_workspace: Optional[torch.Tensor] = None
+        self._local_key_workspace: Optional[torch.Tensor] = None
+        self._local_value_workspace: Optional[torch.Tensor] = None
+        self._attn_merge_buffer: Optional[torch.Tensor] = None
+        self._attn_output_buffer: Optional[torch.Tensor] = None
+        self._out_proj_weight_t: Optional[torch.Tensor] = None
         self._pending_work: Optional[Any] = None
         self._force_sdpa = num_gpus == 1
+
+    def cache_weight_views(self) -> None:
+        self._out_proj_weight_t = self.out_proj.weight.t()
+
+    def _out_proj_weight_view(self) -> torch.Tensor:
+        if (
+            self._out_proj_weight_t is None
+            or self._out_proj_weight_t.data_ptr() != self.out_proj.weight.data_ptr()
+            or self._out_proj_weight_t.device != self.out_proj.weight.device
+            or self._out_proj_weight_t.dtype != self.out_proj.weight.dtype
+        ):
+            self.cache_weight_views()
+        assert self._out_proj_weight_t is not None
+        return self._out_proj_weight_t
+
+    def _ensure_local_workspaces(
+        self,
+        batch_size: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        if batch_size > self.max_batch_size:
+            raise ValueError(
+                f"Batch size {batch_size} exceeds configured max_batch_size={self.max_batch_size}"
+            )
+        if seq_len > self.max_seq_len:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds configured max_seq_len={self.max_seq_len}"
+            )
+
+        kv_shape = (batch_size, self.heads_per_gpu, seq_len, self.head_dim)
+        if (
+            self._local_key_workspace is None
+            or self._local_value_workspace is None
+            or self._local_key_workspace.device != device
+            or self._local_key_workspace.dtype != dtype
+            or self._local_value_workspace.device != device
+            or self._local_value_workspace.dtype != dtype
+            or self._local_key_workspace.size(0) < batch_size
+            or self._local_key_workspace.size(2) < seq_len
+            or self._local_value_workspace.size(0) < batch_size
+            or self._local_value_workspace.size(2) < seq_len
+        ):
+            self._local_key_workspace = torch.empty(kv_shape, dtype=dtype, device=device)
+            self._local_value_workspace = torch.empty_like(self._local_key_workspace)
+
+        rows = int(batch_size * seq_len)
+        merge_shape = (rows, self.heads_per_gpu * self.head_dim)
+        output_shape = (rows, self.d_model)
+        if (
+            self._attn_merge_buffer is None
+            or self._attn_output_buffer is None
+            or self._attn_merge_buffer.device != device
+            or self._attn_merge_buffer.dtype != dtype
+            or self._attn_output_buffer.device != device
+            or self._attn_output_buffer.dtype != dtype
+            or self._attn_merge_buffer.size(0) < rows
+            or self._attn_output_buffer.size(0) < rows
+        ):
+            self._attn_merge_buffer = torch.empty(merge_shape, dtype=dtype, device=device)
+            self._attn_output_buffer = torch.empty(output_shape, dtype=dtype, device=device)
 
     def _ensure_workspaces(
         self,
@@ -780,8 +878,13 @@ class TensorParallelAttention(nn.Module):
         
         # Attention computation using FlexAttention (fallback to SDPA)
         q = q.transpose(1, 2)  # (batch, heads, seq, head_dim)
-        key_local = k.transpose(1, 2).contiguous()
-        value_local = v.transpose(1, 2).contiguous()
+        self._ensure_local_workspaces(batch_size, seq_len, k.dtype, k.device)
+        if self._local_key_workspace is None or self._local_value_workspace is None:
+            raise RuntimeError("Local KV workspaces not configured")
+        key_local = self._local_key_workspace[:batch_size, :, :seq_len, :]
+        value_local = self._local_value_workspace[:batch_size, :, :seq_len, :]
+        key_local.copy_(k.transpose(1, 2))
+        value_local.copy_(v.transpose(1, 2))
         
         scale = 1.0 / (self.head_dim ** 0.5)
 
@@ -827,12 +930,11 @@ class TensorParallelAttention(nn.Module):
                 max_total_len = max(max_total_len, total_len)
 
             required_seq_len = max_total_len if max_total_len > 0 else 1
+            has_padding = False
             self._ensure_workspaces(batch_size, required_seq_len, key_local.dtype, key_local.device)
             attn_k = self._attn_k_workspace[:batch_size, :, :required_seq_len, :]
             attn_v = self._attn_v_workspace[:batch_size, :, :required_seq_len, :]
             valid_mask = self._valid_mask_workspace[:batch_size, :required_seq_len]
-            attn_k.zero_()
-            attn_v.zero_()
             valid_mask.fill_(False)
 
             for idx, (cache_len, cache_k, cache_v) in enumerate(cache_entries):
@@ -850,10 +952,14 @@ class TensorParallelAttention(nn.Module):
                     attn_k[idx, :, write_pos:end_pos, :].copy_(key_local[idx, :, :delta_len, :])
                     attn_v[idx, :, write_pos:end_pos, :].copy_(value_local[idx, :, :delta_len, :])
                     valid_mask[idx, write_pos:end_pos] = True
+                if write_pos + delta_len < required_seq_len:
+                    has_padding = True
 
-            attn_bias = None
-            if not bool(valid_mask.all().item()):
-                attn_bias = valid_mask.view(batch_size, 1, 1, required_seq_len)
+            attn_bias = (
+                valid_mask.view(batch_size, 1, 1, required_seq_len)
+                if has_padding
+                else None
+            )
 
             if self._force_sdpa or not _flex_attention_supported(
                 q,
@@ -875,9 +981,26 @@ class TensorParallelAttention(nn.Module):
                 out = _call_flex_attention_scaled(q, attn_k, attn_v, scale)
         
         # Reshape and project
-        out = out.transpose(1, 2).contiguous()
-        out = out.reshape(batch_size, seq_len, -1)
-        out = self.out_proj(out)
+        merge_buffer = self._attn_merge_buffer
+        output_buffer = self._attn_output_buffer
+        if merge_buffer is None or output_buffer is None:
+            raise RuntimeError("Attention projection buffers not configured")
+        if torch.is_grad_enabled() and (out.requires_grad or self.out_proj.weight.requires_grad):
+            project_input = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
+            out = self.out_proj(project_input)
+        else:
+            rows = int(batch_size * seq_len)
+            merge_2d = merge_buffer[:rows]
+            output_2d = output_buffer[:rows]
+            merge_2d.view(batch_size, seq_len, self.heads_per_gpu, self.head_dim).copy_(
+                out.transpose(1, 2)
+            )
+            torch.mm(
+                merge_2d,
+                self._out_proj_weight_view(),
+                out=output_2d,
+            )
+            out = output_2d.view(batch_size, seq_len, self.d_model)
         
         # All-reduce across GPUs (async to enable overlap with downstream work)
         if dist.is_initialized():
@@ -1194,6 +1317,17 @@ class InferenceServerMultiGPU:
             dtype=torch.float32,
             device=self.device,
         )
+        self._sampled_token_workspace = torch.empty(
+            (max_batch_size, 1),
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._sampled_token_host_workspace = torch.empty(
+            max_batch_size,
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=self.device.type == "cuda",
+        )
         self._last_token_lengths = [0] * max_batch_size
         self._prefill_graph: Optional[torch.cuda.CUDAGraph] = None
         self._prefill_graph_available = False
@@ -1366,39 +1500,37 @@ class InferenceServerMultiGPU:
         temperatures = self._temperature_workspace[:batch_size]
         lengths = self._length_workspace[:batch_size]
         token_counts = [0] * batch_size
+        max_tokens = 1
 
         # Materialise prompts/tokens into the reusable GPU workspace
-        for pack_idx, (orig_idx, state) in enumerate(eligible):
+        for pack_idx, (_orig_idx, state) in enumerate(eligible):
             if len(state.generated_tokens) == 0:
                 token_source = state.request.prompt_tokens
-            else:
-                token_source = [state.generated_tokens[-1]]
-
-            token_tensor = torch.as_tensor(
-                token_source,
-                dtype=torch.long,
-                device=self.device,
-            )
-
-            seq_len = token_tensor.numel()
-            if seq_len > self.max_seq_len:
-                raise ValueError(
-                    f"Sequence length {seq_len} exceeds configured max_seq_len={self.max_seq_len}"
+                seq_len = len(token_source)
+                if seq_len > self.max_seq_len:
+                    raise ValueError(
+                        f"Sequence length {seq_len} exceeds configured max_seq_len={self.max_seq_len}"
+                    )
+                token_tensor = torch.as_tensor(
+                    token_source,
+                    dtype=torch.long,
+                    device=self.device,
                 )
+                self._token_workspace[pack_idx, :seq_len].copy_(token_tensor)
+            else:
+                seq_len = 1
+                self._token_workspace[pack_idx, 0] = int(state.generated_tokens[-1])
+            max_tokens = max(max_tokens, seq_len)
 
             lengths[pack_idx] = seq_len
             temperatures[pack_idx] = state.request.temperature
             token_counts[pack_idx] = seq_len
 
-            workspace_view = self._token_workspace[pack_idx, :seq_len]
-            workspace_view.copy_(token_tensor)
             prev_len = self._last_token_lengths[pack_idx]
             if seq_len < prev_len:
                 self._token_workspace[pack_idx, seq_len:prev_len].zero_()
             self._last_token_lengths[pack_idx] = seq_len
 
-        max_tokens = int(lengths[:batch_size].max().item())
-        max_tokens = max(max_tokens, 1)
         input_ids = self._token_workspace[:batch_size, :max_tokens]
 
         needs_cache_fetch = any(
@@ -1456,47 +1588,28 @@ class InferenceServerMultiGPU:
         scaled_logits = logits / temp.unsqueeze(-1)
         probs = F.softmax(scaled_logits, dim=-1)
 
-        next_tokens_device = torch.empty(batch_size, dtype=torch.long, device=probs.device)
+        sampled_tokens_2d = self._sampled_token_workspace[:batch_size, :]
+        next_tokens_device = sampled_tokens_2d[:, 0]
         if self.world_size == 1 or not dist.is_initialized():
-            next_tokens_device.copy_(torch.multinomial(probs, num_samples=1).squeeze(-1))
+            torch.multinomial(probs, num_samples=1, out=sampled_tokens_2d)
         else:
             if self.rank == 0:
-                next_tokens_device.copy_(torch.multinomial(probs, num_samples=1).squeeze(-1))
+                torch.multinomial(probs, num_samples=1, out=sampled_tokens_2d)
             dist.broadcast(next_tokens_device, src=0)
 
-        generated = next_tokens_device.cpu().tolist()
-
-        for (pack_idx, (orig_idx, state)), token in zip(enumerate(eligible), generated):
-            remaining = self.max_seq_len - state.current_position
-            if remaining <= 0:
-                state.is_complete = True
-                continue
-            state.generated_tokens.append(token)
-            state.current_position += 1
-
-            if token == 2:  # EOS token
-                state.is_complete = True
-            elif state.current_position >= self.max_seq_len:
-                state.is_complete = True
+        generated_host = self._sampled_token_host_workspace[:batch_size]
+        generated_host.copy_(next_tokens_device, non_blocking=self.device.type == "cuda")
 
         head_slice = self._head_slice(attn_keys.shape[2])
 
         def _flush_to_cache():
-            for pack_idx, (orig_idx, state) in enumerate(eligible):
+            for pack_idx, (_orig_idx, state) in enumerate(eligible):
                 num_tokens = token_counts[pack_idx]
                 if num_tokens == 0:
                     continue
 
-                key_layers = []
-                value_layers = []
-                for layer_idx in range(self.num_layers):
-                    layer_keys = attn_keys[layer_idx, pack_idx, head_slice, :num_tokens, :]
-                    layer_values = attn_values[layer_idx, pack_idx, head_slice, :num_tokens, :]
-                    key_layers.append(layer_keys)
-                    value_layers.append(layer_values)
-
-                key_tensor = torch.stack(key_layers, dim=0).contiguous()
-                value_tensor = torch.stack(value_layers, dim=0).contiguous()
+                key_tensor = attn_keys[:, pack_idx, head_slice, :num_tokens, :]
+                value_tensor = attn_values[:, pack_idx, head_slice, :num_tokens, :]
                 self.kv_cache.append_tokens(
                     slot=state.kv_cache_slot,
                     key=key_tensor,
@@ -1521,6 +1634,7 @@ class InferenceServerMultiGPU:
                 self._write_stream.wait_stream(self._compute_stream)
                 _flush_to_cache()
             torch.cuda.current_stream(self.device).wait_stream(self._write_stream)
+            torch.cuda.current_stream(self.device).synchronize()
         else:
             _flush_to_cache()
 
@@ -1529,6 +1643,21 @@ class InferenceServerMultiGPU:
                 attn_module = getattr(layer, "attn", None)
                 if attn_module is not None and hasattr(attn_module, "complete_pending"):
                     attn_module.complete_pending()
+
+        generated = generated_host.tolist()
+
+        for (_pack_idx, (_orig_idx, state)), token in zip(enumerate(eligible), generated):
+            remaining = self.max_seq_len - state.current_position
+            if remaining <= 0:
+                state.is_complete = True
+                continue
+            state.generated_tokens.append(token)
+            state.current_position += 1
+
+            if token == 2:  # EOS token
+                state.is_complete = True
+            elif state.current_position >= self.max_seq_len:
+                state.is_complete = True
 
         return generated
     
@@ -1540,10 +1669,10 @@ class InferenceServerMultiGPU:
             print("Starting serving loop...")
             print(f"Duration: {duration_seconds:.1f} seconds\n")
         
-        start_time = time.time()
+        loop_start = time.perf_counter()
         iteration = 0
         
-        while time.time() - start_time < duration_seconds:
+        while time.perf_counter() - loop_start < duration_seconds:
             iteration += 1
             
             # Get next batch (mix of new and ongoing)
@@ -1555,9 +1684,7 @@ class InferenceServerMultiGPU:
                 continue
             
             # Generate next token for each request in batch
-            start_gen = time.time()
             self.generate_batch(batch, num_tokens=1)
-            gen_time = time.time() - start_gen
             
             # Update completions
             self.scheduler.update_completions(batch, self.kv_cache, self._on_request_complete)
@@ -1580,7 +1707,7 @@ class InferenceServerMultiGPU:
             # Log stats periodically
             if self.rank == 0 and iteration % 100 == 0:
                 stats = self.scheduler.get_stats()
-                throughput = stats["total_tokens_generated"] / (time.time() - start_time)
+                throughput = stats["total_tokens_generated"] / (time.perf_counter() - loop_start)
                 cache_stats = self.kv_cache.stats()
                 
                 print(f"Iter {iteration}: "
@@ -1593,7 +1720,7 @@ class InferenceServerMultiGPU:
         
         # Final statistics
         if self.rank == 0:
-            elapsed = time.time() - start_time
+            elapsed = time.perf_counter() - loop_start
             stats = self.scheduler.get_stats()
             
             print(f"\n=== Serving Complete ===")

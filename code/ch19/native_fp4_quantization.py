@@ -34,7 +34,7 @@ Requirements:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Tuple
 import time
 import math
 
@@ -57,10 +57,64 @@ def has_scaled_mm() -> bool:
     return hasattr(torch, '_scaled_mm')
 
 
+def _benchmark_forward(module: nn.Module, x: torch.Tensor, warmup_iters: int, bench_iters: int) -> Tuple[torch.Tensor, float]:
+    output = module(x)
+    for _ in range(warmup_iters):
+        output = module(x)
+
+    count = max(bench_iters, 1)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream()
+        start.record(current_stream)
+        for _ in range(count):
+            output = module(x)
+        end.record(current_stream)
+        end.synchronize()
+        return output, start.elapsed_time(end) / (count * 1000.0)
+
+    start_time = time.perf_counter()
+    for _ in range(count):
+        output = module(x)
+    return output, (time.perf_counter() - start_time) / count
+
+
 # FP4 E2M1 representable values (positive)
 # Sign bit gives us 16 total values: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}
 FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+FP4_SIGNED_VALUES = torch.cat((FP4_VALUES, -FP4_VALUES))
 FP4_MAX = 6.0
+_FP4_VALUES_CACHE: dict[torch.device, torch.Tensor] = {}
+_FP4_SIGNED_VALUES_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _fp4_values_for(device: torch.device) -> torch.Tensor:
+    if device.type == "cpu":
+        return FP4_VALUES
+    cached = _FP4_VALUES_CACHE.get(device)
+    if cached is None:
+        cached = FP4_VALUES.to(device=device)
+        _FP4_VALUES_CACHE[device] = cached
+    return cached
+
+
+def _fp4_signed_values_for(device: torch.device) -> torch.Tensor:
+    if device.type == "cpu":
+        return FP4_SIGNED_VALUES
+    cached = _FP4_SIGNED_VALUES_CACHE.get(device)
+    if cached is None:
+        cached = FP4_SIGNED_VALUES.to(device=device)
+        _FP4_SIGNED_VALUES_CACHE[device] = cached
+    return cached
+
+
+def _unpack_fp4_codes(packed_data: torch.Tensor) -> torch.Tensor:
+    unpacked = torch.empty(packed_data.numel() * 2, device=packed_data.device, dtype=torch.long)
+    torch.bitwise_right_shift(packed_data, 4, out=unpacked[0::2])
+    torch.bitwise_and(packed_data, 0x0F, out=unpacked[1::2])
+    return unpacked
 
 
 # ============================================================================
@@ -78,7 +132,6 @@ def quantize_to_fp4_packed(
     """
     device = tensor.device
     dtype = tensor.dtype
-    original_shape = tensor.shape
     
     # Flatten and pad to block size
     flat = tensor.flatten().float()
@@ -102,7 +155,7 @@ def quantize_to_fp4_packed(
     normalized = normalized.clamp(-FP4_MAX, FP4_MAX)
     
     # Quantize to FP4 values
-    fp4_vals = FP4_VALUES.to(device)
+    fp4_vals = _fp4_values_for(device)
     abs_normalized = normalized.abs()
     
     # Find nearest FP4 value (vectorized)
@@ -135,30 +188,23 @@ def dequantize_from_fp4_packed(
     Dequantize FP4 packed data back to original dtype.
     """
     device = packed_data.device
-    fp4_vals = FP4_VALUES.to(device)
+    signed_fp4_vals = _fp4_signed_values_for(device)
     
     # Unpack bytes to pairs of 4-bit codes
-    high = (packed_data >> 4) & 0x0F
-    low = packed_data & 0x0F
-    unpacked = torch.stack([high, low], dim=1).flatten()
+    unpacked = _unpack_fp4_codes(packed_data)
     
-    # Decode FP4: sign (bit 3) + magnitude index (bits 0-2)
-    signs = (unpacked >> 3) & 0x01
-    indices = (unpacked & 0x07).long()
-    
-    # Get magnitude values
-    values = fp4_vals[indices]
-    values = torch.where(signs.bool(), -values, values)
+    # Decode FP4 directly from the packed sign+magnitude code.
+    values = signed_fp4_vals[unpacked]
     
     # Reshape to blocks and apply scales
     n_blocks = len(scales)
     n_elements = n_blocks * block_size
     blocks = values[:n_elements].reshape(n_blocks, block_size)
-    dequantized = blocks * scales.unsqueeze(-1)
+    blocks.mul_(scales.unsqueeze(-1))
     
     # Reshape to original
     n_orig = math.prod(original_shape)
-    flat = dequantized.flatten()[:n_orig]
+    flat = blocks.flatten()[:n_orig]
     return flat.reshape(original_shape).to(dtype)
 
 
@@ -203,6 +249,11 @@ class FP4Linear(nn.Module):
         self.register_buffer('weight_packed', None)
         self.register_buffer('weight_scales', None)
         self.register_buffer('_weight_cache', None)  # Cached dequantized weights
+        self.register_buffer('_weight_fp8_cache', None)
+        fp8_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
+        self.register_buffer('_input_fp8_buffer', torch.empty(0, dtype=fp8_dtype), persistent=False)
+        self.register_buffer('_fp8_scale_a', torch.ones(1, dtype=torch.float32), persistent=False)
+        self.register_buffer('_fp8_scale_b', torch.ones(1, dtype=torch.float32), persistent=False)
         self._quantized = False
         
         if bias:
@@ -221,6 +272,7 @@ class FP4Linear(nn.Module):
             self.weight_scales = scales
             self._weight_fp16 = None
             self._weight_cache = None
+            self._weight_fp8_cache = None
             self._quantized = True
     
     def _get_weight(self) -> torch.Tensor:
@@ -250,6 +302,39 @@ class FP4Linear(nn.Module):
     def clear_cache(self) -> None:
         """Clear weight cache to free memory."""
         self._weight_cache = None
+        self._weight_fp8_cache = None
+
+    def _get_weight_fp8(self) -> torch.Tensor:
+        if self._weight_fp8_cache is not None:
+            return self._weight_fp8_cache
+        weight = self._get_weight()
+        weight_fp8 = weight.to(torch.float8_e4m3fn).contiguous()
+        self._weight_fp8_cache = weight_fp8
+        return weight_fp8
+
+    def _activation_fp8_buffer(self, x_2d: torch.Tensor) -> torch.Tensor:
+        input_fp8 = self._input_fp8_buffer
+        if (
+            input_fp8.dim() != x_2d.dim()
+            or input_fp8.size(0) < x_2d.size(0)
+            or tuple(input_fp8.shape[1:]) != tuple(x_2d.shape[1:])
+            or input_fp8.device != x_2d.device
+            or input_fp8.dtype != torch.float8_e4m3fn
+        ):
+            input_fp8 = torch.empty(
+                x_2d.shape,
+                device=x_2d.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            self._input_fp8_buffer = input_fp8
+        return input_fp8[: x_2d.size(0)]
+
+    def _fp8_scale_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._fp8_scale_a.device != device or self._fp8_scale_a.dtype != torch.float32:
+            self._fp8_scale_a = torch.ones(1, device=device, dtype=torch.float32)
+        if self._fp8_scale_b.device != device or self._fp8_scale_b.dtype != torch.float32:
+            self._fp8_scale_b = torch.ones(1, device=device, dtype=torch.float32)
+        return self._fp8_scale_a, self._fp8_scale_b
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using FP4 weights."""
@@ -257,33 +342,33 @@ class FP4Linear(nn.Module):
             return self._forward_fp8(x)
         
         weight = self._get_weight()
-        return F.linear(x.to(weight.dtype), weight, self.bias)
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
+        return F.linear(x, weight, self.bias)
     
     def _forward_fp8(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FP8 tensor cores for acceleration."""
-        weight = self._get_weight()
-        
-        # Convert to FP8 for tensor core acceleration
-        weight_fp8 = weight.to(torch.float8_e4m3fn)
+        weight_fp8 = self._get_weight_fp8()
         
         # Reshape for matmul
         batch_shape = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float8_e4m3fn)
+        x_2d = x.reshape(-1, x.shape[-1])
+        x_fp8 = self._activation_fp8_buffer(x_2d)
+        x_fp8.copy_(x_2d)
         
         # Scales for _scaled_mm
-        scale_a = torch.ones(1, device=x.device, dtype=torch.float32)
-        scale_b = torch.ones(1, device=x.device, dtype=torch.float32)
+        scale_a, scale_b = self._fp8_scale_buffers(x.device)
         
         # _scaled_mm: (M, K) @ (N, K).T -> (M, N)
         result = torch._scaled_mm(
-            x_2d, weight_fp8.T,
+            x_fp8, weight_fp8.T,
             scale_a, scale_b,
             out_dtype=self.dtype
         )
         
         output = result.reshape(*batch_shape, -1)
         if self.bias is not None:
-            output = output + self.bias
+            output.add_(self.bias)
         return output
     
     @property
@@ -396,17 +481,7 @@ def benchmark_fp4():
         nn.Linear(d_ff, d_model, dtype=dtype),
     ).to(device)
     
-    for _ in range(warmup_iters):
-        _ = mlp_fp16(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    
-    start = time.perf_counter()
-    for _ in range(bench_iters):
-        out_fp16 = mlp_fp16(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    time_fp16 = (time.perf_counter() - start) / bench_iters
+    out_fp16, time_fp16 = _benchmark_forward(mlp_fp16, x, warmup_iters, bench_iters)
     
     mem_fp16 = sum(p.numel() * p.element_size() for p in mlp_fp16.parameters()) / 1024**2
     
@@ -424,17 +499,7 @@ def benchmark_fp4():
     
     print(f"  Compression ratio: {mlp_fp4_storage.fc1.compression_ratio:.2f}x")
     
-    for _ in range(warmup_iters):
-        _ = mlp_fp4_storage(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    
-    start = time.perf_counter()
-    for _ in range(bench_iters):
-        out_storage = mlp_fp4_storage(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    time_storage = (time.perf_counter() - start) / bench_iters
+    out_storage, time_storage = _benchmark_forward(mlp_fp4_storage, x, warmup_iters, bench_iters)
     
     mem_storage = (mlp_fp4_storage.fc1.memory_bytes + mlp_fp4_storage.fc2.memory_bytes) / 1024**2
     
@@ -451,18 +516,7 @@ def benchmark_fp4():
     mlp_fp4_cached = FP4MLP(d_model, d_ff, dtype=dtype, mode='cached').to(device)
     mlp_fp4_cached.quantize()
     
-    # Warm up (this populates cache)
-    for _ in range(warmup_iters):
-        _ = mlp_fp4_cached(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    
-    start = time.perf_counter()
-    for _ in range(bench_iters):
-        out_cached = mlp_fp4_cached(x)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    time_cached = (time.perf_counter() - start) / bench_iters
+    out_cached, time_cached = _benchmark_forward(mlp_fp4_cached, x, warmup_iters, bench_iters)
     
     print(f"  Latency: {time_cached * 1000:.2f} ms")
     print(f"  Memory (packed): {mem_storage:.2f} MB")
@@ -478,17 +532,7 @@ def benchmark_fp4():
         mlp_fp4_fp8 = FP4MLP(d_model, d_ff, dtype=dtype, mode='fp8').to(device)
         mlp_fp4_fp8.quantize()
         
-        for _ in range(warmup_iters):
-            _ = mlp_fp4_fp8(x)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        
-        start = time.perf_counter()
-        for _ in range(bench_iters):
-            out_fp8 = mlp_fp4_fp8(x)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        time_fp8 = (time.perf_counter() - start) / bench_iters
+        out_fp8, time_fp8 = _benchmark_forward(mlp_fp4_fp8, x, warmup_iters, bench_iters)
         
         print(f"  Latency: {time_fp8 * 1000:.2f} ms")
         print(f"  Memory (packed): {mem_storage:.2f} MB")
@@ -510,11 +554,16 @@ def benchmark_fp4():
     
     # Accuracy
     print(f"\nAccuracy (vs FP16):")
-    with torch.no_grad():
+    with torch.inference_mode():
         for name, data in [('Cached', out_cached)]:
             error = (out_fp16 - data).abs()
-            mean_err = error.mean().item()
-            rel_err = mean_err / out_fp16.abs().mean().item() * 100
+            error_stats = torch.empty(2, device=error.device, dtype=torch.float32)
+            error_stats[0].copy_(error.mean())
+            error_stats[1].copy_(out_fp16.abs().mean())
+            error_stats_host = error_stats.detach().cpu()
+            mean_err = float(error_stats_host[0])
+            fp16_abs_mean = float(error_stats_host[1])
+            rel_err = mean_err / fp16_abs_mean * 100
             print(f"  {name}: Mean abs error = {mean_err:.6f}, Relative = {rel_err:.2f}%")
     
     print("\n" + "=" * 80)

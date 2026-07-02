@@ -30,15 +30,14 @@ from core.common.device_utils import resolve_local_rank
 
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import (
     flex_attention,
     create_block_mask,
-    create_mask,
 )
-from typing import Optional, Tuple
-import time
+from typing import Callable, Optional, Tuple
 from core.utils.compile_utils import compile_callable, compile_model
 
 # Check for FP8 support
@@ -66,6 +65,19 @@ if _flex_attention_wrapper is not None:
     )
 else:
     _FLEX_ATTENTION_FN = None
+
+
+def _benchmark_cuda_latency_ms(fn: Callable[[], object], iterations: int) -> float:
+    """Measure average CUDA latency in milliseconds for a callable."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
+    start.record(current_stream)
+    for _ in range(iterations):
+        fn()
+    end.record(current_stream)
+    end.synchronize()
+    return start.elapsed_time(end) / iterations
 
 
 # ============================================================================
@@ -109,7 +121,7 @@ class DynamicQuantizedKVCache:
         # Allocate cache (num_layers, 2, max_batch, num_heads, max_seq, head_dim)
         # 2 for key and value
         cache_shape = (num_layers, 2, max_batch_size, num_heads, max_seq_len, head_dim)
-        self.cache = torch.zeros(cache_shape, dtype=self.cache_dtype, device=device)
+        self.cache = torch.empty(cache_shape, dtype=self.cache_dtype, device=device)
         
         # Scaling factors for FP8 quantization
         if FP8_AVAILABLE:
@@ -119,6 +131,26 @@ class DynamicQuantizedKVCache:
         
         # Current sequence length per batch
         self.seq_lens = torch.zeros(max_batch_size, dtype=torch.long, device=device)
+        self._batch_index_cache = torch.arange(max_batch_size, dtype=torch.long, device=device)
+        self._batch_index_host = torch.empty(
+            max_batch_size,
+            dtype=torch.long,
+            device="cpu",
+            pin_memory=torch.device(device).type == "cuda",
+        )
+        self._seq_lens_host = [0] * max_batch_size
+        self._batch_index_list = [0] * max_batch_size
+        self._batch_index_seen = [0] * max_batch_size
+        self._batch_index_seen_token = 0
+        self._next_length_rows = [0] * max_batch_size
+        self._next_length_seen = [0] * max_batch_size
+        self._next_length_seen_token = 0
+        self._range_cache_indices = [0] * max_batch_size
+        self._range_start_positions = [0] * max_batch_size
+        self._range_end_positions = [0] * max_batch_size
+        self._batch_indices_device_buffer: Optional[torch.Tensor] = None
+        self._updated_key_buffer: Optional[torch.Tensor] = None
+        self._updated_value_buffer: Optional[torch.Tensor] = None
         
         print(f"KV Cache initialized:")
         print(f"  Dtype: {self.cache_dtype}")
@@ -127,6 +159,47 @@ class DynamicQuantizedKVCache:
         if FP8_AVAILABLE:
             fp16_memory = self.cache.numel() * 2 / 1e9
             print(f"  Savings: {fp16_memory - self.cache.numel() * self.cache.element_size() / 1e9:.2f} GB vs FP16")
+
+    def _batch_indices_buffer(self, count: int) -> torch.Tensor:
+        if (
+            self._batch_indices_device_buffer is None
+            or self._batch_indices_device_buffer.device != self.seq_lens.device
+            or self._batch_indices_device_buffer.numel() < count
+        ):
+            self._batch_indices_device_buffer = torch.empty(
+                count,
+                dtype=torch.long,
+                device=self.seq_lens.device,
+            )
+        return self._batch_indices_device_buffer[:count]
+
+    def _fill_batch_index_list_from_host(
+        self,
+        batch_index_host: torch.Tensor,
+        batch_count: int,
+    ) -> None:
+        batch_index_list = self._batch_index_list
+        for local_idx in range(batch_count):
+            batch_index_list[local_idx] = int(batch_index_host[local_idx])
+
+    def _batch_rows_unique_and_same_length(self, batch_count: int) -> Tuple[bool, bool, int]:
+        self._batch_index_seen_token += 1
+        seen_token = self._batch_index_seen_token
+        seen = self._batch_index_seen
+        batch_index_list = self._batch_index_list
+        seq_lens_host = self._seq_lens_host
+
+        first_length = seq_lens_host[batch_index_list[0]]
+        unique_rows = True
+        same_length = True
+        for local_idx in range(batch_count):
+            cache_idx = batch_index_list[local_idx]
+            if seen[cache_idx] == seen_token:
+                unique_rows = False
+            seen[cache_idx] = seen_token
+            if seq_lens_host[cache_idx] != first_length:
+                same_length = False
+        return unique_rows, same_length, first_length
     
     def update(
         self,
@@ -149,38 +222,148 @@ class DynamicQuantizedKVCache:
             Updated (key, value) tensors from cache
         """
         if batch_indices is None:
-            batch_indices = torch.tensor(
-                [batch_idx], device=self.seq_lens.device, dtype=torch.long
-            )
-        else:
-            if not torch.is_tensor(batch_indices):
-                batch_indices = torch.tensor(batch_indices, device=self.seq_lens.device)
+            cache_idx = int(batch_idx)
+            batch_index_list = self._batch_index_list
+            batch_index_list[0] = cache_idx
+            batch_count = 1
+            batch_indices = self._batch_index_cache.narrow(0, cache_idx, 1)
+        elif not torch.is_tensor(batch_indices):
+            if isinstance(batch_indices, int):
+                cache_idx = int(batch_indices)
+                batch_index_list = self._batch_index_list
+                batch_index_list[0] = cache_idx
+                batch_count = 1
+                batch_indices = self._batch_index_cache.narrow(0, cache_idx, 1)
             else:
-                batch_indices = batch_indices.to(self.seq_lens.device, dtype=torch.long)
+                batch_index_list = self._batch_index_list
+                batch_count = 0
+                for local_idx, cache_idx in enumerate(batch_indices):
+                    cache_idx_int = int(cache_idx)
+                    batch_index_list[local_idx] = cache_idx_int
+                    batch_count += 1
+                batch_indices = self._batch_indices_buffer(batch_count)
+                if batch_indices.device.type == "cpu":
+                    for local_idx in range(batch_count):
+                        batch_indices[local_idx] = batch_index_list[local_idx]
+                else:
+                    batch_index_host = self._batch_index_host[:batch_count]
+                    for local_idx in range(batch_count):
+                        batch_index_host[local_idx] = batch_index_list[local_idx]
+                    batch_indices.copy_(batch_index_host, non_blocking=True)
+        else:
             if batch_indices.dim() == 0:
                 batch_indices = batch_indices.unsqueeze(0)
+            if batch_indices.device.type == "cpu":
+                batch_count = batch_indices.numel()
+                batch_index_host = self._batch_index_host[:batch_count]
+                batch_index_host.copy_(batch_indices)
+                batch_index_list = self._batch_index_list
+                self._fill_batch_index_list_from_host(batch_index_host, batch_count)
+                device_batch_indices = self._batch_indices_buffer(batch_count)
+                device_batch_indices.copy_(
+                    batch_index_host,
+                    non_blocking=self.seq_lens.device.type == "cuda",
+                )
+                batch_indices = device_batch_indices
+            else:
+                batch_count = batch_indices.numel()
+                batch_index_host = self._batch_index_host[:batch_count]
+                batch_index_host.copy_(batch_indices)
+                batch_index_list = self._batch_index_list
+                self._fill_batch_index_list_from_host(batch_index_host, batch_count)
+                if batch_indices.device != self.seq_lens.device or batch_indices.dtype != torch.long:
+                    batch_indices = batch_indices.to(self.seq_lens.device, dtype=torch.long)
         
-        assert key.shape[0] == batch_indices.numel(), (
+        assert key.shape[0] == batch_count, (
             f"Batch size mismatch: key batch={key.shape[0]}, "
-            f"indices={batch_indices.numel()}"
+            f"indices={batch_count}"
         )
-        
-        updated_keys = []
-        updated_vals = []
-        
-        for local_idx, cache_idx in enumerate(batch_indices.tolist()):
-            cache_idx_int = int(cache_idx)
-            current_len = int(self.seq_lens[cache_idx_int].item())
-            k_slice = key[local_idx]
-            v_slice = value[local_idx]
-            new_seq_len = k_slice.shape[1]
-            
+        unique_rows, same_length, current_len = self._batch_rows_unique_and_same_length(batch_count)
+        if unique_rows and same_length:
+            new_seq_len = key.shape[2]
             end_pos = current_len + new_seq_len
             if end_pos > self.max_seq_len:
                 raise ValueError(
                     f"KV cache overflow: requested {end_pos}, "
                     f"max={self.max_seq_len}"
                 )
+
+            if FP8_AVAILABLE and key.dtype != FP8_E4M3:
+                k_scale = key.abs().amax(dim=(1, 2, 3))
+                v_scale = value.abs().amax(dim=(1, 2, 3))
+                self.scales[layer_idx, 0].index_copy_(0, batch_indices, k_scale)
+                self.scales[layer_idx, 1].index_copy_(0, batch_indices, v_scale)
+                k_store = (key / k_scale.view(-1, 1, 1, 1)).to(FP8_E4M3)
+                v_store = (value / v_scale.view(-1, 1, 1, 1)).to(FP8_E4M3)
+            else:
+                k_store = key
+                v_store = value
+
+            self.cache[layer_idx, 0, batch_indices, :, current_len:end_pos, :] = k_store
+            self.cache[layer_idx, 1, batch_indices, :, current_len:end_pos, :] = v_store
+            self.seq_lens[batch_indices] = end_pos
+            for local_idx in range(batch_count):
+                self._seq_lens_host[batch_index_list[local_idx]] = end_pos
+
+            cached_key = self.cache[layer_idx, 0, batch_indices, :, :end_pos, :]
+            cached_value = self.cache[layer_idx, 1, batch_indices, :, :end_pos, :]
+            if FP8_AVAILABLE:
+                k_scale = self.scales[layer_idx, 0, batch_indices].view(-1, 1, 1, 1)
+                v_scale = self.scales[layer_idx, 1, batch_indices].view(-1, 1, 1, 1)
+                cached_key = cached_key.to(torch.float32) * k_scale
+                cached_value = cached_value.to(torch.float32) * v_scale
+            return cached_key, cached_value
+        
+        new_seq_len = key.shape[2]
+        self._next_length_seen_token += 1
+        seen_token = self._next_length_seen_token
+        next_lengths = self._next_length_rows
+        next_length_seen = self._next_length_seen
+        range_cache_indices = self._range_cache_indices
+        range_start_positions = self._range_start_positions
+        range_end_positions = self._range_end_positions
+        max_end_pos = 0
+        for local_idx in range(batch_count):
+            cache_idx_int = batch_index_list[local_idx]
+            if next_length_seen[cache_idx_int] != seen_token:
+                next_length_seen[cache_idx_int] = seen_token
+                next_lengths[cache_idx_int] = self._seq_lens_host[cache_idx_int]
+            current_len = next_lengths[cache_idx_int]
+            end_pos = current_len + new_seq_len
+            if end_pos > self.max_seq_len:
+                raise ValueError(
+                    f"KV cache overflow: requested {end_pos}, "
+                    f"max={self.max_seq_len}"
+                )
+            range_cache_indices[local_idx] = cache_idx_int
+            range_start_positions[local_idx] = current_len
+            range_end_positions[local_idx] = end_pos
+            next_lengths[cache_idx_int] = end_pos
+            max_end_pos = max(max_end_pos, end_pos)
+
+        return_dtype = torch.float32 if FP8_AVAILABLE else self.cache.dtype
+        return_shape = (batch_count, self.num_heads, max_end_pos, self.head_dim)
+        if (
+            self._updated_key_buffer is None
+            or self._updated_value_buffer is None
+            or self._updated_key_buffer.size(0) < batch_count
+            or self._updated_key_buffer.size(2) < max_end_pos
+            or self._updated_key_buffer.device != key.device
+            or self._updated_key_buffer.dtype != return_dtype
+            or self._updated_value_buffer.device != key.device
+            or self._updated_value_buffer.dtype != return_dtype
+        ):
+            self._updated_key_buffer = torch.empty(return_shape, device=key.device, dtype=return_dtype)
+            self._updated_value_buffer = torch.empty(return_shape, device=key.device, dtype=return_dtype)
+        updated_keys = self._updated_key_buffer[:batch_count, :, :max_end_pos, :]
+        updated_vals = self._updated_value_buffer[:batch_count, :, :max_end_pos, :]
+
+        for local_idx in range(batch_count):
+            cache_idx_int = range_cache_indices[local_idx]
+            current_len = range_start_positions[local_idx]
+            end_pos = range_end_positions[local_idx]
+            k_slice = key[local_idx]
+            v_slice = value[local_idx]
             
             if FP8_AVAILABLE and k_slice.dtype != FP8_E4M3:
                 k_scale = k_slice.abs().max()
@@ -196,6 +379,7 @@ class DynamicQuantizedKVCache:
             self.cache[layer_idx, 0, cache_idx_int, :, current_len:end_pos, :] = k_store
             self.cache[layer_idx, 1, cache_idx_int, :, current_len:end_pos, :] = v_store
             self.seq_lens[cache_idx_int] = end_pos
+            self._seq_lens_host[cache_idx_int] = end_pos
             
             cached_key = self.cache[layer_idx, 0, cache_idx_int, :, :end_pos, :]
             cached_value = self.cache[layer_idx, 1, cache_idx_int, :, :end_pos, :]
@@ -206,19 +390,23 @@ class DynamicQuantizedKVCache:
                 cached_key = cached_key.to(torch.float32) * k_scale
                 cached_value = cached_value.to(torch.float32) * v_scale
             
-            updated_keys.append(cached_key.unsqueeze(0))
-            updated_vals.append(cached_value.unsqueeze(0))
+            updated_keys[local_idx, :, :end_pos, :].copy_(cached_key)
+            updated_vals[local_idx, :, :end_pos, :].copy_(cached_value)
+            if end_pos < max_end_pos:
+                updated_keys[local_idx, :, end_pos:max_end_pos, :].zero_()
+                updated_vals[local_idx, :, end_pos:max_end_pos, :].zero_()
         
-        return torch.cat(updated_keys, dim=0), torch.cat(updated_vals, dim=0)
+        return updated_keys, updated_vals
     
     def clear(self, batch_idx: Optional[int] = None):
         """Clear cache"""
         if batch_idx is None:
-            self.cache.zero_()
             self.seq_lens.zero_()
+            for cache_idx in range(self.max_batch_size):
+                self._seq_lens_host[cache_idx] = 0
         else:
-            self.cache[:, :, batch_idx].zero_()
             self.seq_lens[batch_idx] = 0
+            self._seq_lens_host[batch_idx] = 0
 
     def get_memory_usage(self, batch_idx: Optional[int] = None) -> int:
         """Return memory footprint in bytes."""
@@ -267,6 +455,13 @@ class OptimizedDecoderLayer(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model, device=device)
         self.v_proj = nn.Linear(d_model, d_model, device=device)
         self.o_proj = nn.Linear(d_model, d_model, device=device)
+        self._attn_merge_buffer: Optional[torch.Tensor] = None
+        self._attn_merge_view: Optional[torch.Tensor] = None
+        self._attn_merge_2d: Optional[torch.Tensor] = None
+        self._attn_project_buffer: Optional[torch.Tensor] = None
+        self._attn_project_2d: Optional[torch.Tensor] = None
+        self._o_proj_weight_t: Optional[torch.Tensor] = None
+        self._block_mask_cache = {}
         
         # FlexAttention block mask (sliding window)
         def sliding_window(b, h, q_idx, kv_idx):
@@ -274,6 +469,75 @@ class OptimizedDecoderLayer(nn.Module):
         
         self.block_mask_fn = sliding_window
         self.flex_attention_fn = _FLEX_ATTENTION_FN if self.use_flex_attention else None
+
+    def cache_weight_views(self) -> None:
+        self._o_proj_weight_t = self.o_proj.weight.t()
+
+    def _o_proj_weight_view(self) -> torch.Tensor:
+        if (
+            self._o_proj_weight_t is None
+            or self._o_proj_weight_t.data_ptr() != self.o_proj.weight.data_ptr()
+            or self._o_proj_weight_t.device != self.o_proj.weight.device
+            or self._o_proj_weight_t.dtype != self.o_proj.weight.dtype
+        ):
+            self.cache_weight_views()
+        assert self._o_proj_weight_t is not None
+        return self._o_proj_weight_t
+
+    def _attention_project_workspace(
+        self,
+        batch_size: int,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        rows = int(batch_size * seq_len)
+        shape = (rows, self.d_model)
+        output_shape = (batch_size, seq_len, self.d_model)
+        merge_shape = (batch_size, seq_len, self.num_heads, self.head_dim)
+        if (
+            self._attn_merge_buffer is None
+            or self._attn_project_buffer is None
+            or self._attn_merge_buffer.size(0) < rows
+            or self._attn_project_buffer.size(0) < rows
+            or self._attn_merge_buffer.device != device
+            or self._attn_merge_buffer.dtype != dtype
+            or self._attn_project_buffer.device != device
+            or self._attn_project_buffer.dtype != dtype
+        ):
+            self._attn_merge_buffer = torch.empty(shape, device=device, dtype=dtype)
+            self._attn_project_buffer = torch.empty(shape, device=device, dtype=dtype)
+        assert self._attn_merge_buffer is not None and self._attn_project_buffer is not None
+        self._attn_merge_view = self._attn_merge_buffer[:rows].view(merge_shape)
+        self._attn_merge_2d = self._attn_merge_buffer[:rows]
+        self._attn_project_2d = self._attn_project_buffer[:rows]
+        return (
+            self._attn_merge_view,
+            self._attn_merge_2d,
+            self._attn_project_buffer[:rows].view(output_shape),
+            self._attn_project_2d,
+        )
+
+    def _cached_block_mask(
+        self,
+        batch_size: int,
+        seq_len: int,
+        total_len: int,
+        device: torch.device,
+    ):
+        cache_key = (int(batch_size), int(self.num_heads), int(seq_len), int(total_len), device)
+        block_mask = self._block_mask_cache.get(cache_key)
+        if block_mask is None:
+            block_mask = create_block_mask(
+                self.block_mask_fn,
+                B=batch_size,
+                H=self.num_heads,
+                Q_LEN=seq_len,
+                KV_LEN=total_len,
+                device=device,
+            )
+            self._block_mask_cache[cache_key] = block_mask
+        return block_mask
         
     def forward(
         self,
@@ -315,12 +579,11 @@ class OptimizedDecoderLayer(nn.Module):
         
         total_len = key.shape[2]
         if self.flex_attention_fn is not None:
-            block_mask = create_block_mask(
-                self.block_mask_fn,
-                B=batch_size,
-                H=self.num_heads,
-                Q_LEN=seq_len,
-                KV_LEN=total_len,
+            block_mask = self._cached_block_mask(
+                batch_size,
+                seq_len,
+                total_len,
+                query.device,
             )
             attn_output = self.flex_attention_fn(query, key, value, block_mask)
         else:
@@ -330,10 +593,21 @@ class OptimizedDecoderLayer(nn.Module):
                 )
         
         # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.d_model)
-        output = self.o_proj(attn_output)
-        
+        if torch.is_grad_enabled() and hidden_states.requires_grad:
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.view(batch_size, seq_len, self.d_model)
+            return self.o_proj(attn_output)
+
+        merge_view, merge_2d, output, output_2d = self._attention_project_workspace(
+            batch_size,
+            seq_len,
+            attn_output.device,
+            attn_output.dtype,
+        )
+        merge_view.copy_(attn_output.transpose(1, 2))
+        torch.mm(merge_2d, self._o_proj_weight_view(), out=output_2d)
+        if self.o_proj.bias is not None:
+            output_2d.add_(self.o_proj.bias)
         return output
 
 
@@ -386,6 +660,9 @@ class BlackwellInferencePipeline:
             device=str(self.device),
         )
         
+        self._next_token_buffer: Optional[torch.Tensor] = None
+        self._next_token_values: Optional[torch.Tensor] = None
+        self._generated_token_buffer: Optional[torch.Tensor] = None
         # Compile model with torch.compile (PyTorch 2.10)
         if compile:
             print("Compiling model with torch.compile...")
@@ -404,6 +681,50 @@ class BlackwellInferencePipeline:
             print(" Model compiled")
         
         self.compiled = compile
+
+    def _next_token_from_logits(self, logits_last: torch.Tensor) -> torch.Tensor:
+        batch_size = logits_last.size(0)
+        if (
+            self._next_token_buffer is None
+            or self._next_token_buffer.device != logits_last.device
+            or self._next_token_buffer.size(0) < batch_size
+        ):
+            self._next_token_buffer = torch.empty(
+                (batch_size, 1),
+                dtype=torch.long,
+                device=logits_last.device,
+            )
+        if (
+            self._next_token_values is None
+            or self._next_token_values.device != logits_last.device
+            or self._next_token_values.dtype != logits_last.dtype
+            or self._next_token_values.size(0) < batch_size
+        ):
+            self._next_token_values = torch.empty_like(logits_last[:, :1])
+        values = self._next_token_values[:batch_size]
+        tokens = self._next_token_buffer[:batch_size]
+        torch.max(logits_last, dim=-1, keepdim=True, out=(values, tokens))
+        return tokens
+
+    def _generated_output_buffer(
+        self,
+        input_ids: torch.Tensor,
+        total_len: int,
+    ) -> torch.Tensor:
+        output_shape = (input_ids.size(0), total_len)
+        if (
+            self._generated_token_buffer is None
+            or self._generated_token_buffer.device != input_ids.device
+            or self._generated_token_buffer.dtype != input_ids.dtype
+            or self._generated_token_buffer.size(0) < input_ids.size(0)
+            or self._generated_token_buffer.size(1) < total_len
+        ):
+            self._generated_token_buffer = torch.empty(
+                output_shape,
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
+        return self._generated_token_buffer[: input_ids.size(0), :total_len]
     
     @torch.inference_mode()
     def generate(
@@ -423,26 +744,27 @@ class BlackwellInferencePipeline:
         Returns:
             Generated token IDs [batch, seq_len + max_new_tokens]
         """
-        batch_size, seq_len = input_ids.shape
+        _, seq_len = input_ids.shape
         
         # Clear KV cache
         self.kv_cache.clear()
+        if max_new_tokens <= 0:
+            return input_ids
+        output_ids = self._generated_output_buffer(input_ids, seq_len + max_new_tokens)
+        output_ids[:, :seq_len].copy_(input_ids)
         
         # Prefill phase (process all input tokens)
         logits = self.model(input_ids)
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        
-        generated = [next_token]
+        next_token = self._next_token_from_logits(logits[:, -1, :])
+        output_ids[:, seq_len : seq_len + 1].copy_(next_token)
         
         # Decode phase (autoregressive generation)
-        for _ in range(max_new_tokens - 1):
+        for step in range(1, max_new_tokens):
             logits = self.model(next_token)
-            next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            generated.append(next_token)
+            next_token = self._next_token_from_logits(logits[:, -1, :])
+            output_ids[:, seq_len + step : seq_len + step + 1].copy_(next_token)
         
-        # Concatenate all generated tokens
-        generated_tokens = torch.cat(generated, dim=1)
-        return torch.cat([input_ids, generated_tokens], dim=1)
+        return output_ids
     
     def benchmark(self, seq_len: int = 1024, num_iterations: int = 100):
         """Benchmark inference performance"""
@@ -465,11 +787,12 @@ class BlackwellInferencePipeline:
         # Benchmark using CUDA Events for accurate GPU timing
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream(self.device)
         
-        start_event.record()
+        start_event.record(current_stream)
         for _ in range(num_iterations):
             _ = self.model(input_ids)
-        end_event.record()
+        end_event.record(current_stream)
         end_event.synchronize()
         
         total_time = start_event.elapsed_time(end_event) / 1000  # Convert ms to seconds
@@ -531,11 +854,7 @@ def compare_inference_methods():
     
     # 1. Baseline (no optimizations)
     print("\n1. Baseline (no cache, no FlexAttention)")
-    start = time.time()
-    for _ in range(10):
-        _ = layer(hidden_states)
-    torch.cuda.synchronize()
-    baseline_time = (time.time() - start) / 10 * 1000
+    baseline_time = _benchmark_cuda_latency_ms(lambda: layer(hidden_states), 10)
     print(f"   Time: {baseline_time:.2f} ms")
     
     # 2. With KV cache
@@ -548,11 +867,10 @@ def compare_inference_methods():
         head_dim=d_model // num_heads,
         device=device,
     )
-    start = time.time()
-    for _ in range(10):
-        _ = layer(hidden_states, kv_cache=kv_cache, layer_idx=0)
-    torch.cuda.synchronize()
-    cache_time = (time.time() - start) / 10 * 1000
+    cache_time = _benchmark_cuda_latency_ms(
+        lambda: layer(hidden_states, kv_cache=kv_cache, layer_idx=0),
+        10,
+    )
     print(f"   Time: {cache_time:.2f} ms")
     print(f"   Speedup: {baseline_time / cache_time:.2f}x")
     
@@ -564,11 +882,7 @@ def compare_inference_methods():
         _ = compiled_layer(hidden_states)
     torch.cuda.synchronize()
     
-    start = time.time()
-    for _ in range(10):
-        _ = compiled_layer(hidden_states)
-    torch.cuda.synchronize()
-    compiled_time = (time.time() - start) / 10 * 1000
+    compiled_time = _benchmark_cuda_latency_ms(lambda: compiled_layer(hidden_states), 10)
     print(f"   Time: {compiled_time:.2f} ms")
     print(f"   Speedup: {baseline_time / compiled_time:.2f}x")
     
@@ -641,12 +955,13 @@ class TensorParallelMultiGPU:
         self.rank = rank
         self.local_rank = resolve_local_rank()
         self.device = torch.device(f"cuda:{self.local_rank}")
+        self._gathered_outputs = None
+        self._final_output = None
         
         # Move model to current GPU
         self.model = self.model.to(self.device)
         
         # Initialize process group if not already done
-        import torch.distributed as dist
         if not dist.is_initialized():
             os.environ.setdefault("MASTER_ADDR", "localhost")
             os.environ.setdefault("MASTER_PORT", "12355")
@@ -672,27 +987,63 @@ class TensorParallelMultiGPU:
         cache_shard = kv_cache.cache[:, :, :, start_head:end_head, :, :]
         
         return cache_shard, start_head, end_head
+
+    def _output_gather_workspaces(self, outputs: torch.Tensor):
+        local_shape = tuple(int(dim) for dim in outputs.shape)
+        local_numel = int(outputs.numel())
+        final_shape = (*local_shape[:-1], local_shape[-1] * self.num_gpus)
+        final_numel = local_numel * self.num_gpus
+
+        needs_gather_buffers = (
+            self._gathered_outputs is None
+            or len(self._gathered_outputs) != self.num_gpus
+            or any(
+                buffer.device != outputs.device
+                or buffer.dtype != outputs.dtype
+                or buffer.numel() < local_numel
+                for buffer in self._gathered_outputs
+            )
+        )
+        if needs_gather_buffers:
+            self._gathered_outputs = [
+                torch.empty(local_numel, device=outputs.device, dtype=outputs.dtype)
+                for _ in range(self.num_gpus)
+            ]
+
+        if (
+            self._final_output is None
+            or self._final_output.device != outputs.device
+            or self._final_output.dtype != outputs.dtype
+            or self._final_output.numel() < final_numel
+        ):
+            self._final_output = torch.empty(
+                final_numel,
+                device=outputs.device,
+                dtype=outputs.dtype,
+            )
+
+        gathered_outputs = [
+            buffer[:local_numel].view(local_shape)
+            for buffer in self._gathered_outputs
+        ]
+        final_output = self._final_output[:final_numel].view(final_shape)
+        return gathered_outputs, final_output
     
     def forward(self, input_ids, kv_cache=None):
         """
         Forward pass with tensor parallelism.
         """
-        input_ids = input_ids.to(self.device)
+        if input_ids.device != self.device:
+            input_ids = input_ids.to(self.device, non_blocking=True)
         
-        # If KV cache provided, shard it
-        if kv_cache is not None:
-            cache_shard, start_head, end_head = self.shard_kv_cache(kv_cache)
-            # Use only the relevant head slice
-            outputs = self.model(input_ids)  # Simplified for demo
-        else:
-            outputs = self.model(input_ids)
+        # Demo model does not consume the sharded KV cache in this simplified path.
+        outputs = self.model(input_ids)
         
         # All-gather outputs across GPUs
-        import torch.distributed as dist
         if dist.is_initialized():
-            gathered_outputs = [torch.zeros_like(outputs) for _ in range(self.num_gpus)]
+            gathered_outputs, final_output = self._output_gather_workspaces(outputs)
             dist.all_gather(gathered_outputs, outputs)
-            final_output = torch.cat(gathered_outputs, dim=-1)
+            torch.cat(gathered_outputs, dim=-1, out=final_output)
         else:
             final_output = outputs
         
@@ -774,12 +1125,13 @@ def benchmark_multigpu_tensor_parallel():
     # Benchmark
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream(device)
     
     num_iterations = 100
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(num_iterations):
         _ = layer(hidden_states, kv_cache=kv_cache, layer_idx=0)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     
     time_ms = start_event.elapsed_time(end_event) / num_iterations
@@ -907,7 +1259,7 @@ def demo_gb200_cpu_offloading():
         print("ℹ Running on standard GPU (GB200/GB300 features emulated)")
     
     # Create cache with CPU offloading
-    cache = GB200CPUOffloadKVCache(
+    GB200CPUOffloadKVCache(
         num_layers=32,
         max_batch_size=8,
         max_seq_len=128000,  # 128K context

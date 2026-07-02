@@ -14,6 +14,7 @@ from core.harness.benchmark_harness import (  # noqa: E402
     BenchmarkConfig,
     WorkloadMetadata,
 )
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 # Import CUDA extension
 from ch12.cuda_extensions import load_kernel_fusion_extension
@@ -34,6 +35,9 @@ class OptimizedKernelFusionDedicatedStreamBenchmark(VerificationPayloadMixin, Ba
             tokens_per_iteration=float(self.N * self.iterations),
         )
         self._stream = None
+        self._prefetch_touch: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._enable_nvtx = False
     
     def setup(self) -> None:
         """Setup: Initialize tensors, stream, and load CUDA extension.
@@ -44,6 +48,8 @@ class OptimizedKernelFusionDedicatedStreamBenchmark(VerificationPayloadMixin, Ba
         """
         # Load CUDA extension (will compile on first call)
         self._extension = load_kernel_fusion_extension()
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
 
         # Create a dedicated non-blocking stream for this benchmark if not created.
         if self._stream is None:
@@ -52,6 +58,7 @@ class OptimizedKernelFusionDedicatedStreamBenchmark(VerificationPayloadMixin, Ba
         # Initialize deterministic input on the device.
         torch.manual_seed(42)
         self.data = torch.arange(self.N, dtype=torch.float32, device=self.device)
+        self._prefetch_touch = torch.empty((), device=self.device, dtype=self.data.dtype)
         self._verify_input = self.data.detach().clone()
 
         # Perform a dry run on the dedicated stream to pay compilation and
@@ -66,11 +73,12 @@ class OptimizedKernelFusionDedicatedStreamBenchmark(VerificationPayloadMixin, Ba
         # Reset data so benchmark iterations always start from same values.
         torch.manual_seed(42)
         self.data = torch.arange(self.N, dtype=torch.float32, device=self.device)
+        self._verify_output_buffer = torch.empty_like(self.data)
 
         # Prefetch-style touch on the same stream to fault in pages and
         # encourage the driver to keep this region resident.
         with torch.cuda.stream(self._stream):
-            _ = self.data.sum()
+            torch.sum(self.data, dim=0, out=self._prefetch_touch)
 
         self._stream.synchronize()
     
@@ -82,14 +90,9 @@ class OptimizedKernelFusionDedicatedStreamBenchmark(VerificationPayloadMixin, Ba
         default stream, which helps approach steady-state bandwidth on
         Blackwell.
         """
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
         stream = self._stream if self._stream is not None else torch.cuda.current_stream(device=self.device)
 
-        with nvtx_range("kernel_fusion", enable=enable_nvtx):
+        with nvtx_range("kernel_fusion", enable=self._enable_nvtx):
             # Enqueue the fused kernel on our dedicated stream.
             with torch.cuda.stream(stream):
                 self._extension.fused_kernel(self.data, self.iterations)
@@ -100,9 +103,12 @@ class OptimizedKernelFusionDedicatedStreamBenchmark(VerificationPayloadMixin, Ba
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.data is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output for verification")
+        self._verify_output_buffer.copy_(self.data)
         self._set_verification_payload(
             inputs={"data": self._verify_input},
-            output=self.data.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.N,
             precision_flags={
                 "fp16": False,
@@ -118,6 +124,8 @@ class OptimizedKernelFusionDedicatedStreamBenchmark(VerificationPayloadMixin, Ba
         """Teardown: Clean up resources and destroy the dedicated stream."""
         self.data = None
         self._verify_input = None
+        self._prefetch_touch = None
+        self._verify_output_buffer = None
         # Explicitly delete the stream so that future benchmarks start from
         # a clean state and to avoid holding onto resources.
         self._stream = None

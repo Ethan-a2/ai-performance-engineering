@@ -26,7 +26,7 @@ Author: Blackwell Optimization Project
 import pytest
 import torch
 import torch.nn as nn
-import os
+import inspect
 
 from core.utils.compile_utils import enable_tf32
 
@@ -200,6 +200,230 @@ class TestNumericalCorrectness:
         # Tolerance is higher for FP8
         assert key_error < 0.1, f"Key error too high: {key_error}"
         assert value_error < 0.1, f"Value error too high: {value_error}"
+
+    def test_kv_cache_vectorized_equal_length_update_appends_unique_rows(self, monkeypatch):
+        """Equal-length unique batch rows use the vectorized KV update path."""
+        blackwell = pytest.importorskip("ch16.inference_optimizations_blackwell")
+        monkeypatch.setattr(blackwell, "FP8_AVAILABLE", False)
+
+        init_source = inspect.getsource(blackwell.DynamicQuantizedKVCache.__init__)
+        source = inspect.getsource(blackwell.DynamicQuantizedKVCache.update)
+        clear_source = inspect.getsource(blackwell.DynamicQuantizedKVCache.clear)
+        assert "self.cache = torch.empty(" in init_source
+        assert "self.cache = torch.zeros(" not in init_source
+        assert "self._batch_index_cache = torch.arange(max_batch_size" in init_source
+        assert "self._batch_indices_device_buffer: Optional[torch.Tensor] = None" in init_source
+        assert "self.cache.zero_()" not in clear_source
+        assert "self.cache[:, :, batch_idx].zero_()" not in clear_source
+        assert "self._seq_lens_host = [0] * self.max_batch_size" not in clear_source
+        assert "unique_rows" in source
+        assert "batch_indices = self._batch_index_cache.narrow(0, cache_idx, 1)" in source
+        assert "if isinstance(batch_indices, int)" in source
+        assert 'batch_indices.device.type == "cpu"' in source
+        assert "self._batch_index_host = torch.empty(" in init_source
+        assert "self._batch_index_list = [0] * max_batch_size" in init_source
+        assert "self._batch_index_seen = [0] * max_batch_size" in init_source
+        assert "self._next_length_rows = [0] * max_batch_size" in init_source
+        assert "self._range_cache_indices = [0] * max_batch_size" in init_source
+        assert "self._updated_key_buffer: Optional[torch.Tensor] = None" in init_source
+        assert "self._updated_value_buffer: Optional[torch.Tensor] = None" in init_source
+        assert 'pin_memory=torch.device(device).type == "cuda"' in init_source
+        assert "batch_index_host = self._batch_index_host[:batch_count]" in source
+        assert "batch_index_host.copy_(batch_indices)" in source
+        assert "self._fill_batch_index_list_from_host(batch_index_host, batch_count)" in source
+        assert ".tolist()" not in source
+        assert "batch_indices.detach().cpu().tolist()" not in source
+        assert "len(set(" not in source
+        assert "current_lengths = [" not in source
+        assert "self._seq_lens_host.copy()" not in source
+        assert "ranges: list" not in source
+        assert "ranges.append(" not in source
+        assert "def _batch_indices_buffer(self, count: int) -> torch.Tensor:" in inspect.getsource(
+            blackwell.DynamicQuantizedKVCache._batch_indices_buffer
+        )
+        assert "def _fill_batch_index_list_from_host(" in inspect.getsource(
+            blackwell.DynamicQuantizedKVCache._fill_batch_index_list_from_host
+        )
+        assert "def _batch_rows_unique_and_same_length(" in inspect.getsource(
+            blackwell.DynamicQuantizedKVCache._batch_rows_unique_and_same_length
+        )
+        assert "batch_indices = self._batch_indices_buffer(batch_count)" in source
+        assert "device_batch_indices = self._batch_indices_buffer(batch_count)" in source
+        assert "batch_indices = torch.tensor(" not in source
+        assert "current_len = range_start_positions[local_idx]" in source
+        assert "self.seq_lens[cache_idx_int].item()" not in source
+        assert "self.cache[layer_idx, 0, batch_indices, :, current_len:end_pos, :] = k_store" in source
+        assert "return_shape = (batch_count, self.num_heads, max_end_pos, self.head_dim)" in source
+        assert "updated_keys[local_idx, :, :end_pos, :].copy_(cached_key)" in source
+        assert "updated_keys[local_idx, :, end_pos:max_end_pos, :].zero_()" in source
+        assert "torch.cat(updated_keys" not in source
+
+        cache = blackwell.DynamicQuantizedKVCache(
+            num_layers=1,
+            max_batch_size=2,
+            max_seq_len=4,
+            num_heads=2,
+            head_dim=3,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        batch_indices = torch.tensor([0, 1], dtype=torch.long)
+        key1 = torch.arange(24, dtype=torch.float32).view(2, 2, 2, 3)
+        value1 = key1 + 100.0
+
+        out_k1, out_v1 = cache.update(0, key1, value1, batch_indices=batch_indices)
+
+        torch.testing.assert_close(cache.seq_lens, torch.tensor([2, 2], dtype=torch.long))
+        assert cache._seq_lens_host == [2, 2]
+        torch.testing.assert_close(out_k1, key1)
+        torch.testing.assert_close(out_v1, value1)
+
+        key2 = torch.full((2, 2, 1, 3), 7.0)
+        value2 = torch.full((2, 2, 1, 3), 9.0)
+
+        out_k2, out_v2 = cache.update(0, key2, value2, batch_indices=batch_indices)
+
+        torch.testing.assert_close(cache.seq_lens, torch.tensor([3, 3], dtype=torch.long))
+        assert cache._seq_lens_host == [3, 3]
+        torch.testing.assert_close(out_k2[:, :, :2, :], key1)
+        torch.testing.assert_close(out_v2[:, :, :2, :], value1)
+        torch.testing.assert_close(out_k2[:, :, 2:, :], key2)
+        torch.testing.assert_close(out_v2[:, :, 2:, :], value2)
+
+        cache.clear(batch_idx=1)
+        torch.testing.assert_close(cache.seq_lens, torch.tensor([3, 0], dtype=torch.long))
+        assert cache._seq_lens_host == [3, 0]
+        cache.clear()
+        torch.testing.assert_close(cache.seq_lens, torch.tensor([0, 0], dtype=torch.long))
+        assert cache._seq_lens_host == [0, 0]
+
+        out_k3, out_v3 = cache.update(0, key1, value1, batch_indices=[0, 1])
+        index_buffer_ptr = cache._batch_indices_device_buffer.data_ptr()
+
+        torch.testing.assert_close(cache.seq_lens, torch.tensor([2, 2], dtype=torch.long))
+        assert cache._seq_lens_host == [2, 2]
+        torch.testing.assert_close(out_k3, key1)
+        torch.testing.assert_close(out_v3, value1)
+        torch.testing.assert_close(cache._batch_indices_device_buffer[:2], torch.tensor([0, 1]))
+
+        cache.clear()
+        cache.update(0, key1, value1, batch_indices=[0, 1])
+        assert cache._batch_indices_device_buffer.data_ptr() == index_buffer_ptr
+
+        cache.clear()
+        single_key = key1[:1]
+        single_value = value1[:1]
+        out_k4, out_v4 = cache.update(0, single_key, single_value, batch_indices=0)
+
+        torch.testing.assert_close(cache.seq_lens, torch.tensor([2, 0], dtype=torch.long))
+        assert cache._seq_lens_host == [2, 0]
+        torch.testing.assert_close(out_k4, single_key)
+        torch.testing.assert_close(out_v4, single_value)
+
+    def test_kv_cache_mixed_length_update_reuses_padded_return_buffers(self, monkeypatch):
+        """Mixed-length rows avoid per-row list/torch.cat fallback allocations."""
+        blackwell = pytest.importorskip("ch16.inference_optimizations_blackwell")
+        monkeypatch.setattr(blackwell, "FP8_AVAILABLE", False)
+
+        cache = blackwell.DynamicQuantizedKVCache(
+            num_layers=1,
+            max_batch_size=2,
+            max_seq_len=5,
+            num_heads=1,
+            head_dim=2,
+            device="cpu",
+            dtype=torch.float32,
+        )
+
+        key0 = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+        value0 = key0 + 10.0
+        cache.update(0, key0, value0, batch_indices=0)
+
+        key_next = torch.tensor([[[[5.0, 6.0]]], [[[7.0, 8.0]]]])
+        value_next = key_next + 20.0
+        out_k, out_v = cache.update(
+            0,
+            key_next,
+            value_next,
+            batch_indices=torch.tensor([0, 1], dtype=torch.long),
+        )
+        key_ptr = out_k.data_ptr()
+        value_ptr = out_v.data_ptr()
+
+        assert out_k.data_ptr() == cache._updated_key_buffer.data_ptr()
+        assert out_v.data_ptr() == cache._updated_value_buffer.data_ptr()
+        assert out_k.shape == (2, 1, 3, 2)
+        torch.testing.assert_close(out_k[0, :, :2, :], key0[0])
+        torch.testing.assert_close(out_v[0, :, :2, :], value0[0])
+        torch.testing.assert_close(out_k[0, :, 2:, :], key_next[:1, 0])
+        torch.testing.assert_close(out_v[0, :, 2:, :], value_next[:1, 0])
+        torch.testing.assert_close(out_k[1, :, :1, :], key_next[1])
+        torch.testing.assert_close(out_v[1, :, :1, :], value_next[1])
+        torch.testing.assert_close(out_k[1, :, 1:, :], torch.zeros_like(out_k[1, :, 1:, :]))
+        torch.testing.assert_close(out_v[1, :, 1:, :], torch.zeros_like(out_v[1, :, 1:, :]))
+
+        cache.clear()
+        cache.update(0, key0, value0, batch_indices=0)
+        out_k_again, out_v_again = cache.update(
+            0,
+            key_next,
+            value_next,
+            batch_indices=torch.tensor([0, 1], dtype=torch.long),
+        )
+        assert out_k_again.data_ptr() == key_ptr
+        assert out_v_again.data_ptr() == value_ptr
+
+        cache.clear()
+        dup_key = torch.tensor([[[[1.0, 2.0]]], [[[3.0, 4.0]]]])
+        dup_value = dup_key + 30.0
+        out_k_dup, out_v_dup = cache.update(0, dup_key, dup_value, batch_indices=[0, 0])
+
+        torch.testing.assert_close(cache.seq_lens, torch.tensor([2, 0], dtype=torch.long))
+        assert cache._seq_lens_host == [2, 0]
+        torch.testing.assert_close(out_k_dup[0, :, :1, :], dup_key[0])
+        torch.testing.assert_close(out_v_dup[0, :, :1, :], dup_value[0])
+        torch.testing.assert_close(
+            out_k_dup[0, :, 1:, :],
+            torch.zeros_like(out_k_dup[0, :, 1:, :]),
+        )
+        torch.testing.assert_close(
+            out_v_dup[0, :, 1:, :],
+            torch.zeros_like(out_v_dup[0, :, 1:, :]),
+        )
+        expected_dup_key = dup_key[:, 0, 0, :].unsqueeze(0)
+        expected_dup_value = dup_value[:, 0, 0, :].unsqueeze(0)
+        torch.testing.assert_close(out_k_dup[1, :, :2, :], expected_dup_key)
+        torch.testing.assert_close(out_v_dup[1, :, :2, :], expected_dup_value)
+
+    def test_tensor_parallel_all_gather_uses_uninitialized_receive_buffers(self):
+        blackwell = pytest.importorskip("ch16.inference_optimizations_blackwell")
+        source = inspect.getsource(blackwell.TensorParallelMultiGPU.forward)
+        class_source = inspect.getsource(blackwell.TensorParallelMultiGPU)
+
+        assert "gathered_outputs, final_output = self._output_gather_workspaces(outputs)" in source
+        assert "self._gathered_outputs = [" in class_source
+        assert "torch.empty(local_numel" in class_source
+        assert "torch.zeros_like(outputs)" not in source
+
+    def test_blackwell_inference_generate_preallocates_output_tokens(self):
+        blackwell = pytest.importorskip("ch16.inference_optimizations_blackwell")
+
+        source = inspect.getsource(blackwell.BlackwellInferencePipeline.generate)
+        pipeline_source = inspect.getsource(blackwell.BlackwellInferencePipeline)
+        assert "self._next_token_buffer: Optional[torch.Tensor] = None" in pipeline_source
+        assert "def _next_token_from_logits" in pipeline_source
+        assert "torch.max(logits_last, dim=-1, keepdim=True, out=(self._next_token_values, self._next_token_buffer))" in pipeline_source
+        assert "self._generated_token_buffer: Optional[torch.Tensor] = None" in pipeline_source
+        assert "def _generated_output_buffer" in pipeline_source
+        assert "self._generated_token_buffer = torch.empty(" in pipeline_source
+        assert "output_ids = self._generated_output_buffer(input_ids, seq_len + max_new_tokens)" in source
+        assert "output_ids = torch.empty(" not in source
+        assert "output_ids[:, :seq_len].copy_(input_ids)" in source
+        assert "output_ids[:, seq_len : seq_len + 1].copy_(next_token)" in source
+        assert ".argmax(dim=-1, keepdim=True)" not in source
+        assert "generated = [next_token]" not in source
+        assert "generated.append(next_token)" not in source
+        assert "torch.cat(generated" not in source
 
 
 # ============================================================================
@@ -759,7 +983,7 @@ class TestStress:
         
         start_event.record()
         
-        for i in range(num_chunks):
+        for _ in range(num_chunks):
             k = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device)
             v = torch.randn(batch_size, num_heads, chunk_size, head_dim, device=device)
             
@@ -874,7 +1098,7 @@ class TestEndToEnd:
         
         start.record()
         
-        for step in range(num_steps):
+        for _ in range(num_steps):
             x = torch.randn(batch_size, 512, device=device)
             y = compiled_model(x)
             loss = y.sum()

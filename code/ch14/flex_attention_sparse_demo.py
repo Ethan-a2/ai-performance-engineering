@@ -23,23 +23,23 @@ REQUIREMENTS:
 
 from __future__ import annotations
 
-import math
-from typing import Optional, Callable
+from typing import Callable, Optional
+
+from core.benchmark.utils import scalar_tensor_to_float
 
 import torch
 import torch.nn as nn
+from torch.nn.attention.flex_attention import (
+    _DEFAULT_SPARSE_BLOCK_SIZE,
+    create_block_mask,
+    flex_attention,
+)
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (
     BaseBenchmark,
     BenchmarkConfig,
     WorkloadMetadata,
-)
-
-from torch.nn.attention.flex_attention import (
-    flex_attention,
-    create_block_mask,
-    _DEFAULT_SPARSE_BLOCK_SIZE,
 )
 
 # Ensure we have the flex_attention API
@@ -205,13 +205,14 @@ class FlexAttentionBenchmark:
         # Benchmark
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream(self.device)
         
-        start.record()
+        start.record(current_stream)
         last_output = None
         for _ in range(num_iterations):
             last_output = self._compiled_flex(self.q, self.k, self.v, block_mask=block_mask)
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         
         if store_output and last_output is not None:
             self._last_output = last_output
@@ -225,7 +226,7 @@ class FlexAttentionBenchmark:
         tflops = total_flops / (elapsed_ms / 1000) / 1e12
         
         # Estimate sparsity from block mask
-        num_blocks = block_mask.kv_num_blocks.sum().item()
+        num_blocks = scalar_tensor_to_float(block_mask.kv_num_blocks.sum())
         max_blocks = (self.seq_len // _DEFAULT_SPARSE_BLOCK_SIZE) ** 2 * self.batch_size * self.num_heads
         sparsity = 1.0 - (num_blocks / max_blocks) if max_blocks > 0 else 0.0
         
@@ -257,14 +258,15 @@ class FlexAttentionBenchmark:
         # Benchmark
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream(self.device)
         
-        start.record()
+        start.record(current_stream)
         for _ in range(num_iterations):
             _ = torch.nn.functional.scaled_dot_product_attention(
                 self.q, self.k, self.v, is_causal=False
             )
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         
         elapsed_ms = start.elapsed_time(end) / num_iterations
         
@@ -381,8 +383,7 @@ class SlidingWindowCausalAttention(nn.Module):
         # QKV projection
         qkv = self.qkv_proj(x)
         qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
         
         # FlexAttention with sliding window causal mask
         if self._compiled_flex is not None and HAS_FLEX_ATTENTION:
@@ -420,6 +421,7 @@ class FlexAttentionSparseDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._last = 0.0
         self.output = None
         self._block_mask = None
+        self._payload_inputs = {}
         self._verification_payload = None
         
         tokens = self.batch_size * self.seq_len
@@ -450,13 +452,21 @@ class FlexAttentionSparseDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
             )
         # Warmup with causal pattern
         if HAS_FLEX_ATTENTION:
-            for _ in range(10):
-                _ = self.demo_benchmark._compiled_flex(
-                    self.demo_benchmark.q,
-                    self.demo_benchmark.k,
-                    self.demo_benchmark.v,
-                    block_mask=self._block_mask,
-                )
+            with torch.inference_mode():
+                for _ in range(10):
+                    _ = self.demo_benchmark._compiled_flex(
+                        self.demo_benchmark.q,
+                        self.demo_benchmark.k,
+                        self.demo_benchmark.v,
+                        block_mask=self._block_mask,
+                    )
+        payload_inputs = self._payload_inputs
+        payload_inputs.clear()
+        payload_inputs["q"] = self.demo_benchmark.q
+        payload_inputs["k"] = self.demo_benchmark.k
+        payload_inputs["v"] = self.demo_benchmark.v
+        if self._block_mask is not None:
+            payload_inputs["block_mask"] = self._block_mask
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
@@ -466,24 +476,15 @@ class FlexAttentionSparseDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if self.demo_benchmark is None:
             raise RuntimeError("Benchmark not initialized")
 
-        with torch.no_grad():
+        with torch.inference_mode():
             self.output = self.demo_benchmark._compiled_flex(
                 self.demo_benchmark.q,
                 self.demo_benchmark.k,
                 self.demo_benchmark.v,
                 block_mask=self._block_mask,
             )
-            self._last = float(self.output.detach().sum())
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
-        inputs = {
-            "q": self.demo_benchmark.q,
-            "k": self.demo_benchmark.k,
-            "v": self.demo_benchmark.v,
-        }
-        if self._block_mask is not None:
-            inputs["block_mask"] = self._block_mask
-        self._payload_inputs = inputs
 
     def capture_verification_payload(self) -> None:
         inputs = self._payload_inputs
@@ -505,6 +506,7 @@ class FlexAttentionSparseDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
         """Teardown: Clean up resources."""
         self.demo_benchmark = None
         self._block_mask = None
+        self._payload_inputs.clear()
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

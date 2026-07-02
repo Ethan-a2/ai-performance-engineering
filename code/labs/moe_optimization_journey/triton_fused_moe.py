@@ -11,7 +11,13 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-import time
+
+
+def _flat_topk_token_ids(num_tokens: int, top_k: int, device: torch.device) -> torch.Tensor:
+    token_ids = torch.arange(num_tokens * top_k, device=device, dtype=torch.int64)
+    if top_k > 1:
+        token_ids.div_(top_k, rounding_mode="floor")
+    return token_ids
 
 
 @triton.jit
@@ -19,7 +25,7 @@ def fused_moe_expert_kernel(
     # Pointers
     X_ptr, Out_ptr,
     W_gate_ptr, W_up_ptr, W_down_ptr,
-    Sorted_ids_ptr, Sorted_weights_ptr,
+    Sorted_weights_ptr,
     Expert_offsets_ptr,
     # Dimensions
     H: tl.constexpr, I: tl.constexpr,
@@ -115,17 +121,22 @@ def triton_fused_moe(
     w_gate: torch.Tensor,     # [E, H, I]
     w_up: torch.Tensor,       # [E, H, I]
     w_down: torch.Tensor,     # [E, I, H]
-    sorted_ids: torch.Tensor,
     sorted_weights: torch.Tensor,
     expert_offsets: torch.Tensor,  # [E+1] cumulative offsets
     E: int, H: int, I: int,
+    max_tokens: int | None = None,
 ) -> torch.Tensor:
     """Launch Triton fused MoE kernel."""
     total_tokens = x.shape[0]
-    output = torch.zeros_like(x)
+    output = torch.empty_like(x)
     
-    # Grid: (num_experts, max_tokens_per_expert / BLOCK_M)
-    max_tokens = (expert_offsets[1:] - expert_offsets[:-1]).max().item()
+    # Grid: (num_experts, max_tokens_per_expert / BLOCK_M). Callers should pass
+    # the precomputed max for a tight launch; the fallback avoids a CUDA scalar
+    # readback by using the total sorted assignments as a conservative bound.
+    if max_tokens is None:
+        max_tokens = total_tokens
+    else:
+        max_tokens = int(max_tokens)
     BLOCK_M = 64
     BLOCK_K = 64
     BLOCK_N = 64
@@ -135,7 +146,7 @@ def triton_fused_moe(
     fused_moe_expert_kernel[grid](
         x, output,
         w_gate, w_up, w_down,
-        sorted_ids, sorted_weights,
+        sorted_weights,
         expert_offsets,
         H, I,
         x.stride(0), x.stride(1),
@@ -164,42 +175,54 @@ def benchmark_triton_moe():
     w_up = torch.randn(E, H, I, device=device, dtype=torch.bfloat16)
     w_down = torch.randn(E, I, H, device=device, dtype=torch.bfloat16)
     
-    # Generate routing
-    expert_indices = torch.randint(0, E, (batch_seq, K), device=device)
+    # Generate routing and precompute the launch bound on CPU to avoid a CUDA
+    # scalar readback before the timed kernel loop.
+    expert_indices_cpu = torch.randint(0, E, (batch_seq, K), dtype=torch.int64)
+    counts_cpu = torch.bincount(expert_indices_cpu.reshape(-1), minlength=E)
+    max_tokens = int(counts_cpu.max())
+    expert_indices = expert_indices_cpu.to(device=device, non_blocking=True)
     expert_weights = F.softmax(torch.randn(batch_seq, K, device=device), dim=-1).to(torch.bfloat16)
     
     # Sort by expert
     flat_idx = expert_indices.view(-1)
     sorted_order = torch.argsort(flat_idx, stable=True)
-    sorted_tokens = x.repeat_interleave(K, dim=0)[sorted_order]
-    sorted_weights = expert_weights.view(-1)[sorted_order]
-    sorted_expert_ids = flat_idx[sorted_order]
+    flat_token_ids = _flat_topk_token_ids(batch_seq, K, x.device)
+    sorted_token_ids = flat_token_ids.index_select(0, sorted_order)
+    sorted_tokens = x.index_select(0, sorted_token_ids)
+    sorted_weights = expert_weights.view(-1).index_select(0, sorted_order)
+    sorted_expert_ids = flat_idx.index_select(0, sorted_order)
     
     # Compute expert offsets
     counts = torch.bincount(sorted_expert_ids, minlength=E)
-    expert_offsets = torch.cat([torch.zeros(1, device=device, dtype=torch.long), counts.cumsum(0)])
+    expert_offsets = torch.empty(E + 1, device=device, dtype=torch.long)
+    expert_offsets[0] = 0
+    expert_offsets[1:].copy_(counts.cumsum(0))
     
     # Test kernel
     try:
         output = triton_fused_moe(
             sorted_tokens, w_gate, w_up, w_down,
-            sorted_order, sorted_weights, expert_offsets,
-            E, H, I
+            sorted_weights, expert_offsets,
+            E, H, I, max_tokens=max_tokens
         )
         print(f"✅ Triton kernel executed! Output shape: {output.shape}")
         
         # Benchmark
         for _ in range(5):
             _ = triton_fused_moe(sorted_tokens, w_gate, w_up, w_down,
-                                sorted_order, sorted_weights, expert_offsets, E, H, I)
+                                sorted_weights, expert_offsets, E, H, I, max_tokens=max_tokens)
         torch.cuda.synchronize()
-        
-        start = time.perf_counter()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream()
+        start.record(current_stream)
         for _ in range(10):
             _ = triton_fused_moe(sorted_tokens, w_gate, w_up, w_down,
-                                sorted_order, sorted_weights, expert_offsets, E, H, I)
-        torch.cuda.synchronize()
-        ms = (time.perf_counter() - start) * 1000 / 10
+                                sorted_weights, expert_offsets, E, H, I, max_tokens=max_tokens)
+        end.record(current_stream)
+        end.synchronize()
+        ms = start.elapsed_time(end) / 10
         
         flops = batch_seq * K * 3 * 2 * H * I
         tflops = flops / (ms / 1000) / 1e12
@@ -214,7 +237,3 @@ def benchmark_triton_moe():
 
 if __name__ == "__main__":
     benchmark_triton_moe()
-
-
-
-

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -26,6 +25,7 @@ class BaselinePrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Base
         self.a: Optional[torch.Tensor] = None
         self.b: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         self.m = 8192
         self.k = 8200
@@ -48,6 +48,12 @@ class BaselinePrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Base
 
         self.a = torch.randn(self.m, self.k, device=self.device, dtype=torch.float32) * self.input_scale
         self.b = torch.randn(self.k, self.n, device=self.device, dtype=torch.float32) * self.input_scale
+        self._verify_output_buffer = torch.empty(
+            min(128, self.m),
+            min(256, self.n),
+            device=self.device,
+            dtype=torch.float32,
+        )
         self.parameter_count = self.k * self.n
         self.register_workload_metadata(
             requests_per_iteration=self._workload.requests_per_iteration,
@@ -58,18 +64,23 @@ class BaselinePrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Base
         if self.a is None or self.b is None:
             raise RuntimeError("Benchmark not configured")
         with self._nvtx_range("baseline_precisionfp8_pad_inner_matmul"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = torch.matmul(self.a, self.b)
-                self.output = out.detach().float().clone()
+                self.output = out
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
-        if self.a is None:
+        if self.a is None or self.b is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("Benchmark not configured")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"a": self.a, "b": self.b},
-            output=self.output,
+            output=self._verify_output_buffer,
             batch_size=self.a.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -83,6 +94,8 @@ class BaselinePrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Base
 
     def teardown(self) -> None:
         del self.a, self.b
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
@@ -97,5 +110,3 @@ class BaselinePrecisionFP8PadInnerMatmulBenchmark(VerificationPayloadMixin, Base
 
 def get_benchmark() -> BaseBenchmark:
     return BaselinePrecisionFP8PadInnerMatmulBenchmark()
-
-

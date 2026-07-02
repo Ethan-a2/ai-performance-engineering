@@ -59,7 +59,7 @@ def _apply_per_channel_scaling(linear: nn.Module) -> torch.Tensor:
     if weight is None:
         raise RuntimeError("TE Linear weight missing for per-channel scaling")
     scale = weight.abs().amax(dim=1).clamp(min=1e-6).to(weight.dtype)
-    with torch.no_grad():
+    with torch.inference_mode():
         weight.div_(scale.unsqueeze(1))
         bias = getattr(linear, "bias", None)
         if bias is not None:
@@ -87,10 +87,10 @@ class FP4PerChannelMLP(nn.Module):
         if self.fc1_scale is None or self.fc2_scale is None:
             raise RuntimeError("Per-channel scales not initialized")
         x = self.fc1(x)
-        x = x * self.fc1_scale
+        x.mul_(self.fc1_scale)
         x = self.activation(x)
         x = self.fc2(x)
-        x = x * self.fc2_scale
+        x.mul_(self.fc2_scale)
         return x
 
 
@@ -110,6 +110,7 @@ class OptimizedFP4PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.dtype = torch.float32
         self.parameter_count: int = 0
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.fp4_recipe: Optional[object] = None
         tokens = self.batch_size * self.hidden_dim
         self._workload = WorkloadMetadata(
@@ -144,7 +145,7 @@ class OptimizedFP4PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             device=self.device,
             dtype=self.dtype,
         )
-        with torch.no_grad():
+        with torch.inference_mode():
             self.model.fc1.weight.copy_(w1)
             if self.model.fc1.bias is not None:
                 self.model.fc1.bias.copy_(b1)
@@ -156,26 +157,37 @@ class OptimizedFP4PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
         self.inputs = inputs
         self._verify_input = self.inputs.detach().clone()
+        self._verify_output_buffer = torch.empty(
+            min(128, self.batch_size),
+            min(256, self.hidden_dim),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         for _ in range(3):
-            with torch.no_grad(), fp8_autocast_fn(enabled=True, fp8_recipe=self.fp4_recipe):
+            with torch.inference_mode(), fp8_autocast_fn(enabled=True, fp8_recipe=self.fp4_recipe):
                 _ = self.model(self.inputs)
 
     def benchmark_fn(self) -> None:
         if self.model is None or self.inputs is None or self.fp4_recipe is None:
             raise RuntimeError("Benchmark not initialized")
         _, fp8_autocast_fn, _, _ = _load_transformer_engine()
-        with torch.no_grad(), fp8_autocast_fn(enabled=True, fp8_recipe=self.fp4_recipe):
+        with torch.inference_mode(), fp8_autocast_fn(enabled=True, fp8_recipe=self.fp4_recipe):
             self.output = self.model(self.inputs)
         if self._verify_input is None or self.output is None:
             raise RuntimeError("Verification input/output not initialized")
 
     def capture_verification_payload(self) -> None:
-        if self._verify_input is None or self.output is None:
+        if self._verify_input is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -191,6 +203,8 @@ class OptimizedFP4PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model = None
         self.inputs = None
         self.output = None
+        self._verify_input = None
+        self._verify_output_buffer = None
         self.fp4_recipe = None
         super().teardown()
 

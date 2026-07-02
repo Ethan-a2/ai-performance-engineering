@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import statistics
 from typing import Dict, List, Optional
 
 import torch
 
-from core.benchmark.cuda_event_timing import elapsed_ms, elapsed_ms_list
+from core.benchmark.cuda_event_timing import elapsed_ms
 from core.harness.benchmark_harness import (  # noqa: E402
     BaseBenchmark,
     BenchmarkConfig,
@@ -37,13 +36,27 @@ class FlexDecodingHarness(VerificationPayloadMixin, BaseBenchmark):
         self.model: Optional[flexdemo.FlexDecodingModule] = None
         self.prefill_tokens: Optional[torch.Tensor] = None
         self.decode_token: Optional[torch.Tensor] = None
-        self._history: Dict[str, List[float]] = {"prefill_ms": [], "decode_ms": []}
+        self._prefill_total_ms = 0.0
+        self._prefill_count = 0
+        self._decode_total_ms = 0.0
+        self._decode_count = 0
         self._last_output: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         self._verification_payload = None
         self._prefill_events: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
         self._decode_events: Optional[List[tuple[torch.cuda.Event, torch.cuda.Event]]] = None
+        self._decode_positions: List[int] = []
+        self._decode_schedule: List[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
+        self._decode_event_count = 0
+        self._decode_position_count = 0
+        self._decode_schedule_count = 0
         self._pending_iteration_metrics = False
+        self._prefill_metric_values = [0.0]
+        self._decode_metric_values = [0.0] * self.decode_tokens
+        self._iteration_metric_payload: Dict[str, List[float]] = {
+            "prefill_ms": self._prefill_metric_values,
+            "decode_ms": self._decode_metric_values,
+        }
         total_tokens = self.config.max_seq_len + self.decode_tokens
         self._workload = WorkloadMetadata(
             requests_per_iteration=1.0,
@@ -93,6 +106,19 @@ class FlexDecodingHarness(VerificationPayloadMixin, BaseBenchmark):
             (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
             for _ in range(self.decode_tokens)
         ]
+        self._decode_event_count = len(self._decode_events)
+        base_position = self.prefill_tokens.size(1)
+        self._decode_positions = [base_position + pos for pos in range(self.decode_tokens)]
+        self._decode_position_count = len(self._decode_positions)
+        self._decode_schedule = [
+            (position, start_evt, end_evt)
+            for position, (start_evt, end_evt) in zip(
+                self._decode_positions,
+                self._decode_events,
+                strict=True,
+            )
+        ]
+        self._decode_schedule_count = len(self._decode_schedule)
         torch.cuda.synchronize(self.device)
 
     def _prefill_step(self) -> torch.Tensor:
@@ -111,24 +137,27 @@ class FlexDecodingHarness(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("Model/tokens not initialized")
         if self._prefill_events is None or self._decode_events is None:
             raise RuntimeError("Timing events not initialized")
-        if len(self._decode_events) != self.decode_tokens:
+        if self._decode_event_count != self.decode_tokens:
             raise RuntimeError("Timing event count mismatch")
+        if self._decode_position_count != self.decode_tokens:
+            raise RuntimeError("Decode positions not initialized")
+        if self._decode_schedule_count != self.decode_tokens:
+            raise RuntimeError("Decode schedule not initialized")
 
-        base_position = self.prefill_tokens.size(1)
+        current_stream = torch.cuda.current_stream(self.device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             with self._nvtx_range("flex_prefill"):
                 prefill_start, prefill_end = self._prefill_events
-                prefill_start.record()
+                prefill_start.record(current_stream)
                 prefill_out = self._prefill_step()
-                prefill_end.record()
+                prefill_end.record(current_stream)
 
             with self._nvtx_range("flex_decode"):
-                for pos in range(self.decode_tokens):
-                    start_evt, end_evt = self._decode_events[pos]
-                    start_evt.record()
-                    decode_out = self._decode_step(self.decode_token, base_position + pos)
-                    end_evt.record()
+                for position, start_evt, end_evt in self._decode_schedule:
+                    start_evt.record(current_stream)
+                    decode_out = self._decode_step(self.decode_token, position)
+                    end_evt.record(current_stream)
 
         # Store last output for verification
         self._last_output = decode_out if "decode_out" in locals() else prefill_out
@@ -141,11 +170,23 @@ class FlexDecodingHarness(VerificationPayloadMixin, BaseBenchmark):
         if not self._pending_iteration_metrics or self._prefill_events is None or self._decode_events is None:
             return None
         prefill_time = elapsed_ms(self._prefill_events)
-        decode_times = elapsed_ms_list(self._decode_events)
+        decode_times = self._decode_metric_values
+        if len(decode_times) != len(self._decode_events):
+            decode_times = [0.0] * len(self._decode_events)
+            self._decode_metric_values = decode_times
+            self._iteration_metric_payload["decode_ms"] = decode_times
+        decode_total_ms = 0.0
+        for idx, event_pair in enumerate(self._decode_events):
+            token_ms = elapsed_ms(event_pair)
+            decode_times[idx] = token_ms
+            decode_total_ms += token_ms
         self._pending_iteration_metrics = False
-        self._history["prefill_ms"].append(prefill_time)
-        self._history["decode_ms"].extend(decode_times)
-        return {"prefill_ms": [prefill_time], "decode_ms": decode_times}
+        self._prefill_total_ms += prefill_time
+        self._prefill_count += 1
+        self._decode_total_ms += decode_total_ms
+        self._decode_count += len(self._decode_events)
+        self._prefill_metric_values[0] = prefill_time
+        return self._iteration_metric_payload
 
     def capture_verification_payload(self) -> None:
         self.finalize_iteration_metrics()
@@ -171,6 +212,10 @@ class FlexDecodingHarness(VerificationPayloadMixin, BaseBenchmark):
         self.model = None
         self.prefill_tokens = None
         self.decode_token = None
+        self._decode_schedule = []
+        self._decode_event_count = 0
+        self._decode_position_count = 0
+        self._decode_schedule_count = 0
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -183,20 +228,22 @@ class FlexDecodingHarness(VerificationPayloadMixin, BaseBenchmark):
 
     def get_custom_metrics(self) -> Optional[Dict[str, float]]:
         self.finalize_iteration_metrics()
-        if not self._history["prefill_ms"]:
+        if self._prefill_count == 0:
             return None
         return {
-            "flex_prefill.mean_ms": float(statistics.mean(self._history["prefill_ms"])),
-            "flex_decode.mean_ms": float(statistics.mean(self._history["decode_ms"])),
+            "flex_prefill.mean_ms": float(self._prefill_total_ms / self._prefill_count),
+            "flex_decode.mean_ms": float(
+                self._decode_total_ms / self._decode_count if self._decode_count else 0.0
+            ),
             "flex_decode.tokens_per_iter": float(self.decode_tokens),
             "flexdecode.uses_flex_attention": float(self.use_flex_attention),
         }
 
     def validate_result(self) -> Optional[str]:
         self.finalize_iteration_metrics()
-        if not self._history["prefill_ms"]:
+        if self._prefill_count == 0:
             return "No prefill samples collected"
-        if not self._history["decode_ms"]:
+        if self._decode_count == 0:
             return "No decode samples collected"
         return None
 

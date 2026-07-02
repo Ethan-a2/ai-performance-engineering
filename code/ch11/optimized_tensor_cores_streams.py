@@ -6,14 +6,10 @@ from typing import List, Optional
 
 import torch
 
+from ch11.stream_overlap_base import resolve_device
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
-from core.profiling.nvtx_helper import (
-    canonicalize_nvtx_name,
-    get_nvtx_enabled,
-    nvtx_range,
-)
-from ch11.stream_overlap_base import resolve_device
+from core.profiling.nvtx_helper import canonicalize_nvtx_name
 
 
 class OptimizedTensorCoresStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -35,10 +31,24 @@ class OptimizedTensorCoresStreamsBenchmark(VerificationPayloadMixin, BaseBenchma
         self.host_A: torch.Tensor | None = None
         self.host_B: torch.Tensor | None = None
         self.host_output: torch.Tensor | None = None
+        self._verify_output_buffer: torch.Tensor | None = None
         self.device_A_slots: List[torch.Tensor] | None = None
         self.device_B_slots: List[torch.Tensor] | None = None
         self.device_C_slots: List[torch.Tensor] | None = None
-        element_size = float(torch.empty((), dtype=self.dtype).element_size())
+        self.device_C_rows: List[torch.Tensor] | None = None
+        self.segment_work: List[
+            tuple[
+                torch.cuda.Stream,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+        ] | None = None
+        element_size = float(torch.finfo(self.dtype).bits // 8)
         bytes_transferred = float(self.num_elements * element_size * 3)
         self.register_workload_metadata(bytes_per_iteration=bytes_transferred)
 
@@ -73,19 +83,36 @@ class OptimizedTensorCoresStreamsBenchmark(VerificationPayloadMixin, BaseBenchma
             dtype=self.dtype,
             pin_memory=True,
         )
+        self._verify_output_buffer = torch.empty_like(self.host_output, pin_memory=True)
         self.device_A_slots = [
             torch.empty((self.matrix_dim, self.matrix_dim), device=self.device, dtype=self.dtype)
             for _ in range(self.num_streams)
         ]
         self.device_B_slots = [torch.empty_like(slot) for slot in self.device_A_slots]
         self.device_C_slots = [torch.empty_like(slot) for slot in self.device_A_slots]
+        self.device_C_rows = [slot[0] for slot in self.device_C_slots]
+        segment_work = []
+        for idx, (host_a, host_b, host_out) in enumerate(
+            zip(self.host_A.unbind(0), self.host_B.unbind(0), self.host_output.unbind(0), strict=True)
+        ):
+            slot = idx % self.num_streams
+            segment_work.append(
+                (
+                    self.streams[slot],
+                    host_a,
+                    host_b,
+                    host_out,
+                    self.device_A_slots[slot],
+                    self.device_B_slots[slot],
+                    self.device_C_slots[slot],
+                    self.device_C_rows[slot],
+                )
+            )
+        self.segment_work = segment_work
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        config = getattr(self, "_config", None) or self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range(self.nvtx_label, enable=enable_nvtx):
+        with self._nvtx_range(self.nvtx_label):
             assert self.streams is not None
             assert self.host_A is not None
             assert self.host_B is not None
@@ -93,19 +120,25 @@ class OptimizedTensorCoresStreamsBenchmark(VerificationPayloadMixin, BaseBenchma
             assert self.device_A_slots is not None
             assert self.device_B_slots is not None
             assert self.device_C_slots is not None
+            assert self.device_C_rows is not None
+            assert self.segment_work is not None
 
-            with torch.no_grad():
-                for idx in range(self.num_segments):
-                    slot = idx % self.num_streams
-                    stream = self.streams[slot]
-                    device_a = self.device_A_slots[slot]
-                    device_b = self.device_B_slots[slot]
-                    device_c = self.device_C_slots[slot]
+            with torch.inference_mode():
+                for (
+                    stream,
+                    host_a,
+                    host_b,
+                    host_out,
+                    device_a,
+                    device_b,
+                    device_c,
+                    device_c_row,
+                ) in self.segment_work:
                     with torch.cuda.stream(stream):
-                        device_a.copy_(self.host_A[idx], non_blocking=True)
-                        device_b.copy_(self.host_B[idx], non_blocking=True)
+                        device_a.copy_(host_a, non_blocking=True)
+                        device_b.copy_(host_b, non_blocking=True)
                         torch.matmul(device_a, device_b, out=device_c)
-                        self.host_output[idx].copy_(device_c[0], non_blocking=True)
+                        host_out.copy_(device_c_row, non_blocking=True)
 
                 current = torch.cuda.current_stream(self.device)
                 for stream in self.streams:
@@ -118,9 +151,11 @@ class OptimizedTensorCoresStreamsBenchmark(VerificationPayloadMixin, BaseBenchma
         assert self.host_A is not None
         assert self.host_B is not None
         assert self.host_output is not None
+        assert self._verify_output_buffer is not None
+        self._verify_output_buffer.copy_(self.host_output)
         self._set_verification_payload(
             inputs={"host_A": self.host_A, "host_B": self.host_B},
-            output=self.host_output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.host_output.numel(),
             parameter_count=0,
             precision_flags={
@@ -136,9 +171,12 @@ class OptimizedTensorCoresStreamsBenchmark(VerificationPayloadMixin, BaseBenchma
         self.host_A = None
         self.host_B = None
         self.host_output = None
+        self._verify_output_buffer = None
         self.device_A_slots = None
         self.device_B_slots = None
         self.device_C_slots = None
+        self.device_C_rows = None
+        self.segment_work = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -159,7 +197,7 @@ class OptimizedTensorCoresStreamsBenchmark(VerificationPayloadMixin, BaseBenchma
         return None
 
     def get_custom_metrics(self) -> Optional[dict]:
-        element_size = float(torch.empty((), dtype=self.dtype).element_size())
+        element_size = float(torch.finfo(self.dtype).bits // 8)
         bytes_transferred = float(self.num_elements * element_size * 3)
         return {
             f"{self.label}.elements": float(self.num_elements),

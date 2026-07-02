@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Optional
 
 import torch
-import triton
-import triton.language as tl
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
 from labs.persistent_decode.optimized_persistent_decode_triton import persistent_decode_kernel
 from labs.persistent_decode.persistent_decode_common import (
-    build_inputs,
     build_decode_input_signature,
+    build_inputs,
     get_decode_options,
     get_decode_profile,
     resolve_device,
@@ -56,17 +55,42 @@ class OptimizedPersistentDecodeGraphsBenchmark(VerificationPayloadMixin, BaseBen
         self.prefill_out: torch.Tensor | None = None
         self.graph_mode = graph_mode or GraphMode.FULL_AND_PIECEWISE
         self.max_capture_seq = max_capture_seq or self.seq_len
-        self._history: dict[str, list[float]] = {}
-        self._pending_iteration: dict[str, object] | None = None
+        self._ttft_metric_values: list[float] = [0.0]
+        self._tpot_metric_values: list[float] = [0.0] * self.seq_len
+        self._iteration_metric_payload: dict[str, list[float]] = {
+            "ttft_times_ms": self._ttft_metric_values,
+            "tpot_times_ms": self._tpot_metric_values,
+        }
+        self._pending_graph_path: str | None = None
+        self._pending_start: torch.cuda.Event | None = None
+        self._pending_prefill_end: torch.cuda.Event | None = None
+        self._pending_decode_start: torch.cuda.Event | None = None
+        self._pending_decode_end: torch.cuda.Event | None = None
+        self._full_events: dict[str, torch.cuda.Event] = {}
+        self._piecewise_events: dict[str, torch.cuda.Event] = {}
         self.register_workload_metadata(tokens_per_iteration=tokens_per_iteration())
         self.output: torch.Tensor | None = None
+        self._output_view: torch.Tensor | None = None
+        self._verify_output_buffer: torch.Tensor | None = None
 
     def setup(self) -> None:
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
         self.inputs = build_inputs(self.device)
+        self._output_view = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])]
+        self._verify_output_buffer = torch.empty_like(self._output_view, dtype=torch.float32)
         self.prefill_out = torch.empty((self.batch, self.seq_len), device=self.device, dtype=torch.float32)
+        self._full_events = {
+            "start": torch.cuda.Event(enable_timing=True),
+            "end": torch.cuda.Event(enable_timing=True),
+        }
+        self._piecewise_events = {
+            "start_prefill": torch.cuda.Event(enable_timing=True),
+            "end_prefill": torch.cuda.Event(enable_timing=True),
+            "start_decode": torch.cuda.Event(enable_timing=True),
+            "end_decode": torch.cuda.Event(enable_timing=True),
+        }
         torch.cuda.synchronize()
         self._capture_graphs()
 
@@ -112,7 +136,6 @@ class OptimizedPersistentDecodeGraphsBenchmark(VerificationPayloadMixin, BaseBen
         grid = (max(1, num_items),)
         BLOCK_K = self.block_k
         with torch.cuda.graph(self.full_graph):
-            self.inputs.out.zero_()
             qk = (self.inputs.q * self.inputs.k).sum(dim=-1)
             self.prefill_out.copy_(qk)
             persistent_decode_kernel[grid](
@@ -132,87 +155,93 @@ class OptimizedPersistentDecodeGraphsBenchmark(VerificationPayloadMixin, BaseBen
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        if self.inputs is None or self.prefill_out is None:
+        if self.inputs is None or self.prefill_out is None or self._output_view is None:
             raise RuntimeError("Inputs not initialized")
 
         use_full = (
             self.graph_mode == GraphMode.FULL
             or (self.graph_mode == GraphMode.FULL_AND_PIECEWISE and self.seq_len <= self.max_capture_seq)
         )
+        current_stream = torch.cuda.current_stream(self.device)
         if use_full and self.full_graph is not None:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            with self._nvtx_range("full_graph"):
-                start.record()
+            start = self._full_events["start"]
+            end = self._full_events["end"]
+            with torch.inference_mode(), self._nvtx_range("full_graph"):
+                start.record(current_stream)
                 self.full_graph.replay()
-                end.record()
-            self._pending_iteration = {
-                "path": "full_graph",
-                "start": start,
-                "prefill_end": end,
-                "decode_start": start,
-                "decode_end": end,
-            }
-            self.output = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])]
+                end.record(current_stream)
+            self._pending_graph_path = "full_graph"
+            self._pending_start = start
+            self._pending_prefill_end = end
+            self._pending_decode_start = start
+            self._pending_decode_end = end
+            self.output = self._output_view
             return
 
         if self.prefill_graph is None or self.decode_graph is None:
             raise RuntimeError("Piecewise graphs not initialized")
 
-        with self._nvtx_range(
+        with torch.inference_mode(), self._nvtx_range(
             "piecewise_graph" if self.graph_mode != GraphMode.FULL_AND_PIECEWISE else "graph_fallback_piecewise"
         ):
-            start_prefill = torch.cuda.Event(enable_timing=True)
-            end_prefill = torch.cuda.Event(enable_timing=True)
-            start_decode = torch.cuda.Event(enable_timing=True)
-            end_decode = torch.cuda.Event(enable_timing=True)
-            start_prefill.record()
+            start_prefill = self._piecewise_events["start_prefill"]
+            end_prefill = self._piecewise_events["end_prefill"]
+            start_decode = self._piecewise_events["start_decode"]
+            end_decode = self._piecewise_events["end_decode"]
+            start_prefill.record(current_stream)
             self.prefill_graph.replay()
-            end_prefill.record()
-            start_decode.record()
+            end_prefill.record(current_stream)
+            start_decode.record(current_stream)
             self.decode_graph.replay()
-            end_decode.record()
-            self._pending_iteration = {
-                "path": "piecewise_graph",
-                "start": start_prefill,
-                "prefill_end": end_prefill,
-                "decode_start": start_decode,
-                "decode_end": end_decode,
-            }
-        self.output = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])]
+            end_decode.record(current_stream)
+            self._pending_graph_path = "piecewise_graph"
+            self._pending_start = start_prefill
+            self._pending_prefill_end = end_prefill
+            self._pending_decode_start = start_decode
+            self._pending_decode_end = end_decode
+        self.output = self._output_view
+
+    def _ensure_tpot_metric_values(self) -> list[float]:
+        if len(self._tpot_metric_values) != self.seq_len:
+            self._tpot_metric_values = [0.0] * self.seq_len
+            self._iteration_metric_payload["tpot_times_ms"] = self._tpot_metric_values
+        return self._tpot_metric_values
 
     def finalize_iteration_metrics(self) -> dict[str, list[float]] | None:
-        if not self._pending_iteration:
+        start = self._pending_start
+        prefill_end = self._pending_prefill_end
+        decode_start = self._pending_decode_start
+        decode_end = self._pending_decode_end
+        graph_path = self._pending_graph_path
+        if start is None or prefill_end is None or decode_start is None or decode_end is None or graph_path is None:
             return None
 
-        start = self._pending_iteration["start"]
-        prefill_end = self._pending_iteration["prefill_end"]
-        decode_start = self._pending_iteration["decode_start"]
-        decode_end = self._pending_iteration["decode_end"]
-        graph_path = str(self._pending_iteration["path"])
-        self._pending_iteration = None
+        self._pending_graph_path = None
+        self._pending_start = None
+        self._pending_prefill_end = None
+        self._pending_decode_start = None
+        self._pending_decode_end = None
 
         ttft_ms = float(start.elapsed_time(prefill_end))
         decode_ms = float(decode_start.elapsed_time(decode_end))
-        self._history.setdefault("ttft_ms", []).append(ttft_ms)
-        self._history.setdefault("decode_ms", []).append(decode_ms)
-        self._history.setdefault("per_token_ms", []).append(decode_ms / max(1, self.seq_len))
-        self._history.setdefault("graph_path", []).append(graph_path)
-        return {
-            "ttft_times_ms": [ttft_ms],
-            "tpot_times_ms": [(decode_ms / max(1, self.seq_len))] * self.seq_len,
-        }
+        per_token_ms = decode_ms / max(1, self.seq_len)
+        self._ttft_metric_values[0] = ttft_ms
+        tpot_times_ms = self._ensure_tpot_metric_values()
+        for idx in range(len(tpot_times_ms)):
+            tpot_times_ms[idx] = per_token_ms
+        return self._iteration_metric_payload
 
     def capture_verification_payload(self) -> None:
-        if self.inputs is None or self.output is None:
+        if self.inputs is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "q": self.inputs.q,
                 "k": self.inputs.k,
                 "v": self.inputs.v,
             },
-            output=self.output.to(dtype=torch.float32),
+            output=self._verify_output_buffer,
             batch_size=self.batch,
             parameter_count=0,
             precision_flags={
@@ -231,7 +260,16 @@ class OptimizedPersistentDecodeGraphsBenchmark(VerificationPayloadMixin, BaseBen
         self.decode_graph = None
         self.full_graph = None
         self.prefill_out = None
+        self._full_events = {}
+        self._piecewise_events = {}
         self.output = None
+        self._output_view = None
+        self._verify_output_buffer = None
+        self._pending_graph_path = None
+        self._pending_start = None
+        self._pending_prefill_end = None
+        self._pending_decode_start = None
+        self._pending_decode_end = None
 
     def get_config(self) -> BenchmarkConfig:
         return BenchmarkConfig(

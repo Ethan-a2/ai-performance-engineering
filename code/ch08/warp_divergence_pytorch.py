@@ -24,6 +24,8 @@ except ImportError:
 import time
 import torch
 
+from core.benchmark.utils import scalar_tensor_to_float
+
 
 def _device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -141,18 +143,29 @@ def compare_mask_strategies() -> None:
     data = torch.randn(n, device=device)
     mask = torch.rand(n, device=device) < 0.1  # 10% active
 
-    zeros = torch.zeros_like(data)
+    inactive = mask.logical_not()
     active_indices = mask.nonzero(as_tuple=False).squeeze()
+    all_output = torch.empty_like(data)
+    all_scratch = torch.empty_like(data)
+    active_output = torch.empty_like(data)
+    active_data = torch.empty(active_indices.numel(), device=device, dtype=data.dtype)
+    active_scratch = torch.empty_like(active_data)
 
     def process_all():
-        processed = torch.sin(data) * torch.cos(data)
-        return torch.where(mask, processed, zeros)
+        torch.sin(data, out=all_output)
+        torch.cos(data, out=all_scratch)
+        all_output.mul_(all_scratch)
+        all_output.masked_fill_(inactive, 0.0)
+        return all_output
 
     def process_active_only():
-        processed = torch.sin(data[active_indices]) * torch.cos(data[active_indices])
-        result = zeros.clone()
-        result[active_indices] = processed
-        return result
+        torch.index_select(data, 0, active_indices, out=active_data)
+        torch.cos(active_data, out=active_scratch)
+        torch.sin(active_data, out=active_data)
+        active_data.mul_(active_scratch)
+        active_output.zero_()
+        active_output.index_copy_(0, active_indices, active_data)
+        return active_output
 
     res_all = None
     def run_all():
@@ -167,7 +180,7 @@ def compare_mask_strategies() -> None:
     time_all = _benchmark("Process all elements", run_all)
     time_active = _benchmark("Process active subset", run_active)
 
-    diff = torch.max(torch.abs(res_all - res_active)).item()
+    diff = scalar_tensor_to_float(torch.max(torch.abs(res_all - res_active)))
     print(f"Max elementwise difference: {diff:.2e}")
     if time_active > 0:
         print(f"Speedup (all / active): {time_all / time_active:5.2f}x")
@@ -218,7 +231,9 @@ def compiled_conditionals() -> None:
     _benchmark("Uncompiled", lambda: uncompiled(x, y, threshold))
     _benchmark(f"Compiled ({compile_mode})", lambda: compiled(x, y, threshold))
 
-    max_diff = torch.max(torch.abs(uncompiled(x, y, threshold) - compiled(x, y, threshold))).item()
+    max_diff = scalar_tensor_to_float(
+        torch.max(torch.abs(uncompiled(x, y, threshold) - compiled(x, y, threshold)))
+    )
     print(f"Max difference post-compile: {max_diff:.2e}")
 
 

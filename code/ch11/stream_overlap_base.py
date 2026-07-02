@@ -10,11 +10,7 @@ import torch
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.common.device_utils import require_cuda_device
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
-from core.profiling.nvtx_helper import (
-    canonicalize_nvtx_name,
-    get_nvtx_enabled,
-    nvtx_range,
-)
+from core.profiling.nvtx_helper import canonicalize_nvtx_name
 
 resolve_device = partial(require_cuda_device, "CUDA required for ch11")
 
@@ -39,9 +35,11 @@ class StridedStreamBaseline(VerificationPayloadMixin, BaseBenchmark):
         self.stream = None
         self.host_input = None
         self.host_output = None
+        self._verify_output_buffer = None
         self.host_in_chunks = None
         self.host_out_chunks = None
         self.device_chunks = None
+        self.chunk_triplets = None
         # Stream benchmark - fixed dimensions for overlap measurement
         bytes_transferred = float(num_elements * 4 * 2)  # H2D + D2H
         self.register_workload_metadata(bytes_per_iteration=bytes_transferred)
@@ -55,29 +53,30 @@ class StridedStreamBaseline(VerificationPayloadMixin, BaseBenchmark):
             self.N, device="cpu", dtype=torch.float32, pin_memory=True
         )
         self.host_output = torch.empty_like(self.host_input, pin_memory=True)
+        self._verify_output_buffer = torch.empty_like(self.host_output, pin_memory=True)
         self.host_in_chunks = list(torch.chunk(self.host_input, self.num_segments))
         self.host_out_chunks = list(torch.chunk(self.host_output, self.num_segments))
         self.device_chunks = [torch.empty_like(chunk, device=self.device) for chunk in self.host_in_chunks]
+        self.chunk_triplets = list(zip(self.host_in_chunks, self.host_out_chunks, self.device_chunks, strict=True))
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        config = getattr(self, "_config", None) or self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range(self.label, enable=enable_nvtx):
+        with self._nvtx_range(self.label):
             assert self.host_in_chunks is not None
             assert self.host_out_chunks is not None
             assert self.device_chunks is not None
-            for h_in, h_out, d_buf in zip(self.host_in_chunks, self.host_out_chunks, self.device_chunks):
-                with torch.cuda.stream(self.stream):
-                    d_buf.copy_(h_in, non_blocking=True)
-                    d_buf.mul_(2.0)
-                    d_buf.add_(1.0)
-                    d_buf.mul_(1.1)
-                    d_buf.add_(0.5)
-                    h_out.copy_(d_buf, non_blocking=True)
-                # Naive path blocks on each segment, preventing overlap.
-                self.stream.synchronize()
+            assert self.chunk_triplets is not None
+            with torch.inference_mode():
+                for h_in, h_out, d_buf in self.chunk_triplets:
+                    with torch.cuda.stream(self.stream):
+                        d_buf.copy_(h_in, non_blocking=True)
+                        d_buf.mul_(2.0)
+                        d_buf.add_(1.0)
+                        d_buf.mul_(1.1)
+                        d_buf.add_(0.5)
+                        h_out.copy_(d_buf, non_blocking=True)
+                    # Naive path blocks on each segment, preventing overlap.
+                    self.stream.synchronize()
         if (
             self.host_input is None
             or self.host_output is None
@@ -87,9 +86,13 @@ class StridedStreamBaseline(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must run after setup() initializes buffers")
 
     def capture_verification_payload(self) -> None:
+        assert self.host_input is not None
+        assert self.host_output is not None
+        assert self._verify_output_buffer is not None
+        self._verify_output_buffer.copy_(self.host_output)
         self._set_verification_payload(
             inputs={"host_input": self.host_input},
-            output=self.host_output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.host_input.numel(),
             parameter_count=0,
             precision_flags={"tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -100,9 +103,11 @@ class StridedStreamBaseline(VerificationPayloadMixin, BaseBenchmark):
         self.stream = None
         self.host_input = None
         self.host_output = None
+        self._verify_output_buffer = None
         self.host_in_chunks = None
         self.host_out_chunks = None
         self.device_chunks = None
+        self.chunk_triplets = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -177,11 +182,13 @@ class ConcurrentStreamOptimized(VerificationPayloadMixin, BaseBenchmark):
         self.streams: List[torch.cuda.Stream] | None = None
         self.host_input: torch.Tensor | None = None
         self.host_output: torch.Tensor | None = None
+        self._verify_output_buffer: torch.Tensor | None = None
         self.host_in_chunks: List[torch.Tensor] | None = None
         self.host_out_chunks: List[torch.Tensor] | None = None
         self.device_chunks: List[torch.Tensor] | None = None
+        self.stream_chunk_groups: List[tuple[torch.cuda.Stream, torch.Tensor, torch.Tensor, torch.Tensor]] | None = None
         # Stream benchmark - fixed dimensions for overlap measurement
-        element_size = float(torch.empty((), dtype=self.dtype).element_size())
+        element_size = float(torch.finfo(self.dtype).bits // 8)
         bytes_transferred = float(num_elements * element_size * 2)  # H2D + D2H
         self.register_workload_metadata(bytes_per_iteration=bytes_transferred)
 
@@ -197,6 +204,7 @@ class ConcurrentStreamOptimized(VerificationPayloadMixin, BaseBenchmark):
             self.N, dtype=self.dtype, device="cpu", pin_memory=True
         )
         self.host_output = torch.empty_like(self.host_input, pin_memory=True)
+        self._verify_output_buffer = torch.empty_like(self.host_output, pin_memory=True)
         chunks = torch.chunk(self.host_input, self.num_segments)
         if len(chunks) < self.num_segments:
             chunks = list(chunks)
@@ -207,24 +215,25 @@ class ConcurrentStreamOptimized(VerificationPayloadMixin, BaseBenchmark):
         self.host_out_chunks = list(torch.chunk(self.host_output, len(self.host_in_chunks)))
         self.device_chunks = [torch.empty_like(chunk, device=self.device) for chunk in self.host_in_chunks]
         self.streams = [torch.cuda.Stream() for _ in range(self.num_streams)]
+        self.stream_chunk_groups = [
+            (self.streams[idx % self.num_streams], h_in, h_out, d_buf)
+            for idx, (h_in, h_out, d_buf) in enumerate(
+                zip(self.host_in_chunks, self.host_out_chunks, self.device_chunks, strict=True)
+            )
+        ]
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        config = getattr(self, "_config", None) or self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range(self.label, enable=enable_nvtx):
+        with self._nvtx_range(self.label):
             assert self.streams is not None
             assert self.host_in_chunks is not None
             assert self.host_out_chunks is not None
             assert self.device_chunks is not None
-            with torch.no_grad():
-                for idx, (h_in, h_out, d_buf) in enumerate(
-                    zip(self.host_in_chunks, self.host_out_chunks, self.device_chunks)
-                ):
+            assert self.stream_chunk_groups is not None
+            with torch.inference_mode():
+                for stream, h_in, h_out, d_buf in self.stream_chunk_groups:
                     if h_in.numel() == 0:
                         continue
-                    stream = self.streams[idx % self.num_streams]
                     with torch.cuda.stream(stream):
                         d_buf.copy_(h_in, non_blocking=True)
                         d_buf.mul_(2.0)
@@ -247,9 +256,13 @@ class ConcurrentStreamOptimized(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must run after setup() initializes buffers")
 
     def capture_verification_payload(self) -> None:
+        assert self.host_input is not None
+        assert self.host_output is not None
+        assert self._verify_output_buffer is not None
+        self._verify_output_buffer.copy_(self.host_output)
         self._set_verification_payload(
             inputs={"host_input": self.host_input},
-            output=self.host_output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.host_input.numel(),
             parameter_count=0,
             precision_flags={"tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -260,9 +273,11 @@ class ConcurrentStreamOptimized(VerificationPayloadMixin, BaseBenchmark):
         self.streams = None
         self.host_input = None
         self.host_output = None
+        self._verify_output_buffer = None
         self.host_in_chunks = None
         self.host_out_chunks = None
         self.device_chunks = None
+        self.stream_chunk_groups = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

@@ -21,6 +21,7 @@ resolve_device = lambda: require_cuda_device("MoE CUDA/PTX lab requires CUDA.")
 _MXFP8_BLOCK_SIZE = 32
 _MXFP8_E4M3_MAX = 448.0
 _MXFP8_E8M0_MIN = float(2.0 ** -127)
+_QUANT_VERIFY_MAX_NUMEL = 2 * (4 * 32 + 4 * 8)
 
 
 @dataclass(frozen=True)
@@ -85,13 +86,16 @@ class MoELabState:
     up_proj: torch.Tensor
     down_proj: torch.Tensor
     loss_grad: torch.Tensor
+    route_counts_cpu: tuple[int, ...] = ()
 
 
 @dataclass
 class PackedRoutes:
     packed_tokens: torch.Tensor
     packed_weights: torch.Tensor
+    packed_weight_column: torch.Tensor
     token_indices: torch.Tensor
+    combine_index: torch.Tensor
     expert_indices: torch.Tensor
     counts: torch.Tensor
     starts: torch.Tensor
@@ -112,6 +116,13 @@ class QuantizedMatrix:
 class QuantizedBundle:
     forward: QuantizedMatrix
     transpose: Optional[QuantizedMatrix] = None
+
+
+def _flat_topk_token_ids(num_tokens: int, top_k: int, device: torch.device) -> torch.Tensor:
+    token_ids = torch.arange(num_tokens * top_k, device=device, dtype=torch.long)
+    if top_k > 1:
+        token_ids.div_(top_k, rounding_mode="floor")
+    return token_ids
 
 
 def _workload_parser() -> argparse.ArgumentParser:
@@ -150,41 +161,90 @@ def apply_workload_overrides(workload: MoECudaPtxWorkload, argv: list[str]) -> M
     return updated
 
 
-def _counts_from_weights(total: int, weights: torch.Tensor) -> torch.Tensor:
-    normalized = (weights / weights.sum()) * float(total)
-    base = torch.floor(normalized).to(torch.long)
-    remainder = int(total - int(base.sum().item()))
+def _counts_from_weights(total: int, weights: Sequence[float]) -> tuple[int, ...]:
+    weight_sum = sum(weights)
+    normalized = [weight / weight_sum * float(total) for weight in weights]
+    base = [math.floor(value) for value in normalized]
+    remainder = total - sum(base)
     if remainder > 0:
-        frac = (normalized - base.to(normalized.dtype))
-        order = torch.argsort(frac, descending=True, stable=True)
-        base[order[:remainder]] += 1
-    return base
+        fractional_order = sorted(
+            range(len(base)),
+            key=lambda expert_idx: (-(normalized[expert_idx] - base[expert_idx]), expert_idx),
+        )
+        for expert_idx in fractional_order[:remainder]:
+            base[expert_idx] += 1
+    return tuple(base)
+
+
+def _primary_route_counts_cpu(workload: MoECudaPtxWorkload) -> tuple[int, ...]:
+    if workload.histogram == "balanced":
+        base, remainder = divmod(workload.num_tokens, workload.num_experts)
+        return tuple(
+            base + int(expert_idx < remainder)
+            for expert_idx in range(workload.num_experts)
+        )
+
+    first_weight = workload.capacity_factor
+    last_weight = max(0.25, 2.0 - workload.capacity_factor)
+    step = (last_weight - first_weight) / (workload.num_experts - 1)
+    weights = [first_weight + step * expert_idx for expert_idx in range(workload.num_experts)]
+    return _counts_from_weights(workload.num_tokens, weights)
+
+
+def _primary_routes_cpu(workload: MoECudaPtxWorkload) -> torch.Tensor:
+    if workload.histogram == "balanced":
+        return torch.arange(workload.num_tokens, dtype=torch.long) % workload.num_experts
+
+    counts_cpu = _primary_route_counts_cpu(workload)
+    expert_ids = torch.arange(workload.num_experts, dtype=torch.long)
+    repeats = torch.tensor(counts_cpu, dtype=torch.long)
+    return torch.repeat_interleave(
+        expert_ids,
+        repeats,
+        output_size=workload.num_tokens,
+    )
+
+
+def _route_counts_cpu(workload: MoECudaPtxWorkload) -> tuple[int, ...]:
+    primary_counts = _primary_route_counts_cpu(workload)
+    counts = list(primary_counts)
+    if workload.histogram == "balanced":
+        for token_idx in range(workload.num_tokens):
+            primary_expert = token_idx % workload.num_experts
+            secondary_expert = (token_idx * 3 + 1) % workload.num_experts
+            if secondary_expert == primary_expert:
+                secondary_expert = (secondary_expert + 1) % workload.num_experts
+            counts[secondary_expert] += 1
+    else:
+        token_idx = 0
+        for primary_expert, primary_count in enumerate(primary_counts):
+            for _ in range(primary_count):
+                secondary_expert = (token_idx * 3 + 1) % workload.num_experts
+                if secondary_expert == primary_expert:
+                    secondary_expert = (secondary_expert + 1) % workload.num_experts
+                counts[secondary_expert] += 1
+                token_idx += 1
+    return tuple(counts)
 
 
 def _build_primary_routes(workload: MoECudaPtxWorkload, device: torch.device) -> torch.Tensor:
     if workload.histogram == "balanced":
         return torch.arange(workload.num_tokens, device=device, dtype=torch.long) % workload.num_experts
 
-    weights = torch.linspace(
-        workload.capacity_factor,
-        max(0.25, 2.0 - workload.capacity_factor),
-        steps=workload.num_experts,
-        device=device,
-        dtype=torch.float32,
+    counts_cpu = _primary_route_counts_cpu(workload)
+    expert_ids = torch.arange(workload.num_experts, device=device, dtype=torch.long)
+    repeats = torch.tensor(counts_cpu, device=device, dtype=torch.long)
+    return torch.repeat_interleave(
+        expert_ids,
+        repeats,
+        output_size=workload.num_tokens,
     )
-    counts = _counts_from_weights(workload.num_tokens, weights)
-    routes = [
-        torch.full((int(count.item()),), expert, device=device, dtype=torch.long)
-        for expert, count in enumerate(counts)
-        if int(count.item()) > 0
-    ]
-    primary = torch.cat(routes, dim=0)
-    if primary.numel() != workload.num_tokens:
-        raise RuntimeError("Primary route generation produced the wrong token count")
-    return primary
 
 
-def build_routes(workload: MoECudaPtxWorkload, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def _build_routes_with_counts(
+    workload: MoECudaPtxWorkload,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
     primary = _build_primary_routes(workload, device)
     secondary = (torch.arange(workload.num_tokens, device=device, dtype=torch.long) * 3 + 1) % workload.num_experts
     collision = secondary == primary
@@ -202,12 +262,18 @@ def build_routes(workload: MoECudaPtxWorkload, device: torch.device) -> tuple[to
     )
     expert_weights = torch.softmax(logits, dim=1).to(dtype=workload.dtype)
 
-    counts = torch.bincount(expert_indices.reshape(-1), minlength=workload.num_experts)
-    if int(counts.max().item()) > workload.capacity_tokens_per_expert:
+    route_counts_cpu = _route_counts_cpu(workload)
+    max_count = max(route_counts_cpu, default=0)
+    if max_count > workload.capacity_tokens_per_expert:
         raise RuntimeError(
             "Deterministic routing exceeded the configured capacity factor; "
-            f"max_count={int(counts.max().item())}, capacity={workload.capacity_tokens_per_expert}"
+            f"max_count={max_count}, capacity={workload.capacity_tokens_per_expert}"
         )
+    return expert_indices, expert_weights, route_counts_cpu
+
+
+def build_routes(workload: MoECudaPtxWorkload, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    expert_indices, expert_weights, _ = _build_routes_with_counts(workload, device)
     return expert_indices, expert_weights
 
 
@@ -219,7 +285,7 @@ def build_state(workload: MoECudaPtxWorkload, device: torch.device) -> MoELabSta
     x += torch.linspace(0.0, 1e-3, steps=workload.hidden_dim, dtype=torch.float32).view(1, -1)
     x = x.to(device=device, dtype=workload.dtype).contiguous()
 
-    expert_indices, expert_weights = build_routes(workload, device)
+    expert_indices, expert_weights, route_counts_cpu = _build_routes_with_counts(workload, device)
 
     gate_proj = (
         torch.randn(
@@ -267,6 +333,7 @@ def build_state(workload: MoECudaPtxWorkload, device: torch.device) -> MoELabSta
         up_proj=up_proj.contiguous(),
         down_proj=down_proj.contiguous(),
         loss_grad=loss_grad.contiguous(),
+        route_counts_cpu=route_counts_cpu,
     )
 
 
@@ -276,11 +343,12 @@ def pack_topk_routes(
     expert_weights: torch.Tensor,
     *,
     num_experts: int,
+    counts_cpu: Optional[Sequence[int]] = None,
 ) -> PackedRoutes:
     top_k = expert_indices.shape[1]
     flat_experts = expert_indices.reshape(-1)
     flat_weights = expert_weights.reshape(-1)
-    flat_token_ids = torch.arange(x.shape[0], device=x.device, dtype=torch.long).repeat_interleave(top_k)
+    flat_token_ids = _flat_topk_token_ids(x.shape[0], top_k, x.device)
     sort_order = torch.argsort(flat_experts, stable=True)
 
     sorted_token_ids = flat_token_ids.index_select(0, sort_order)
@@ -288,15 +356,18 @@ def pack_topk_routes(
     sorted_weights = flat_weights.index_select(0, sort_order)
     packed_tokens = x.index_select(0, sorted_token_ids).contiguous()
 
-    counts = torch.bincount(sorted_expert_ids, minlength=num_experts)
-    counts_cpu = tuple(int(count) for count in counts.detach().cpu().tolist())
-    starts = torch.cat(
-        [
-            torch.zeros(1, device=x.device, dtype=torch.long),
-            counts.cumsum(dim=0)[:-1],
-        ],
-        dim=0,
-    )
+    if counts_cpu is None:
+        counts = torch.bincount(sorted_expert_ids, minlength=num_experts)
+        counts_host = counts.detach().cpu()
+        counts_cpu = tuple(int(counts_host[idx]) for idx in range(counts_host.numel()))
+    else:
+        counts_cpu = tuple(int(count) for count in counts_cpu)
+        counts = torch.tensor(counts_cpu, device=x.device, dtype=torch.long)
+    cumsum = counts.cumsum(dim=0)
+    starts = torch.empty_like(counts)
+    starts[0] = 0
+    if starts.numel() > 1:
+        starts[1:].copy_(cumsum[:-1])
     positions = torch.arange(sorted_expert_ids.numel(), device=x.device, dtype=torch.long) - starts.index_select(
         0, sorted_expert_ids
     )
@@ -304,10 +375,15 @@ def pack_topk_routes(
     uniform_count = counts_cpu[0] if counts_cpu and all(count == counts_cpu[0] for count in counts_cpu) else 0
     padded_indices = sorted_expert_ids * max_count + positions
 
+    packed_weights = sorted_weights.contiguous()
+    token_indices = sorted_token_ids.contiguous()
+
     return PackedRoutes(
         packed_tokens=packed_tokens,
-        packed_weights=sorted_weights.contiguous(),
-        token_indices=sorted_token_ids.contiguous(),
+        packed_weights=packed_weights,
+        packed_weight_column=packed_weights.unsqueeze(-1),
+        token_indices=token_indices,
+        combine_index=token_indices.unsqueeze(-1).expand(-1, x.shape[1]),
         expert_indices=sorted_expert_ids.contiguous(),
         counts=counts.contiguous(),
         starts=starts.contiguous(),
@@ -335,11 +411,27 @@ def grouped_ffn_reference(
         if count == 0:
             continue
         tokens_e = packed_tokens[offset : offset + count]
-        gate = F.silu(tokens_e @ gate_proj[expert_idx])
+        gate = tokens_e @ gate_proj[expert_idx]
         up = tokens_e @ up_proj[expert_idx]
-        output[offset : offset + count] = (gate * up) @ down_proj[expert_idx]
+        hidden = _silu_mul_in_place_if_safe(gate, up)
+        output[offset : offset + count] = hidden @ down_proj[expert_idx]
         offset += count
     return output
+
+
+def _silu_mul_in_place_if_safe(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and gate.requires_grad:
+        return F.silu(gate) * up
+    F.silu(gate, inplace=True)
+    gate.mul_(up)
+    return gate
+
+
+def _weight_routes_in_place_if_safe(out: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and (out.requires_grad or weights.requires_grad):
+        return out * weights
+    out.mul_(weights)
+    return out
 
 
 def grouped_ffn_cuda(
@@ -363,22 +455,28 @@ def grouped_ffn_cuda(
         grouped_tokens = packed_tokens.view(num_experts, packed.max_count, hidden_dim)
         gate = torch.bmm(grouped_tokens, gate_proj)
         up = torch.bmm(grouped_tokens, up_proj)
-        hidden = F.silu(gate) * up
+        hidden = _silu_mul_in_place_if_safe(gate, up)
         return torch.bmm(hidden, down_proj).reshape(-1, output_dim)
 
     flat_slots = num_experts * packed.max_count
 
     padded_tokens = padded_tokens_buffer
-    if padded_tokens is None or tuple(padded_tokens.shape) != (flat_slots, hidden_dim):
-        padded_tokens = torch.zeros(flat_slots, hidden_dim, device=device, dtype=packed_tokens.dtype)
-    else:
-        padded_tokens.zero_()
+    padded_numel = flat_slots * hidden_dim
+    if (
+        padded_tokens is None
+        or padded_tokens.device != device
+        or padded_tokens.dtype != packed_tokens.dtype
+        or not padded_tokens.is_contiguous()
+        or padded_tokens.numel() < padded_numel
+    ):
+        padded_tokens = torch.empty(padded_numel, device=device, dtype=packed_tokens.dtype)
+    padded_tokens = padded_tokens.view(-1)[:padded_numel].view(flat_slots, hidden_dim)
     padded_tokens.index_copy_(0, packed.padded_indices, packed_tokens)
     padded_tokens = padded_tokens.view(num_experts, packed.max_count, hidden_dim)
 
     gate = torch.bmm(padded_tokens, gate_proj)
     up = torch.bmm(padded_tokens, up_proj)
-    hidden = F.silu(gate) * up
+    hidden = _silu_mul_in_place_if_safe(gate, up)
     out = torch.bmm(hidden, down_proj)
     flat_out = out.reshape(flat_slots, output_dim)
     return flat_out.index_select(0, packed.padded_indices).contiguous()
@@ -390,13 +488,32 @@ def combine_weighted_outputs(
     num_tokens: int,
     *,
     output_buffer: Optional[torch.Tensor] = None,
+    consume_sorted_outputs: bool = False,
 ) -> torch.Tensor:
     combined = output_buffer
-    if combined is None or tuple(combined.shape) != (num_tokens, sorted_outputs.shape[1]):
-        combined = torch.zeros(num_tokens, sorted_outputs.shape[1], device=sorted_outputs.device, dtype=sorted_outputs.dtype)
+    output_shape = (int(num_tokens), int(sorted_outputs.shape[1]))
+    output_numel = output_shape[0] * output_shape[1]
+    if (
+        combined is None
+        or combined.device != sorted_outputs.device
+        or combined.dtype != sorted_outputs.dtype
+        or not combined.is_contiguous()
+        or combined.numel() < output_numel
+    ):
+        combined = torch.empty(output_numel, device=sorted_outputs.device, dtype=sorted_outputs.dtype)
+    combined = combined.view(-1)[:output_numel].view(output_shape)
+    weighted_outputs = sorted_outputs
+    weights = getattr(packed, "packed_weight_column", None)
+    if weights is None:
+        weights = packed.packed_weights.unsqueeze(-1)
+    if consume_sorted_outputs:
+        weighted_outputs.mul_(weights)
     else:
-        combined.zero_()
-    combined.index_add_(0, packed.token_indices, sorted_outputs * packed.packed_weights.unsqueeze(-1))
+        weighted_outputs = sorted_outputs * weights
+    combine_index = getattr(packed, "combine_index", None)
+    if combine_index is None or tuple(combine_index.shape) != tuple(weighted_outputs.shape):
+        combine_index = packed.token_indices.unsqueeze(-1).expand_as(weighted_outputs)
+    combined.scatter_reduce_(0, combine_index, weighted_outputs, reduce="sum", include_self=False)
     return combined
 
 
@@ -406,18 +523,21 @@ def run_layer_baseline(
     *,
     output_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    output = output_buffer if output_buffer is not None else torch.zeros_like(state.x)
+    output = output_buffer if output_buffer is not None else torch.empty_like(state.x)
     output.zero_()
     for expert_idx in range(workload.num_experts):
         for slot_idx in range(workload.top_k):
-            mask = state.expert_indices[:, slot_idx] == expert_idx
-            if not torch.any(mask):
+            token_ids = (state.expert_indices[:, slot_idx] == expert_idx).nonzero(as_tuple=True)[0]
+            if token_ids.numel() == 0:
                 continue
-            tokens_e = state.x[mask]
-            gate = F.silu(tokens_e @ state.gate_proj[expert_idx])
+            tokens_e = state.x[token_ids]
+            gate = tokens_e @ state.gate_proj[expert_idx]
             up = tokens_e @ state.up_proj[expert_idx]
-            expert_out = (gate * up) @ state.down_proj[expert_idx]
-            output[mask] += expert_out * state.expert_weights[mask, slot_idx].unsqueeze(-1)
+            hidden = _silu_mul_in_place_if_safe(gate, up)
+            expert_out = hidden @ state.down_proj[expert_idx]
+            route_weights = state.expert_weights[token_ids, slot_idx].unsqueeze(-1)
+            expert_out = _weight_routes_in_place_if_safe(expert_out, route_weights)
+            output[token_ids] += expert_out
     return output
 
 
@@ -429,11 +549,13 @@ def run_layer_cuda(
     combined_buffer: Optional[torch.Tensor] = None,
     padded_tokens_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    route_counts_cpu = getattr(state, "route_counts_cpu", None) or None
     packed = packed or pack_topk_routes(
         state.x,
         state.expert_indices,
         state.expert_weights,
         num_experts=workload.num_experts,
+        counts_cpu=route_counts_cpu,
     )
     # Keep the standalone quantization surface on `moe_quant` until the layer path
     # has a real low-precision kernel that benefits from quantized activations.
@@ -446,7 +568,13 @@ def run_layer_cuda(
         state.down_proj,
         padded_tokens_buffer=padded_tokens_buffer,
     )
-    return combine_weighted_outputs(sorted_outputs, packed, workload.num_tokens, output_buffer=combined_buffer)
+    return combine_weighted_outputs(
+        sorted_outputs,
+        packed,
+        workload.num_tokens,
+        output_buffer=combined_buffer,
+        consume_sorted_outputs=True,
+    )
 
 
 def _compute_scale_blocks(matrix: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -460,7 +588,7 @@ def _pow2_scales(blocks: torch.Tensor) -> torch.Tensor:
     amax = blocks.abs().amax(dim=-1)
     unclamped = (amax / _MXFP8_E4M3_MAX).clamp_min(_MXFP8_E8M0_MIN)
     scales = torch.pow(2.0, torch.ceil(torch.log2(unclamped)))
-    scales = torch.where(amax > 0, scales, torch.full_like(scales, _MXFP8_E8M0_MIN))
+    scales.masked_fill_(amax <= 0, _MXFP8_E8M0_MIN)
     return scales
 
 
@@ -475,17 +603,23 @@ def _quantize_matrix(matrix: torch.Tensor) -> QuantizedMatrix:
     return QuantizedMatrix(quantized=quantized, scales=scales, original_shape=tuple(matrix.shape))
 
 
+def _expand_mxfp8_scales(scales: torch.Tensor) -> torch.Tensor:
+    scales_fp32 = scales.to(torch.float32)
+    return scales_fp32.unsqueeze(-1).expand(*scales_fp32.shape, _MXFP8_BLOCK_SIZE).reshape(
+        scales_fp32.shape[0],
+        scales_fp32.shape[1] * _MXFP8_BLOCK_SIZE,
+    )
+
+
 def quantize_mxfp8_reference(matrix: torch.Tensor, *, include_transpose: bool) -> QuantizedBundle:
     forward = _quantize_matrix(matrix)
     # Reference path pays the reshape tax explicitly to reflect the cost of
     # materializing a tcgen05-style scale layout from a generic quantizer.
-    _ = forward.scales.to(torch.float32).repeat_interleave(_MXFP8_BLOCK_SIZE, dim=1).reshape(forward.quantized.shape)
+    _ = _expand_mxfp8_scales(forward.scales)
     transpose = None
     if include_transpose:
         transpose = _quantize_matrix(matrix.t().contiguous())
-        _ = transpose.scales.to(torch.float32).repeat_interleave(_MXFP8_BLOCK_SIZE, dim=1).reshape(
-            transpose.quantized.shape
-        )
+        _ = _expand_mxfp8_scales(transpose.scales)
     return QuantizedBundle(forward=forward, transpose=transpose)
 
 
@@ -496,25 +630,48 @@ def quantize_mxfp8_optimized(matrix: torch.Tensor, *, include_transpose: bool) -
 
 
 def dequantize_mxfp8(qmat: QuantizedMatrix, *, dtype: torch.dtype) -> torch.Tensor:
-    scales = qmat.scales.to(torch.float32).repeat_interleave(_MXFP8_BLOCK_SIZE, dim=1)
+    scales = _expand_mxfp8_scales(qmat.scales)
     values = qmat.quantized.to(torch.float32) * scales[:, : qmat.quantized.shape[1]]
     rows, cols = qmat.original_shape
     return values[:rows, :cols].to(dtype=dtype)
 
 
-def build_quant_verification_tensor(bundle: QuantizedBundle) -> torch.Tensor:
-    pieces = [
-        bundle.forward.quantized[:4, :32].to(torch.float32).reshape(-1),
-        bundle.forward.scales[:4, :8].to(torch.float32).reshape(-1),
+def _quant_verification_pieces(bundle: QuantizedBundle) -> tuple[torch.Tensor, ...]:
+    pieces: list[torch.Tensor] = [
+        bundle.forward.quantized[:4, :32],
+        bundle.forward.scales[:4, :8],
     ]
     if bundle.transpose is not None:
-        pieces.append(bundle.transpose.quantized[:4, :32].to(torch.float32).reshape(-1))
-        pieces.append(bundle.transpose.scales[:4, :8].to(torch.float32).reshape(-1))
-    return torch.cat(pieces, dim=0)
+        pieces.append(bundle.transpose.quantized[:4, :32])
+        pieces.append(bundle.transpose.scales[:4, :8])
+    return tuple(pieces)
 
 
-def build_tensor_slice_verification(output: torch.Tensor) -> torch.Tensor:
-    return output[: min(32, output.shape[0]), : min(32, output.shape[1])].reshape(-1).float().clone()
+def quant_verification_numel(bundle: QuantizedBundle) -> int:
+    return sum(piece.numel() for piece in _quant_verification_pieces(bundle))
+
+
+def build_quant_verification_tensor(bundle: QuantizedBundle, out: torch.Tensor) -> torch.Tensor:
+    verification = out[: quant_verification_numel(bundle)]
+    offset = 0
+    for piece in _quant_verification_pieces(bundle):
+        flat = piece.reshape(-1)
+        next_offset = offset + flat.numel()
+        verification[offset:next_offset].copy_(flat)
+        offset = next_offset
+    return verification
+
+
+def build_tensor_slice_verification(
+    output: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    rows = min(32, output.shape[0])
+    cols = min(32, output.shape[1])
+    output_slice = output[:rows, :cols]
+    verification = out[: rows * cols]
+    verification.view(rows, cols).copy_(output_slice)
+    return verification
 
 
 def build_backward_verification(
@@ -522,14 +679,35 @@ def build_backward_verification(
     x_grad: torch.Tensor,
     gate_grad: torch.Tensor,
     down_grad: torch.Tensor,
+    out: torch.Tensor,
 ) -> torch.Tensor:
-    pieces = [
-        output[: min(8, output.shape[0]), : min(16, output.shape[1])].reshape(-1).float(),
-        x_grad[: min(8, x_grad.shape[0]), : min(16, x_grad.shape[1])].reshape(-1).float(),
-        gate_grad[0, : min(8, gate_grad.shape[1]), : min(8, gate_grad.shape[2])].reshape(-1).float(),
-        down_grad[0, : min(8, down_grad.shape[1]), : min(8, down_grad.shape[2])].reshape(-1).float(),
-    ]
-    return torch.cat(pieces, dim=0)
+    verification = out[: backward_verification_numel(output, x_grad, gate_grad, down_grad)]
+    offset = 0
+    for piece in (
+        output[: min(8, output.shape[0]), : min(16, output.shape[1])],
+        x_grad[: min(8, x_grad.shape[0]), : min(16, x_grad.shape[1])],
+        gate_grad[0, : min(8, gate_grad.shape[1]), : min(8, gate_grad.shape[2])],
+        down_grad[0, : min(8, down_grad.shape[1]), : min(8, down_grad.shape[2])],
+    ):
+        flat = piece.reshape(-1)
+        next_offset = offset + flat.numel()
+        verification[offset:next_offset].copy_(flat)
+        offset = next_offset
+    return verification
+
+
+def backward_verification_numel(
+    output: torch.Tensor,
+    x_grad: torch.Tensor,
+    gate_grad: torch.Tensor,
+    down_grad: torch.Tensor,
+) -> int:
+    return (
+        min(8, output.shape[0]) * min(16, output.shape[1])
+        + min(8, x_grad.shape[0]) * min(16, x_grad.shape[1])
+        + min(8, gate_grad.shape[1]) * min(8, gate_grad.shape[2])
+        + min(8, down_grad.shape[1]) * min(8, down_grad.shape[2])
+    )
 
 
 def grouped_work_unit_count(
@@ -572,9 +750,21 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.x_grad: Optional[torch.Tensor] = None
         self.gate_grad: Optional[torch.Tensor] = None
         self.down_grad: Optional[torch.Tensor] = None
+        self._bwd_x: Optional[torch.Tensor] = None
+        self._bwd_tokens: Optional[torch.Tensor] = None
+        self._bwd_gate_proj: Optional[torch.Tensor] = None
+        self._bwd_up_proj: Optional[torch.Tensor] = None
+        self._bwd_down_proj: Optional[torch.Tensor] = None
+        self._packed_loss_grad: Optional[torch.Tensor] = None
         self._combined_buffer: Optional[torch.Tensor] = None
         self._grouped_output_buffer: Optional[torch.Tensor] = None
         self._padded_tokens_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._quant_verify_output_buffer: Optional[torch.Tensor] = None
+        self._backward_verify_output_buffer: Optional[torch.Tensor] = None
+        self._quant_shape_tensor: Optional[torch.Tensor] = None
+        self._verification_shape_tensor: Optional[torch.Tensor] = None
+        self._routing_verification_tensor: Optional[torch.Tensor] = None
         self._benchmark_impl: Optional[Callable[[], None]] = None
         self._custom_metrics: dict[str, float] = {}
         self._refresh_workload_metadata()
@@ -650,16 +840,20 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.workload.validate()
         self._force_target_mode()
         self.state = build_state(self.workload, self.device)
-        route_counts = torch.bincount(self.state.expert_indices.reshape(-1), minlength=self.workload.num_experts)
-        route_counts_cpu = tuple(int(count) for count in route_counts.detach().cpu().tolist())
+        route_counts_cpu = self.state.route_counts_cpu
         self._populate_metrics(route_counts_cpu)
 
-        if self.target != "moe_layer":
+        self.packed = None
+        prepack_routes = self.target != "moe_layer" or (
+            self.backend == "cuda" and self.workload.mode == "forward"
+        )
+        if prepack_routes:
             self.packed = pack_topk_routes(
                 self.state.x,
                 self.state.expert_indices,
                 self.state.expert_weights,
                 num_experts=self.workload.num_experts,
+                counts_cpu=route_counts_cpu,
             )
 
         self.outputs = None
@@ -667,9 +861,61 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.x_grad = None
         self.gate_grad = None
         self.down_grad = None
+        self._bwd_x = None
+        self._bwd_tokens = None
+        self._bwd_gate_proj = None
+        self._bwd_up_proj = None
+        self._bwd_down_proj = None
+        self._packed_loss_grad = None
         self._combined_buffer = torch.empty_like(self.state.x)
         self._grouped_output_buffer = None
         self._padded_tokens_buffer = None
+        verify_rows = min(32, max(self.workload.num_tokens, self.workload.routed_tokens))
+        verify_cols = min(32, self.workload.hidden_dim)
+        self._verify_output_buffer = torch.empty(
+            verify_rows * verify_cols,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._quant_verify_output_buffer = torch.empty(
+            _QUANT_VERIFY_MAX_NUMEL,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._backward_verify_output_buffer = torch.empty(
+            backward_verification_numel(
+                self.state.x,
+                self.state.x,
+                self.state.gate_proj,
+                self.state.down_proj,
+            ),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._quant_shape_tensor = torch.tensor(
+            [
+                self.workload.num_tokens,
+                self.workload.hidden_dim,
+                self.workload.top_k,
+                self.workload.num_experts,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._verification_shape_tensor = torch.tensor(
+            [
+                self.workload.num_tokens,
+                self.workload.hidden_dim,
+                self.workload.expert_ffn_dim,
+                self.workload.num_experts,
+                self.workload.top_k,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._routing_verification_tensor = self.state.expert_indices[
+            : min(32, self.state.expert_indices.shape[0])
+        ].detach().cpu()
 
         if self.packed is not None:
             self._grouped_output_buffer = torch.empty(
@@ -686,6 +932,11 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
                     device=self.device,
                     dtype=self.workload.dtype,
                 )
+
+        if self.target == "moe_grouped_gemm_bwd" or (
+            self.target == "moe_layer" and self.workload.mode == "fwd_bwd"
+        ):
+            self._prepare_backward_tensors()
 
         if self.backend == "ptx":
             ensure_moe_ptx_supported()
@@ -721,34 +972,116 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
             else:
                 raise RuntimeError("SKIPPED: PTX grouped GEMM backend scaffold exists, but kernels are not implemented yet.")
         elif self.target == "moe_grouped_gemm_bwd" and self.packed is not None and self.state is not None:
-            tokens = self.packed.packed_tokens.detach().clone().requires_grad_(True)
-            gate_proj = self.state.gate_proj.detach().clone().requires_grad_(True)
-            up_proj = self.state.up_proj.detach().clone().requires_grad_(True)
-            down_proj = self.state.down_proj.detach().clone().requires_grad_(True)
-            if self.backend == "baseline":
-                out = grouped_ffn_reference(tokens, self.packed.counts_cpu, gate_proj, up_proj, down_proj)
-            elif self.backend == "cuda":
-                out = grouped_ffn_cuda(
-                    tokens,
-                    self.packed,
-                    gate_proj,
-                    up_proj,
-                    down_proj,
-                    padded_tokens_buffer=self._padded_tokens_buffer,
-                )
-            else:
-                raise RuntimeError("SKIPPED: PTX grouped GEMM backend scaffold exists, but kernels are not implemented yet.")
-            grad_target = self.state.loss_grad.index_select(0, self.packed.token_indices)
-            (out * grad_target).sum().backward()
+            _ = self._run_grouped_gemm_backward()
         elif self.target == "moe_layer" and self.state is not None:
             if self.backend == "baseline":
-                _ = run_layer_baseline(self.state, self.workload, output_buffer=self._combined_buffer)
+                if self.workload.mode == "fwd_bwd":
+                    _ = self._run_layer_backward()
+                else:
+                    _ = run_layer_baseline(self.state, self.workload, output_buffer=self._combined_buffer)
             elif self.backend == "cuda":
-                _ = run_layer_cuda(self.state, self.workload, combined_buffer=self._combined_buffer)
+                if self.workload.mode == "fwd_bwd":
+                    _ = self._run_layer_backward()
+                else:
+                    _ = run_layer_cuda(
+                        self.state,
+                        self.workload,
+                        packed=self.packed,
+                        combined_buffer=self._combined_buffer,
+                        padded_tokens_buffer=self._padded_tokens_buffer,
+                    )
             else:
                 raise RuntimeError("SKIPPED: PTX layer backend scaffold exists, but kernels are not implemented yet.")
         self._synchronize()
         self._benchmark_impl = self._select_benchmark_impl()
+
+    def _prepare_backward_tensors(self) -> None:
+        if self.state is None:
+            raise RuntimeError("setup() must build state before preparing backward tensors")
+        self._bwd_gate_proj = self.state.gate_proj.detach().clone().requires_grad_(True)
+        self._bwd_up_proj = self.state.up_proj.detach().clone().requires_grad_(True)
+        self._bwd_down_proj = self.state.down_proj.detach().clone().requires_grad_(True)
+        if self.target == "moe_grouped_gemm_bwd":
+            if self.packed is None:
+                raise RuntimeError("Packed routes must be initialized before preparing grouped backward tensors")
+            self._bwd_tokens = self.packed.packed_tokens.detach().clone().requires_grad_(True)
+            self._packed_loss_grad = self.state.loss_grad.index_select(0, self.packed.token_indices).contiguous()
+        elif self.target == "moe_layer":
+            self._bwd_x = self.state.x.detach().clone().requires_grad_(True)
+
+    def _clear_backward_grads(self) -> None:
+        for tensor in (
+            self._bwd_x,
+            self._bwd_tokens,
+            self._bwd_gate_proj,
+            self._bwd_up_proj,
+            self._bwd_down_proj,
+        ):
+            if tensor is not None:
+                tensor.grad = None
+
+    def _run_grouped_gemm_backward(self) -> torch.Tensor:
+        if (
+            self.packed is None
+            or self.state is None
+            or self._bwd_tokens is None
+            or self._bwd_gate_proj is None
+            or self._bwd_up_proj is None
+            or self._bwd_down_proj is None
+            or self._packed_loss_grad is None
+        ):
+            raise RuntimeError("Grouped GEMM backward tensors are not initialized")
+        self._clear_backward_grads()
+        if self.backend == "baseline":
+            sorted_out = grouped_ffn_reference(
+                self._bwd_tokens,
+                self.packed.counts_cpu,
+                self._bwd_gate_proj,
+                self._bwd_up_proj,
+                self._bwd_down_proj,
+            )
+        elif self.backend == "cuda":
+            sorted_out = grouped_ffn_cuda(
+                self._bwd_tokens,
+                self.packed,
+                self._bwd_gate_proj,
+                self._bwd_up_proj,
+                self._bwd_down_proj,
+                padded_tokens_buffer=self._padded_tokens_buffer,
+            )
+        else:
+            raise RuntimeError("SKIPPED: PTX grouped GEMM backend scaffold exists, but kernels are not implemented yet.")
+        (sorted_out * self._packed_loss_grad).sum().backward()
+        return sorted_out
+
+    def _run_layer_backward(self) -> torch.Tensor:
+        if (
+            self.state is None
+            or self._bwd_x is None
+            or self._bwd_gate_proj is None
+            or self._bwd_up_proj is None
+            or self._bwd_down_proj is None
+        ):
+            raise RuntimeError("Layer backward tensors are not initialized")
+        self._clear_backward_grads()
+        state = MoELabState(
+            x=self._bwd_x,
+            expert_indices=self.state.expert_indices,
+            expert_weights=self.state.expert_weights,
+            gate_proj=self._bwd_gate_proj,
+            up_proj=self._bwd_up_proj,
+            down_proj=self._bwd_down_proj,
+            loss_grad=self.state.loss_grad,
+            route_counts_cpu=self.state.route_counts_cpu,
+        )
+        if self.backend == "baseline":
+            output = run_layer_baseline(state, self.workload)
+        elif self.backend == "cuda":
+            output = run_layer_cuda(state, self.workload)
+        else:
+            raise RuntimeError("SKIPPED: PTX layer backend scaffold exists, but kernels are not implemented yet.")
+        (output * self.state.loss_grad).sum().backward()
+        return output
 
     def _select_benchmark_impl(self) -> Callable[[], None]:
         if self.target == "moe_quant":
@@ -811,29 +1144,20 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def _benchmark_grouped_gemm_bwd(self) -> None:
         if self.packed is None or self.state is None:
             raise RuntimeError("Grouped backward benchmark state is not initialized")
-        tokens = self.packed.packed_tokens.detach().clone().requires_grad_(True)
-        gate_proj = self.state.gate_proj.detach().clone().requires_grad_(True)
-        up_proj = self.state.up_proj.detach().clone().requires_grad_(True)
-        down_proj = self.state.down_proj.detach().clone().requires_grad_(True)
-        if self.backend == "baseline":
-            sorted_out = grouped_ffn_reference(tokens, self.packed.counts_cpu, gate_proj, up_proj, down_proj)
-        elif self.backend == "cuda":
-            sorted_out = grouped_ffn_cuda(
-                tokens,
-                self.packed,
-                gate_proj,
-                up_proj,
-                down_proj,
-                padded_tokens_buffer=self._padded_tokens_buffer,
-            )
-        else:
-            raise RuntimeError("SKIPPED: PTX grouped GEMM backend scaffold exists, but kernels are not implemented yet.")
-        grad_target = self.state.loss_grad.index_select(0, self.packed.token_indices)
-        (sorted_out * grad_target).sum().backward()
+        sorted_out = self._run_grouped_gemm_backward()
         self.outputs = sorted_out.detach()
-        self.x_grad = tokens.grad.detach()
-        self.gate_grad = gate_proj.grad.detach()
-        self.down_grad = down_proj.grad.detach()
+        if (
+            self._bwd_tokens is None
+            or self._bwd_tokens.grad is None
+            or self._bwd_gate_proj is None
+            or self._bwd_gate_proj.grad is None
+            or self._bwd_down_proj is None
+            or self._bwd_down_proj.grad is None
+        ):
+            raise RuntimeError("Grouped GEMM backward did not produce expected gradients")
+        self.x_grad = self._bwd_tokens.grad.detach()
+        self.gate_grad = self._bwd_gate_proj.grad.detach()
+        self.down_grad = self._bwd_down_proj.grad.detach()
 
     def _benchmark_layer_forward(self) -> None:
         if self.state is None:
@@ -844,7 +1168,9 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
             self.outputs = run_layer_cuda(
                 self.state,
                 self.workload,
+                packed=self.packed,
                 combined_buffer=self._combined_buffer,
+                padded_tokens_buffer=self._padded_tokens_buffer,
             )
         else:
             raise RuntimeError("SKIPPED: PTX layer backend scaffold exists, but kernels are not implemented yet.")
@@ -852,30 +1178,20 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def _benchmark_layer_fwd_bwd(self) -> None:
         if self.state is None:
             raise RuntimeError("Layer benchmark state is not initialized")
-        x = self.state.x.detach().clone().requires_grad_(True)
-        gate_proj = self.state.gate_proj.detach().clone().requires_grad_(True)
-        up_proj = self.state.up_proj.detach().clone().requires_grad_(True)
-        down_proj = self.state.down_proj.detach().clone().requires_grad_(True)
-        state = MoELabState(
-            x=x,
-            expert_indices=self.state.expert_indices,
-            expert_weights=self.state.expert_weights,
-            gate_proj=gate_proj,
-            up_proj=up_proj,
-            down_proj=down_proj,
-            loss_grad=self.state.loss_grad,
-        )
-        if self.backend == "baseline":
-            output = run_layer_baseline(state, self.workload)
-        elif self.backend == "cuda":
-            output = run_layer_cuda(state, self.workload)
-        else:
-            raise RuntimeError("SKIPPED: PTX layer backend scaffold exists, but kernels are not implemented yet.")
-        (output * self.state.loss_grad).sum().backward()
+        output = self._run_layer_backward()
         self.outputs = output.detach()
-        self.x_grad = x.grad.detach()
-        self.gate_grad = gate_proj.grad.detach()
-        self.down_grad = down_proj.grad.detach()
+        if (
+            self._bwd_x is None
+            or self._bwd_x.grad is None
+            or self._bwd_gate_proj is None
+            or self._bwd_gate_proj.grad is None
+            or self._bwd_down_proj is None
+            or self._bwd_down_proj.grad is None
+        ):
+            raise RuntimeError("Layer backward did not produce expected gradients")
+        self.x_grad = self._bwd_x.grad.detach()
+        self.gate_grad = self._bwd_gate_proj.grad.detach()
+        self.down_grad = self._bwd_down_proj.grad.detach()
 
     def benchmark_fn(self) -> None:
         if self._benchmark_impl is None:
@@ -893,20 +1209,16 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if self.target == "moe_quant":
             if self.quantized is None:
                 raise RuntimeError("benchmark_fn() did not produce quantized outputs")
+            if self._quant_shape_tensor is None:
+                raise RuntimeError("setup() must initialize quant verification shape tensor")
+            if self._quant_verify_output_buffer is None:
+                raise RuntimeError("setup() must initialize quant verification output buffer")
             self._set_verification_payload(
-                inputs={
-                    "shape": torch.tensor(
-                        [
-                            self.workload.num_tokens,
-                            self.workload.hidden_dim,
-                            self.workload.top_k,
-                            self.workload.num_experts,
-                        ],
-                        dtype=torch.int64,
-                        device="cpu",
-                    )
-                },
-                output=build_quant_verification_tensor(self.quantized),
+                inputs={"shape": self._quant_shape_tensor},
+                output=build_quant_verification_tensor(
+                    self.quantized,
+                    self._quant_verify_output_buffer,
+                ),
                 batch_size=self.workload.num_tokens,
                 parameter_count=0,
                 precision_flags={"bf16": self.workload.dtype == torch.bfloat16, "fp16": self.workload.dtype == torch.float16},
@@ -917,33 +1229,28 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
         if self.outputs is None:
             raise RuntimeError("benchmark_fn() did not produce outputs")
+        if self._verification_shape_tensor is None or self._routing_verification_tensor is None:
+            raise RuntimeError("setup() must initialize verification input tensors")
 
         inputs = {
-            "shape": torch.tensor(
-                [
-                    self.workload.num_tokens,
-                    self.workload.hidden_dim,
-                    self.workload.expert_ffn_dim,
-                    self.workload.num_experts,
-                    self.workload.top_k,
-                ],
-                dtype=torch.int64,
-                device="cpu",
-            ),
-            "routing": self.state.expert_indices[: min(32, self.state.expert_indices.shape[0])].detach().cpu(),
+            "shape": self._verification_shape_tensor,
+            "routing": self._routing_verification_tensor,
         }
 
         if self.target == "moe_grouped_gemm_bwd" or mode == "fwd_bwd":
             if self.x_grad is None or self.gate_grad is None or self.down_grad is None:
                 raise RuntimeError("Backward mode did not capture gradients")
+            if self._backward_verify_output_buffer is None:
+                raise RuntimeError("setup() must initialize backward verification buffer")
             verification = build_backward_verification(
                 self.outputs,
                 self.x_grad,
                 self.gate_grad,
                 self.down_grad,
+                self._backward_verify_output_buffer,
             )
         else:
-            verification = build_tensor_slice_verification(self.outputs)
+            verification = build_tensor_slice_verification(self.outputs, self._verify_output_buffer)
 
         tolerance = (2e-2, 2e-2)
         if self.target == "moe_layer" and mode == "forward":
@@ -975,9 +1282,21 @@ class MoECudaPtxBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.x_grad = None
         self.gate_grad = None
         self.down_grad = None
+        self._bwd_x = None
+        self._bwd_tokens = None
+        self._bwd_gate_proj = None
+        self._bwd_up_proj = None
+        self._bwd_down_proj = None
+        self._packed_loss_grad = None
         self._combined_buffer = None
         self._grouped_output_buffer = None
         self._padded_tokens_buffer = None
+        self._verify_output_buffer = None
+        self._quant_verify_output_buffer = None
+        self._backward_verify_output_buffer = None
+        self._quant_shape_tensor = None
+        self._verification_shape_tensor = None
+        self._routing_verification_tensor = None
         self._benchmark_impl = None
         torch.cuda.empty_cache()
 

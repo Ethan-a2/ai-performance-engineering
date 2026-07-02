@@ -31,6 +31,11 @@ class OptimizedFlashAttentionGluonBenchmark(VerificationPayloadMixin, BaseBenchm
         self.inputs: Optional[FlashAttentionInputs] = None
         self.kernel: Optional[FlashAttentionKernel] = None
         self.output: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._payload_q: Optional[torch.Tensor] = None
+        self._payload_k: Optional[torch.Tensor] = None
+        self._payload_v: Optional[torch.Tensor] = None
         tokens = self.batch * self.seq_len
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch),
@@ -50,10 +55,12 @@ class OptimizedFlashAttentionGluonBenchmark(VerificationPayloadMixin, BaseBenchm
             dtype=self.dtype,
             device=self.device,
         )
+        self._output_buffer = torch.empty_like(self.inputs.q)
+        self._verify_output_buffer = torch.empty_like(self.inputs.q, dtype=torch.float32)
         self._synchronize()
 
     def benchmark_fn(self) -> None:
-        if self.inputs is None or self.kernel is None:
+        if self.inputs is None or self.kernel is None or self._output_buffer is None:
             raise RuntimeError("FlashAttention inputs/kernel not initialized")
 
         with torch.inference_mode():
@@ -62,8 +69,8 @@ class OptimizedFlashAttentionGluonBenchmark(VerificationPayloadMixin, BaseBenchm
                     q = self.inputs.q
                     k = self.inputs.k
                     v = self.inputs.v
-                    result = self.kernel.fn(q, k, v)
-                    self.output = result.detach().float().clone()
+                    result = self.kernel.fn(q, k, v, out=self._output_buffer)
+                    self.output = result
         if self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
         self._payload_k = k
@@ -74,9 +81,12 @@ class OptimizedFlashAttentionGluonBenchmark(VerificationPayloadMixin, BaseBenchm
         k = self._payload_k
         q = self._payload_q
         v = self._payload_v
+        if q is None or k is None or v is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"q": q.detach(), "k": k.detach(), "v": v.detach()},
-            output=self.output,
+            output=self._verify_output_buffer,
             batch_size=self.batch,
             parameter_count=0,
             precision_flags={"fp16": True, "bf16": False, "tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -87,6 +97,11 @@ class OptimizedFlashAttentionGluonBenchmark(VerificationPayloadMixin, BaseBenchm
         self.inputs = None
         self.kernel = None
         self.output = None
+        self._output_buffer = None
+        self._verify_output_buffer = None
+        self._payload_q = None
+        self._payload_k = None
+        self._payload_v = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

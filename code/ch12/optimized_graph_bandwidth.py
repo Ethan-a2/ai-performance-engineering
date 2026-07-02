@@ -34,6 +34,7 @@ class OptimizedGraphBandwidthBenchmark(VerificationPayloadMixin, BaseBenchmark):
             tokens_per_iteration=float(self.N * self.iterations),
         )
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
     
     def setup(self) -> None:
         """Setup: Initialize tensors and load CUDA extension."""
@@ -59,28 +60,23 @@ class OptimizedGraphBandwidthBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._extension.graph_kernel(self.dst, self.src, self.iterations)
         torch.cuda.synchronize()
         self._verify_input = self.src.detach().clone()
+        self._verify_output_buffer = torch.empty_like(self.dst)
     
     def benchmark_fn(self) -> None:
         """Benchmark: CUDA graph kernel."""
-        # Use conditional NVTX ranges - only enabled when profiling
-
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-
-        with nvtx_range("optimized_graph_bandwidth_graph", enable=enable_nvtx):
+        with torch.inference_mode(), self._nvtx_range("optimized_graph_bandwidth_graph"):
             # Call CUDA extension with graph kernel
             self._extension.graph_kernel(self.dst, self.src, self.iterations)
         if self._verify_input is None or self.dst is None:
             raise RuntimeError("Verification input/output not initialized")
 
     def capture_verification_payload(self) -> None:
+        if self.dst is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output for verification")
+        self._verify_output_buffer.copy_(self.dst)
         self._set_verification_payload(
             inputs={"src": self._verify_input},
-            output=self.dst.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=0,
             precision_flags={
@@ -97,6 +93,8 @@ class OptimizedGraphBandwidthBenchmark(VerificationPayloadMixin, BaseBenchmark):
         """Teardown: Clean up resources."""
         self.src = None
         self.dst = None
+        self._verify_input = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:
@@ -143,4 +141,3 @@ class OptimizedGraphBandwidthBenchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> BaseBenchmark:
     """Factory function for benchmark discovery."""
     return OptimizedGraphBandwidthBenchmark()
-

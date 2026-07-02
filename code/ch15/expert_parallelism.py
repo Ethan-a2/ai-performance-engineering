@@ -20,10 +20,11 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+from core.benchmark.utils import scalar_tensor_to_float
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
@@ -83,18 +84,62 @@ class Top2MoE(nn.Module):
             ]
         )
         self._local_streams: Optional[list[torch.cuda.Stream]] = None
+        self._local_out_buffers: list[torch.Tensor] = []
+        self._local_accum_buffer: Optional[torch.Tensor] = None
+        self._distributed_workspaces: dict[str, torch.Tensor] = {}
 
     def init_local_streams(self, device: torch.device) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA required for local overlap streams")
         self._local_streams = [torch.cuda.Stream(device=device) for _ in range(2)]
 
+    def _local_buffers(self, flat_tokens: torch.Tensor, slots: int) -> tuple[list[torch.Tensor], torch.Tensor]:
+        needs_partials = (
+            len(self._local_out_buffers) != slots
+            or any(
+                buf.shape != flat_tokens.shape
+                or buf.device != flat_tokens.device
+                or buf.dtype != flat_tokens.dtype
+                for buf in self._local_out_buffers
+            )
+        )
+        if needs_partials:
+            self._local_out_buffers = [torch.empty_like(flat_tokens) for _ in range(slots)]
+        if (
+            self._local_accum_buffer is None
+            or self._local_accum_buffer.shape != flat_tokens.shape
+            or self._local_accum_buffer.device != flat_tokens.device
+            or self._local_accum_buffer.dtype != flat_tokens.dtype
+        ):
+            self._local_accum_buffer = torch.empty_like(flat_tokens)
+        return self._local_out_buffers, self._local_accum_buffer
+
+    def _distributed_workspace(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        workspace = self._distributed_workspaces.get(name)
+        if (
+            workspace is None
+            or workspace.shape != shape
+            or workspace.device != device
+            or workspace.dtype != dtype
+        ):
+            workspace = torch.empty(shape, device=device, dtype=dtype)
+            self._distributed_workspaces[name] = workspace
+        return workspace
+
     def forward_local(self, tokens: torch.Tensor) -> torch.Tensor:
         if self._local_streams is None:
             raise RuntimeError("init_local_streams() must be called before forward_local()")
         batch, seq, hidden = tokens.shape
-        probs = F.softmax(self.gate(tokens), dim=-1)
-        top2_w, top2_idx = torch.topk(probs, k=2, dim=-1)
+        logits = self.gate(tokens)
+        top2_logits, top2_idx = torch.topk(logits, k=2, dim=-1)
+        top2_w = torch.exp(top2_logits - torch.logsumexp(logits, dim=-1, keepdim=True))
         flat_idx = top2_idx.view(batch * seq, 2)
         flat_w = top2_w.view(batch * seq, 2)
         flat_tokens = tokens.view(batch * seq, hidden)
@@ -102,37 +147,45 @@ class Top2MoE(nn.Module):
         cap = int(self.capacity_factor * (batch * seq) / self.num_experts)
         counts = torch.bincount(flat_idx.view(-1), minlength=self.num_experts)
         mask_overflow = counts > cap
+        overflow_flags_host = mask_overflow.detach().cpu()
 
-        partials: list[torch.Tensor] = []
-        for slot, stream in enumerate(self._local_streams):
-            expert_ids = flat_idx[:, slot]
-            local_out = torch.zeros_like(flat_tokens)
-            with torch.cuda.stream(stream):
-                for eid in torch.unique(expert_ids):
-                    eid_int = int(eid.item())
-                    if mask_overflow[eid_int]:
-                        continue
-                    mask = expert_ids == eid
-                    if mask.any():
-                        contrib = self.experts[eid_int](flat_tokens[mask]) * flat_w[mask, slot:slot + 1]
-                        local_out[mask] += contrib
-            partials.append(local_out)
-
+        local_buffers, local_accum = self._local_buffers(flat_tokens, len(self._local_streams))
         current = torch.cuda.current_stream(tokens.device)
         for stream in self._local_streams:
+            stream.wait_stream(current)
+        for slot, stream in enumerate(self._local_streams):
+            expert_ids = flat_idx[:, slot]
+            local_out = local_buffers[slot]
+            unique_expert_ids_host = torch.unique(expert_ids).detach().cpu()
+            with torch.cuda.stream(stream):
+                local_out.zero_()
+                for unique_idx in range(unique_expert_ids_host.numel()):
+                    eid_int = int(unique_expert_ids_host[unique_idx])
+                    if bool(overflow_flags_host[eid_int]):
+                        continue
+                    mask = expert_ids == eid_int
+                    contrib = self.experts[eid_int](flat_tokens[mask]) * flat_w[mask, slot:slot + 1]
+                    local_out[mask] += contrib
+
+        for stream in self._local_streams:
             current.wait_stream(stream)
-        return sum(partials).view(batch, seq, hidden)
+        local_accum.copy_(local_buffers[0])
+        for local_out in local_buffers[1:]:
+            local_accum.add_(local_out)
+        return local_accum.view(batch, seq, hidden)
 
     def forward_distributed(self, tokens: torch.Tensor, *, ctx: DistributedContext) -> torch.Tensor:
         batch, seq, hidden = tokens.shape
-        probs = F.softmax(self.gate(tokens), dim=-1)
-        top2_w, top2_idx = torch.topk(probs, k=2, dim=-1)
+        logits = self.gate(tokens)
+        top2_logits, top2_idx = torch.topk(logits, k=2, dim=-1)
+        top2_w = torch.exp(top2_logits - torch.logsumexp(logits, dim=-1, keepdim=True))
         flat_idx = top2_idx.view(batch * seq, 2)
         flat_tokens = tokens.view(batch * seq, hidden)
 
         cap = int(self.capacity_factor * (batch * seq) / self.num_experts)
         counts = torch.bincount(flat_idx.view(-1), minlength=self.num_experts)
         mask_overflow = counts > cap
+        overflow_flags_host = mask_overflow.detach().cpu()
 
         world_size = ctx.world_size
         rank = ctx.rank
@@ -141,53 +194,98 @@ class Top2MoE(nn.Module):
         top1 = flat_idx[:, 0]
         dest_ranks = top1 // experts_per_rank
 
-        send_tokens: list[torch.Tensor] = []
-        send_indices: list[torch.Tensor] = []
-        send_expert_ids: list[torch.Tensor] = []
+        total_send = flat_tokens.shape[0]
+        send_buf = self._distributed_workspace(
+            "send_buf",
+            (total_send, hidden),
+            device=tokens.device,
+            dtype=flat_tokens.dtype,
+        )
+        send_ids = self._distributed_workspace(
+            "send_ids",
+            (total_send,),
+            device=tokens.device,
+            dtype=torch.int64,
+        )
+        send_pos = self._distributed_workspace(
+            "send_pos",
+            (total_send,),
+            device=tokens.device,
+            dtype=torch.int64,
+        )
+        send_splits: list[int] = []
+        send_offset = 0
         for r in range(world_size):
             mask = dest_ranks == r
-            send_tokens.append(flat_tokens[mask])
-            send_indices.append(torch.nonzero(mask, as_tuple=False).view(-1))
-            send_expert_ids.append(top1[mask])
-
-        send_splits = [int(t.size(0)) for t in send_tokens]
+            send_indices = torch.nonzero(mask, as_tuple=False).view(-1)
+            count = int(send_indices.numel())
+            send_splits.append(count)
+            if count:
+                end = send_offset + count
+                torch.index_select(flat_tokens, 0, send_indices, out=send_buf[send_offset:end])
+                torch.index_select(top1, 0, send_indices, out=send_ids[send_offset:end])
+                send_pos[send_offset:end].copy_(send_indices)
+                send_offset = end
         splits_all: list[list[int]] = [None for _ in range(world_size)]  # type: ignore[list-item]
         dist.all_gather_object(splits_all, send_splits)
         recv_splits = [splits_all[r][rank] for r in range(world_size)]
 
-        send_buf = torch.cat(send_tokens, dim=0) if send_tokens else flat_tokens[:0]
-        send_ids = torch.cat(send_expert_ids, dim=0) if send_expert_ids else top1[:0]
-        send_pos = (
-            torch.cat(send_indices, dim=0)
-            if send_indices
-            else torch.empty(0, device=tokens.device, dtype=torch.int64)
-        )
-
         total_recv = int(sum(recv_splits))
-        recv_buf = torch.empty(total_recv, hidden, device=tokens.device, dtype=flat_tokens.dtype)
-        recv_ids = torch.empty(total_recv, device=tokens.device, dtype=torch.int64)
-        recv_pos = torch.empty(total_recv, device=tokens.device, dtype=torch.int64)
+        recv_buf = self._distributed_workspace(
+            "recv_buf",
+            (total_recv, hidden),
+            device=tokens.device,
+            dtype=flat_tokens.dtype,
+        )
+        recv_ids = self._distributed_workspace(
+            "recv_ids",
+            (total_recv,),
+            device=tokens.device,
+            dtype=torch.int64,
+        )
+        recv_pos = self._distributed_workspace(
+            "recv_pos",
+            (total_recv,),
+            device=tokens.device,
+            dtype=torch.int64,
+        )
 
         dist.all_to_all_single(recv_buf, send_buf, out_split_sizes=recv_splits, in_split_sizes=send_splits)
         dist.all_to_all_single(recv_ids, send_ids, out_split_sizes=recv_splits, in_split_sizes=send_splits)
         dist.all_to_all_single(recv_pos, send_pos, out_split_sizes=recv_splits, in_split_sizes=send_splits)
 
-        local_out = torch.zeros_like(recv_buf)
-        for eid in torch.unique(recv_ids):
-            eid_int = int(eid.item())
-            if mask_overflow[eid_int]:
+        local_out = self._distributed_workspace(
+            "local_out",
+            (total_recv, hidden),
+            device=tokens.device,
+            dtype=flat_tokens.dtype,
+        )
+        local_out.zero_()
+        recv_unique_ids_host = torch.unique(recv_ids).detach().cpu()
+        for unique_idx in range(recv_unique_ids_host.numel()):
+            eid_int = int(recv_unique_ids_host[unique_idx])
+            if bool(overflow_flags_host[eid_int]):
                 continue
             if _expert_to_rank(eid_int, experts_per_rank) != rank:
                 continue
-            mask = recv_ids == eid
-            if mask.any():
-                local_out[mask] = self.experts[eid_int](recv_buf[mask])
+            mask = recv_ids == eid_int
+            local_out[mask] = self.experts[eid_int](recv_buf[mask])
 
         send_back_splits = recv_splits
         recv_back_splits = send_splits
         total_back = int(sum(recv_back_splits))
-        recv_back_buf = torch.empty(total_back, hidden, device=tokens.device, dtype=flat_tokens.dtype)
-        recv_back_pos = torch.empty(total_back, device=tokens.device, dtype=torch.int64)
+        recv_back_buf = self._distributed_workspace(
+            "recv_back_buf",
+            (total_back, hidden),
+            device=tokens.device,
+            dtype=flat_tokens.dtype,
+        )
+        recv_back_pos = self._distributed_workspace(
+            "recv_back_pos",
+            (total_back,),
+            device=tokens.device,
+            dtype=torch.int64,
+        )
 
         dist.all_to_all_single(
             recv_back_buf, local_out, out_split_sizes=recv_back_splits, in_split_sizes=send_back_splits
@@ -196,7 +294,13 @@ class Top2MoE(nn.Module):
             recv_back_pos, recv_pos, out_split_sizes=recv_back_splits, in_split_sizes=send_back_splits
         )
 
-        out = torch.zeros_like(flat_tokens)
+        out = self._distributed_workspace(
+            "out",
+            (flat_tokens.shape[0], hidden),
+            device=tokens.device,
+            dtype=flat_tokens.dtype,
+        )
+        out.zero_()
         out[recv_back_pos] = recv_back_buf
         return out.view(batch, seq, hidden)
 
@@ -252,7 +356,7 @@ def main() -> None:
     tokens = torch.randn(args.batch, args.seq, args.hidden_dim, device=device, dtype=dtype)
     torch.cuda.synchronize(device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(args.warmup):
             if args.mode == "distributed":
                 out = model.forward_distributed(tokens, ctx=ctx)  # type: ignore[arg-type]
@@ -262,21 +366,22 @@ def main() -> None:
 
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        current_stream = torch.cuda.current_stream(device)
+        start.record(current_stream)
         for _ in range(args.iters):
             if args.mode == "distributed":
                 out = model.forward_distributed(tokens, ctx=ctx)  # type: ignore[arg-type]
             else:
                 out = model.forward_local(tokens)
-        end.record()
+        end.record(current_stream)
         torch.cuda.synchronize(device)
 
     per_iter_ms = start.elapsed_time(end) / max(args.iters, 1)
 
     if args.mode == "distributed":
-        t = torch.tensor([per_iter_ms], device=device, dtype=torch.float32)
+        t = torch.tensor(per_iter_ms, device=device, dtype=torch.float32)
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
-        per_iter_ms = float(t.item())
+        per_iter_ms = scalar_tensor_to_float(t)
 
     if is_rank0:
         total_tokens = args.batch * args.seq

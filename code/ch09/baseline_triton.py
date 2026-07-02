@@ -12,7 +12,6 @@ from core.harness.benchmark_harness import (  # noqa: E402
     BenchmarkConfig,
     WorkloadMetadata,
 )
-from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range  # noqa: E402
 try:
     import triton  # noqa: F401
     TRITON_AVAILABLE = True
@@ -37,6 +36,7 @@ class BaselineTritonBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.input: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.N = 1_000_000
         # Triton benchmark - fixed N for kernel comparison
         tokens = self.N
@@ -49,12 +49,11 @@ class BaselineTritonBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.manual_seed(42)
         self.input = torch.randn(self.N, device=self.device, dtype=torch.float32)
         self._output_buffer = torch.empty(self.N, device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty_like(self._output_buffer)
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        with nvtx_range("baseline_triton", enable=enable_nvtx):
+        with torch.inference_mode(), self._nvtx_range("baseline_triton"):
             if self._output_buffer is None:
                 raise RuntimeError("setup() must initialize _output_buffer")
             baseline_elementwise(self.input, self._output_buffer)
@@ -63,9 +62,12 @@ class BaselineTritonBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output before verification")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self.input},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.input.shape[0],
             parameter_count=0,
             precision_flags={
@@ -81,6 +83,7 @@ class BaselineTritonBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.input = None
         self.output = None
         self._output_buffer = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -110,5 +113,3 @@ class BaselineTritonBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineTritonBenchmark()
-
-

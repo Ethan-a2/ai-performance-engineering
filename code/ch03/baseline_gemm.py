@@ -7,7 +7,7 @@ host-side scheduling overhead is measurable.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
@@ -41,11 +41,13 @@ class BaselineGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
         # Micro-batch size for blocked computation
         self.block_size = 256
         self.num_blocks = self.k // self.block_size
+        self._block_range = range(self.num_blocks)
         
         self.left: Optional[torch.Tensor] = None
         self.right: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         
         # Register workload metadata in __init__ for compliance checks
         self.register_workload_metadata(
@@ -59,7 +61,9 @@ class BaselineGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
         # Create input matrices - same as optimized version
         self.left = torch.randn(self.m, self.k, device=self.device, dtype=torch.float32)
         self.right = torch.randn(self.k, self.n, device=self.device, dtype=torch.float32)
-        self._output_buffer = torch.zeros(self.m, self.n, device=self.device, dtype=torch.float32)
+        self._output_buffer = torch.empty(self.m, self.n, device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty_like(self._output_buffer)
+        self._block_range = range(self.num_blocks)
         self.output = None
         self._synchronize()
 
@@ -69,11 +73,6 @@ class BaselineGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
         The intent is to expose host/runtime launch overhead around a fixed
         GEMM, not to demonstrate a Chapter 3-specific math-kernel trick.
         """
-        from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
         # Accumulate result from blocked matmul operations
         # C = A @ B = sum over blocks of (A[:, block_i] @ B[block_i, :])
         result = self._output_buffer
@@ -81,8 +80,8 @@ class BaselineGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("Output buffer not initialized")
         result.zero_()
         
-        with nvtx_range("baseline_gemm", enable=enable_nvtx):
-            for i in range(self.num_blocks):
+        with torch.inference_mode(), self._nvtx_range("baseline_gemm"):
+            for i in self._block_range:
                 start = i * self.block_size
                 end = start + self.block_size
                 # Extract block slices
@@ -96,9 +95,12 @@ class BaselineGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must be called after setup initializes inputs")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output before verification")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"left": self.left, "right": self.right},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.left.shape[0],
             parameter_count=0,
             precision_flags={
@@ -115,6 +117,7 @@ class BaselineGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.right = None
         self.output = None
         self._output_buffer = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

@@ -45,9 +45,9 @@ text_iter = text_iterator()
 
 # -----------------------------------------------------------------------------
 # Train the tokenizer
-t0 = time.time()
+t0 = time.perf_counter()
 tokenizer = RustBPETokenizer.train_from_iterator(text_iter, args.vocab_size)
-t1 = time.time()
+t1 = time.perf_counter()
 train_time = t1 - t0
 print(f"Training time: {train_time:.2f}s")
 
@@ -93,14 +93,24 @@ print(f"Saved token_bytes to {token_bytes_path}")
 # Log to report
 from nanochat.report import get_report
 token_bytes_nonzero = (token_bytes[token_bytes > 0]).to(dtype=torch.float32)
+token_byte_stats = torch.stack((
+    token_bytes_nonzero.min(),
+    token_bytes_nonzero.max(),
+    token_bytes_nonzero.mean(),
+    token_bytes_nonzero.std(),
+))
+token_bytes_min = float(token_byte_stats[0])
+token_bytes_max = float(token_byte_stats[1])
+token_bytes_mean = float(token_byte_stats[2])
+token_bytes_std = float(token_byte_stats[3])
 get_report().log(section="Tokenizer training", data=[
     vars(args), # argparse command line arguments
     {"train_time": train_time},
     {"num_special_tokens": len(special_set)},
     {
-        "token_bytes_min": int(token_bytes_nonzero.min().item()),
-        "token_bytes_max": int(token_bytes_nonzero.max().item()),
-        "token_bytes_mean": token_bytes_nonzero.mean().item(),
-        "token_bytes_std": token_bytes_nonzero.std().item(),
+        "token_bytes_min": int(token_bytes_min),
+        "token_bytes_max": int(token_bytes_max),
+        "token_bytes_mean": token_bytes_mean,
+        "token_bytes_std": token_bytes_std,
     }
 ])

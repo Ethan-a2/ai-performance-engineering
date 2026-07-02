@@ -25,7 +25,8 @@ class CUDAGraphPersistentDecodeBenchmark(DecodeBenchmark):
 
         # Prefill once and stash persistent state to amortize setup in benchmark_fn.
         self._copy_prompts_to_device()
-        prefill_state = self.prefill_fn(self.gpu_prompt)
+        with torch.inference_mode(), self.sdpa_ctx_factory():
+            prefill_state = self.prefill_fn(self.gpu_prompt)
         self._prefilled_state = prefill_state.detach().clone()
         self._prefilled_tokens = self.gpu_prompt[:, -1].detach().clone()
 
@@ -42,37 +43,37 @@ class CUDAGraphPersistentDecodeBenchmark(DecodeBenchmark):
         self._decode_graph = torch.cuda.CUDAGraph()
 
         # Warm up on the capture stream so kernels, heuristics, and workspaces are ready.
-        with torch.cuda.stream(self._graph_stream):
+        with torch.inference_mode(), self.sdpa_ctx_factory():
+            with torch.cuda.stream(self._graph_stream):
+                self.state_buffer.copy_(self._prefilled_state)
+                self.current_tokens.copy_(self._prefilled_tokens)
+                for _ in range(2):
+                    for _ in range(self.cfg.decode_tokens):
+                        next_state, next_token = self.decode_fn(self.current_tokens, self.state_buffer)
+                        self.state_buffer.copy_(next_state)
+                        self.current_tokens.copy_(next_token)
+            torch.cuda.synchronize()
+
+            # Reset to the same starting state/tokens before capture.
             self.state_buffer.copy_(self._prefilled_state)
             self.current_tokens.copy_(self._prefilled_tokens)
-            for _ in range(2):
+            torch.cuda.synchronize()
+
+            with torch.cuda.graph(self._decode_graph, stream=self._graph_stream):
                 for _ in range(self.cfg.decode_tokens):
-                    _, next_state, next_token = self.decode_fn(self.current_tokens, self.state_buffer)
+                    next_state, next_token = self.decode_fn(self.current_tokens, self.state_buffer)
                     self.state_buffer.copy_(next_state)
                     self.current_tokens.copy_(next_token)
-        torch.cuda.synchronize()
-
-        # Reset to the same starting state/tokens before capture.
-        self.state_buffer.copy_(self._prefilled_state)
-        self.current_tokens.copy_(self._prefilled_tokens)
-        torch.cuda.synchronize()
-
-        with torch.cuda.graph(self._decode_graph, stream=self._graph_stream):
-            for _ in range(self.cfg.decode_tokens):
-                _, next_state, next_token = self.decode_fn(self.current_tokens, self.state_buffer)
-                self.state_buffer.copy_(next_state)
-                self.current_tokens.copy_(next_token)
-        torch.cuda.synchronize()
+            torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        # Reset to persistent state; avoid recomputing prefill every iteration.
-        self.state_buffer.copy_(self._prefilled_state)
-        self.current_tokens.copy_(self._prefilled_tokens)
-
+        current_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self._graph_stream):
+            # Reset on the graph stream so replay consumes the intended state.
+            self.state_buffer.copy_(self._prefilled_state)
+            self.current_tokens.copy_(self._prefilled_tokens)
             self._decode_graph.replay()
-        torch.cuda.current_stream().wait_stream(self._graph_stream)
-        self._finalize_output()
+        current_stream.wait_stream(self._graph_stream)
 
     def teardown(self) -> None:
         for attr in ("_decode_graph", "_graph_stream", "_prefilled_state", "_prefilled_tokens"):
@@ -97,5 +98,3 @@ def get_benchmark() -> DecodeBenchmark:
         label="optimized_decode_warp_specialized",
     )
     return attach_benchmark_metadata(CUDAGraphPersistentDecodeBenchmark(cfg), __file__)
-
-

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 
+from core.benchmark.utils import scalar_tensor_to_float
 from core.common.device_utils import resolve_local_rank
 import time
 
@@ -65,6 +66,7 @@ def main() -> int:
 
     # Stage-specific weight (deterministic across ranks).
     w_stage = _weight_for_stage(rank, hidden, device, dtype)
+    w_stage_t = w_stage.t()
 
     # Buffers for send/recv.
     act = torch.empty(batch, hidden, device=device, dtype=dtype)
@@ -74,53 +76,53 @@ def main() -> int:
     if rank == 0:
         x0 = torch.randn(batch, hidden, device=device, dtype=dtype)
 
-    def stage_forward(x: torch.Tensor, *, is_last: bool) -> torch.Tensor:
-        y = x @ w_stage.t()
-        return y if is_last else torch.relu(y)
+    def stage_forward_into(x: torch.Tensor, out_buf: torch.Tensor, *, is_last: bool) -> torch.Tensor:
+        torch.mm(x, w_stage_t, out=out_buf)
+        return out_buf if is_last else torch.relu_(out_buf)
 
     # Warmup.
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(int(args.warmup)):
             if rank == 0:
                 assert x0 is not None
-                act.copy_(stage_forward(x0, is_last=False))
+                stage_forward_into(x0, act, is_last=False)
                 dist.send(act, dst=1)
                 dist.recv(out, src=world_size - 1)
             elif rank == world_size - 1:
                 dist.recv(act, src=rank - 1)
-                out.copy_(stage_forward(act, is_last=True))
+                stage_forward_into(act, out, is_last=True)
                 dist.send(out, dst=0)
             else:
                 dist.recv(act, src=rank - 1)
-                out.copy_(stage_forward(act, is_last=False))
+                stage_forward_into(act, out, is_last=False)
                 dist.send(out, dst=rank + 1)
         torch.cuda.synchronize(device)
         dist.barrier()
 
     # Timed loop (measure wall-clock on rank 0, take max over ranks).
     t0 = time.perf_counter()
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(int(args.iters)):
             if rank == 0:
                 assert x0 is not None
-                act.copy_(stage_forward(x0, is_last=False))
+                stage_forward_into(x0, act, is_last=False)
                 dist.send(act, dst=1)
                 dist.recv(out, src=world_size - 1)
             elif rank == world_size - 1:
                 dist.recv(act, src=rank - 1)
-                out.copy_(stage_forward(act, is_last=True))
+                stage_forward_into(act, out, is_last=True)
                 dist.send(out, dst=0)
             else:
                 dist.recv(act, src=rank - 1)
-                out.copy_(stage_forward(act, is_last=False))
+                stage_forward_into(act, out, is_last=False)
                 dist.send(out, dst=rank + 1)
         torch.cuda.synchronize(device)
         dist.barrier()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0 / max(int(args.iters), 1)
 
-    worst = torch.tensor([elapsed_ms], device=device, dtype=torch.float32)
+    worst = torch.tensor(elapsed_ms, device=device, dtype=torch.float32)
     dist.all_reduce(worst, op=dist.ReduceOp.MAX)
-    worst_ms = float(worst.item())
+    worst_ms = scalar_tensor_to_float(worst)
 
     max_diff = 0.0
     if rank == 0:
@@ -130,8 +132,8 @@ def main() -> int:
             w_ref = _weight_for_stage(stage_idx, hidden, device, dtype)
             ref = ref @ w_ref.t()
             if stage_idx < world_size - 1:
-                ref = torch.relu(ref)
-        max_diff = float((out.float() - ref.float()).abs().max().item())
+                ref = torch.relu_(ref)
+        max_diff = scalar_tensor_to_float((out.float() - ref.float()).abs().max())
         print(
             f"pipeline_parallel_demo: world={world_size} -> {worst_ms:.3f} ms/iter, "
             f"max_abs_diff={max_diff:.3e}"

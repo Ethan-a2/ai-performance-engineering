@@ -16,11 +16,17 @@ from labs.decode_optimization.decode_common import DecodeBenchmark, DecodeConfig
 class PersistentPrefillBaselineBenchmark(DecodeBenchmark):
     """Baseline that matches the optimized persistent-prefill execution model."""
 
+    def __init__(self, cfg: DecodeConfig) -> None:
+        super().__init__(cfg)
+        self._prefilled_state: torch.Tensor | None = None
+        self._prefilled_tokens: torch.Tensor | None = None
+
     def setup(self) -> None:
         super().setup()
         # Match optimized path: do prefill ONCE and benchmark decode-only iterations.
         self._copy_prompts_to_device()
-        prefill_state = self.prefill_fn(self.gpu_prompt)
+        with torch.inference_mode(), self.sdpa_ctx_factory():
+            prefill_state = self.prefill_fn(self.gpu_prompt)
         self._prefilled_state = prefill_state.detach().clone()
         self._prefilled_tokens = self.gpu_prompt[:, -1].detach().clone()
         self.register_workload_metadata(
@@ -29,22 +35,21 @@ class PersistentPrefillBaselineBenchmark(DecodeBenchmark):
         )
 
     def benchmark_fn(self) -> None:
-        if not hasattr(self, "_prefilled_state") or not hasattr(self, "_prefilled_tokens"):
+        if self._prefilled_state is None or self._prefilled_tokens is None:
             raise RuntimeError("setup() must run before benchmark_fn()")
 
-        # Reset to persistent state; avoid recomputing prefill every iteration.
-        self.state_buffer.copy_(self._prefilled_state)
-        self.current_tokens.copy_(self._prefilled_tokens)
-
-        stream = self.compute_stream or torch.cuda.current_stream()
-        with torch.cuda.stream(stream):
-            for _ in range(self.cfg.decode_tokens):
-                _, next_state, next_token = self.decode_fn(self.current_tokens, self.state_buffer)
+        current_stream = torch.cuda.current_stream()
+        stream = self.compute_stream or current_stream
+        with torch.cuda.stream(stream), torch.inference_mode(), self.sdpa_ctx_factory():
+            # Reset on the same stream that consumes the state to keep ordering explicit.
+            self.state_buffer.copy_(self._prefilled_state)
+            self.current_tokens.copy_(self._prefilled_tokens)
+            for _ in self._decode_step_range:
+                next_state, next_token = self.decode_fn(self.current_tokens, self.state_buffer)
                 self.state_buffer.copy_(next_state)
                 self.current_tokens.copy_(next_token)
         if self.compute_stream is not None:
-            torch.cuda.current_stream().wait_stream(stream)
-        self._finalize_output()
+            current_stream.wait_stream(stream)
 
 
 def get_benchmark() -> DecodeBenchmark:
@@ -63,5 +68,3 @@ def get_benchmark() -> DecodeBenchmark:
         label="baseline_decode_warp_specialized",
     )
     return attach_benchmark_metadata(PersistentPrefillBaselineBenchmark(cfg), __file__)
-
-

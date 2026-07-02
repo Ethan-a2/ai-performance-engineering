@@ -13,8 +13,6 @@ from __future__ import annotations
 from core.utils import compile_utils as _compile_utils_patch  # noqa: F401
 from core.utils.compile_utils import compile_model
 import contextlib
-import os
-import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -115,7 +113,7 @@ def _training_step(
     target: torch.Tensor,
     *,
     amp_dtype: Optional[torch.dtype] = None,
-) -> float:
+) -> torch.Tensor:
     autocast_ctx = (
         torch.autocast(device_type="cuda", dtype=amp_dtype) if amp_dtype is not None else contextlib.nullcontext()
     )
@@ -125,7 +123,7 @@ def _training_step(
     loss.backward()
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
-    return float(loss.detach())
+    return loss.detach()
 
 
 def benchmark_fp8_training() -> Dict[str, BenchmarkResult]:
@@ -166,10 +164,12 @@ def benchmark_fp8_training() -> Dict[str, BenchmarkResult]:
         if amp_dtype is not None:
             inputs = inputs.to(amp_dtype)
             targets = targets.to(amp_dtype)
+        loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
+        loss_tensor: torch.Tensor | None = None
 
         # Warmup
         for _ in range(5):
-            loss_val = _training_step(
+            loss_tensor = _training_step(
                 model,
                 optimizer,
                 inputs,
@@ -181,20 +181,25 @@ def benchmark_fp8_training() -> Dict[str, BenchmarkResult]:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
 
-        start.record()
+        current_stream = torch.cuda.current_stream(device)
+        start.record(current_stream)
         for _ in range(20):
-            loss_val = _training_step(
+            loss_tensor = _training_step(
                 model,
                 optimizer,
                 inputs,
                 targets,
                 amp_dtype=amp_dtype if not use_fp8 else None,
             )
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
 
         time_ms = start.elapsed_time(end) / 20.0
         memory_mb = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+        if loss_tensor is None:
+            raise RuntimeError("No FP8 training iterations ran")
+        loss_value_buffer[0].copy_(loss_tensor)
+        loss_val = float(loss_value_buffer.detach().cpu()[0])
 
         results[name] = BenchmarkResult(time_ms=time_ms, memory_mb=memory_mb, loss=loss_val)
         print(f"{name:<4}  time={time_ms:6.2f} ms | memory={memory_mb:7.1f} MB | loss={loss_val:.5f}")
@@ -221,11 +226,12 @@ def demonstrate_fp8_compile() -> None:
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    start.record()
+    current_stream = torch.cuda.current_stream(device)
+    start.record(current_stream)
     for _ in range(20):
         compiled(sample)
-    end.record()
-    torch.cuda.synchronize()
+    end.record(current_stream)
+    end.synchronize()
     print(f"FP8 + torch.compile throughput: {start.elapsed_time(end)/20.0:6.2f} ms/iter")
 
 

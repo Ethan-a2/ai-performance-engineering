@@ -9,17 +9,18 @@ FlexAttention to a compiled, TMA-oriented kernel path.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import inspect
 import json
 import math
-from pathlib import Path
 import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
 
+from core.benchmark.utils import scalar_tensor_to_float
 from core.utils.compile_utils import compile_callable
 
 try:
@@ -65,6 +66,9 @@ FLASHATTENTION4_CLAIM_TYPE_IDS = {
 FLASHATTENTION4_EDUCATIONAL_TARGET = "labs/flashattention4:flashattention4"
 FLASHATTENTION4_ABSOLUTE_TARGET = "labs/flashattention4:best_available_attention"
 FLASHATTENTION4_REPRODUCTION_ENTRYPOINT = "labs/flashattention4/tflops_microbench.py"
+_ALIBI_DISTANCE_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
+_ALIBI_SLOPE_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
+_DENSE_MASK_POSITION_CACHE: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 @dataclass(frozen=True)
@@ -371,16 +375,43 @@ def build_dense_attention_mask(
     if mode == "dense":
         return None
 
-    q_idx = torch.arange(seq_len, device=device)[:, None]
-    kv_idx = torch.arange(seq_len, device=device)[None, :]
+    q_idx, kv_idx = _dense_mask_positions_for(seq_len, device)
     mask = q_idx >= kv_idx
     if mode in {"windowed", "alibi_windowed"}:
         mask = mask & ((q_idx - kv_idx) < window_size)
     return mask.unsqueeze(0).unsqueeze(0)
 
 
+def _dense_mask_positions_for(
+    seq_len: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (int(seq_len), torch.device(device))
+    cached = _DENSE_MASK_POSITION_CACHE.get(key)
+    if cached is None:
+        positions = torch.arange(seq_len, device=device)
+        cached = (positions[:, None], positions[None, :])
+        _DENSE_MASK_POSITION_CACHE[key] = cached
+    return cached
+
+
+def _alibi_distance_for(seq_len: int, device: torch.device) -> torch.Tensor:
+    key = (int(seq_len), torch.device(device))
+    cached = _ALIBI_DISTANCE_CACHE.get(key)
+    if cached is None:
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        cached = positions[:, None] - positions[None, :]
+        cached.clamp_min_(0)
+        _ALIBI_DISTANCE_CACHE[key] = cached
+    return cached
+
+
 def build_alibi_slopes(num_heads: int, *, device: torch.device) -> torch.Tensor:
     """Standard ALiBi slope generation."""
+    key = (int(num_heads), torch.device(device))
+    cached = _ALIBI_SLOPE_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     def _slopes_power_of_two(head_count: int) -> list[float]:
         start = 2 ** (-(2 ** -(math.log2(head_count) - 3)))
@@ -394,7 +425,9 @@ def build_alibi_slopes(num_heads: int, *, device: torch.device) -> torch.Tensor:
         slopes = _slopes_power_of_two(closest)
         extra = _slopes_power_of_two(2 * closest)[0::2]
         slopes.extend(extra[: num_heads - closest])
-    return torch.tensor(slopes, device=device, dtype=torch.float32)
+    cached = torch.tensor(slopes, device=device, dtype=torch.float32)
+    _ALIBI_SLOPE_CACHE[key] = cached
+    return cached
 
 
 def build_reference_inputs(
@@ -494,16 +527,18 @@ def reference_attention(inputs: FlashAttention4Inputs) -> torch.Tensor:
 
     if inputs.alibi_slopes is not None:
         seq_len = inputs.q.size(-2)
-        q_pos = torch.arange(seq_len, device=inputs.q.device)[:, None]
-        kv_pos = torch.arange(seq_len, device=inputs.q.device)[None, :]
-        distance = (q_pos - kv_pos).clamp_min(0).to(torch.float32)
-        scores = scores - inputs.alibi_slopes.view(1, -1, 1, 1) * distance.view(1, 1, seq_len, seq_len)
+        distance = _alibi_distance_for(seq_len, inputs.q.device)
+        scores.addcmul_(
+            inputs.alibi_slopes.view(1, -1, 1, 1),
+            distance.view(1, 1, seq_len, seq_len),
+            value=-1.0,
+        )
 
     if inputs.softcap_scale is not None:
-        scores = inputs.softcap_scale * torch.tanh(scores / inputs.softcap_scale)
+        scores.div_(inputs.softcap_scale).tanh_().mul_(inputs.softcap_scale)
 
     if inputs.dense_mask is not None:
-        scores = scores.masked_fill(~inputs.dense_mask, float("-inf"))
+        scores.masked_fill_(~inputs.dense_mask, float("-inf"))
 
     probs = torch.softmax(scores, dim=-1)
     return torch.matmul(probs, inputs.v.float())
@@ -568,21 +603,47 @@ def measure_flashattention4_latency(
     torch.cuda.synchronize()
 
     times_ms: list[float] = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
     for _ in range(iterations):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        start.record(current_stream)
         _ = fn()
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         times_ms.append(float(start.elapsed_time(end)))
 
+    count = len(times_ms)
+    total_ms = 0.0
+    total_sq_ms = 0.0
+    min_ms = float("inf")
+    max_ms = float("-inf")
+    for value in times_ms:
+        total_ms += value
+        total_sq_ms += value * value
+        min_ms = min(min_ms, value)
+        max_ms = max(max_ms, value)
+
+    times_ms.sort()
+    mid = count // 2
+    if count % 2 == 1:
+        median_ms = times_ms[mid]
+    else:
+        median_ms = (times_ms[mid - 1] + times_ms[mid]) / 2.0
+
+    mean_ms = total_ms / count
+    if count > 1:
+        variance = (total_sq_ms - (total_ms * total_ms / count)) / (count - 1)
+        std_ms = variance**0.5 if variance > 0.0 else 0.0
+    else:
+        std_ms = 0.0
+
     return FlashAttention4Timing(
-        mean_ms=sum(times_ms) / len(times_ms),
-        median_ms=sorted(times_ms)[len(times_ms) // 2] if len(times_ms) % 2 == 1 else sum(sorted(times_ms)[len(times_ms) // 2 - 1 : len(times_ms) // 2 + 1]) / 2.0,
-        min_ms=min(times_ms),
-        max_ms=max(times_ms),
-        std_ms=0.0 if len(times_ms) < 2 else torch.tensor(times_ms, dtype=torch.float64).std(unbiased=True).item(),
+        mean_ms=mean_ms,
+        median_ms=median_ms,
+        min_ms=min_ms,
+        max_ms=max_ms,
+        std_ms=std_ms,
     )
 
 
@@ -598,17 +659,23 @@ def count_nonmasked_attention_elements(
         return q_seq_len * kv_seq_len
 
     if mode == "causal":
-        return sum(min(kv_seq_len, q_idx + 1) for q_idx in range(q_seq_len))
+        diagonal_rows = min(q_seq_len, kv_seq_len)
+        triangular = diagonal_rows * (diagonal_rows + 1) // 2
+        full_kv_rows = max(q_seq_len - kv_seq_len, 0)
+        return triangular + full_kv_rows * kv_seq_len
 
     if mode in {"windowed", "alibi_windowed"}:
         if window_size < 1:
             raise ValueError("window_size must be >= 1 for windowed modes")
-        total = 0
-        for q_idx in range(q_seq_len):
-            upper = min(kv_seq_len - 1, q_idx)
-            lower = max(0, q_idx - window_size + 1)
-            total += max(0, upper - lower + 1)
-        return total
+        active_kv = min(kv_seq_len, q_seq_len)
+        full_window_cols = min(active_kv, max(q_seq_len - window_size + 1, 0))
+        tail_cols = active_kv - full_window_cols
+        if tail_cols == 0:
+            return full_window_cols * window_size
+        tail_first = full_window_cols
+        tail_last = active_kv - 1
+        tail_total = tail_cols * (2 * q_seq_len - tail_first - tail_last) // 2
+        return full_window_cols * window_size + tail_total
 
     raise ValueError(f"Unsupported mode {mode!r}; expected one of {SUPPORTED_MODES}")
 
@@ -773,7 +840,7 @@ def _candidate_matches_reference(
         return False, reference_output, "non-finite output"
 
     if not torch.allclose(candidate_output, reference_output, atol=0.5, rtol=0.05):
-        max_diff = (candidate_output - reference_output).abs().max().item()
+        max_diff = scalar_tensor_to_float((candidate_output - reference_output).abs().max())
         return False, reference_output, f"max_diff={max_diff:.6f}"
 
     return True, reference_output, "ok"

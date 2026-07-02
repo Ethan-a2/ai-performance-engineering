@@ -39,9 +39,13 @@ class OptimizedFlashInferAttentionLab(VerificationPayloadMixin, BaseBenchmark):
         self.k: Optional[torch.Tensor] = None
         self.v: Optional[torch.Tensor] = None
         self.out_proj: Optional[nn.Linear] = None
+        self._proj_weight_t: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.wrapper: Optional[flashinfer.BlockSparseAttentionWrapper] = None
         self.sparsity_ratio = 0.0
+        self._payload_parameter_count = 0
         tokens = float(self.seq_len)
         self._workload = WorkloadMetadata(
             requests_per_iteration=1.0,
@@ -83,28 +87,57 @@ class OptimizedFlashInferAttentionLab(VerificationPayloadMixin, BaseBenchmark):
             sm_scale=sm_scale,
         )
         self.out_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False).to(self.device, dtype=torch.float16)
+        self._proj_weight_t = self.out_proj.weight.t()
+        self._output_buffer = torch.empty(
+            self.seq_len,
+            self.hidden_size,
+            device=self.device,
+            dtype=torch.float16,
+        )
+        self._verify_output_buffer = torch.empty(
+            min(128, self.seq_len),
+            min(128, self.hidden_size),
+            device=self.device,
+            dtype=torch.float16,
+        )
+        self._payload_parameter_count = self.out_proj.weight.numel()
         self._synchronize()
 
     def benchmark_fn(self) -> None:
-        if self.q is None or self.k is None or self.v is None or self.wrapper is None or self.out_proj is None:
+        if (
+            self.q is None
+            or self.k is None
+            or self.v is None
+            or self.wrapper is None
+            or self.out_proj is None
+            or self._proj_weight_t is None
+            or self._output_buffer is None
+        ):
             raise RuntimeError("Benchmark not initialized")
         with self._nvtx_range("optimized_flashinfer_attention"):
-            attn_out = self.wrapper.run(self.q, self.k, self.v)
-            proj_in = attn_out.reshape(self.seq_len, self.hidden_size)
-            self.output = self.out_proj(proj_in)
+            with torch.inference_mode():
+                attn_out = self.wrapper.run(self.q, self.k, self.v)
+                proj_in = attn_out.reshape(self.seq_len, self.hidden_size)
+                self.output = torch.matmul(proj_in, self._proj_weight_t, out=self._output_buffer)
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
-        if self.q is None or self.k is None or self.v is None or self.output is None:
+        if (
+            self.q is None
+            or self.k is None
+            or self.v is None
+            or self.output is None
+            or self._verify_output_buffer is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
-        verify_output = self.output[:128, :128]
-        parameter_count = self.out_proj.weight.numel() if self.out_proj is not None else 0
+        verify_output = self._verify_output_buffer
+        verify_output.copy_(self.output[: verify_output.shape[0], : verify_output.shape[1]])
         self._set_verification_payload(
             inputs={"q": self.q, "k": self.k, "v": self.v},
-            output=verify_output.detach().clone(),
+            output=verify_output,
             batch_size=self.seq_len,
-            parameter_count=parameter_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": True,
                 "bf16": False,
@@ -122,7 +155,10 @@ class OptimizedFlashInferAttentionLab(VerificationPayloadMixin, BaseBenchmark):
         self.k = None
         self.v = None
         self.out_proj = None
+        self._proj_weight_t = None
         self.output = None
+        self._output_buffer = None
+        self._verify_output_buffer = None
         self.wrapper = None
         torch.cuda.empty_cache()
 
@@ -144,5 +180,3 @@ class OptimizedFlashInferAttentionLab(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedFlashInferAttentionLab()
-
-

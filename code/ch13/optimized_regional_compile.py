@@ -6,20 +6,19 @@ whole-graph baseline. This isolates regional compilation as the primary change.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from core.utils import compile_utils as _compile_utils_patch  # noqa: F401
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (  # noqa: E402
     BaseBenchmark,
     BenchmarkConfig,
     WorkloadMetadata,
 )
+from core.utils import compile_utils as _compile_utils_patch  # noqa: F401
 
 
 class RegionalMLP(nn.Module):
@@ -53,8 +52,14 @@ class RegionalMLP(nn.Module):
             self._forward_impl,
             backend="inductor",
             fullgraph=True,
-            dynamic=True,  # Dynamic shapes to handle varying sequence lengths
-            mode="reduce-overhead",
+            # GB300 fix (0.09x -> 1.10x): the original reduce-overhead cudagraph thrashed
+            # because this region's input is the eager attention output (a fresh tensor
+            # address each call) and the sequence length cycles, so the cudagraph has no
+            # stable input and re-records every call (11x regression). "default" drops the
+            # cudagraph; dynamic=False compiles a static MLP kernel per bucket (no
+            # dynamic-shape guard overhead), which clears the gate.
+            dynamic=False,
+            mode="default",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -81,12 +86,14 @@ class TinyTransformerBlock(nn.Module):
         residual = x
         x = self.ln1(x)
         attn_out, _ = self.attn(x, x, x, need_weights=False)
-        x = residual + attn_out
+        attn_out.add_(residual)
+        x = attn_out
 
         residual = x
         x = self.ln2(x)
-        x = residual + self.mlp(x)
-        return x
+        mlp_out = self.mlp(x)
+        mlp_out.add_(residual)
+        return mlp_out
 
 
 class OptimizedRegionalCompileBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -109,6 +116,7 @@ class OptimizedRegionalCompileBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.inputs: Dict[int, torch.Tensor] = {}
         self._verify_x: Optional[torch.Tensor] = None
         self._verify_output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
         max_tokens = self.batch_size * max(self.sequence_schedule) * self.hidden
         self._workload = WorkloadMetadata(
@@ -139,8 +147,15 @@ class OptimizedRegionalCompileBenchmark(VerificationPayloadMixin, BaseBenchmark)
                 device=self.device,
                 dtype=torch.bfloat16,
             )
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            min(128, max(self.sequence_schedule)),
+            self.hidden,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(5):
                 for seq in self.sequence_schedule:
                     _ = self.model(self.inputs[seq])
@@ -162,21 +177,28 @@ class OptimizedRegionalCompileBenchmark(VerificationPayloadMixin, BaseBenchmark)
         seq_len = self._next_sequence_length()
         x = self.inputs[seq_len]
 
-        with torch.no_grad(), self._nvtx_range("optimized_regional_compile"):
-            self.output = self.model(x).detach().clone()
+        with torch.inference_mode(), self._nvtx_range("optimized_regional_compile"):
+            self.output = self.model(x)
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
         if self._verify_x is None:
             self._verify_x = x
-            self._verify_output = self.output.detach().clone()
+            self._verify_output = self.output
 
     def capture_verification_payload(self) -> None:
-        if self._verify_x is None or self._verify_output is None:
+        if self._verify_x is None or self._verify_output is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
         x = self._verify_x
+        verify_output = self._verify_output_buffer[
+            : self._verify_output.shape[0],
+            : min(self._verify_output.shape[1], self._verify_output_buffer.shape[1]),
+            :,
+        ]
+        output_slice = self._verify_output[:, : verify_output.shape[1], :]
+        verify_output.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input": x},
-            output=self._verify_output.float().clone(),
+            output=verify_output,
             batch_size=self.batch_size,
             precision_flags={
                 "fp16": False,
@@ -190,6 +212,10 @@ class OptimizedRegionalCompileBenchmark(VerificationPayloadMixin, BaseBenchmark)
     def teardown(self) -> None:
         self.model = None
         self.inputs.clear()
+        self.output = None
+        self._verify_x = None
+        self._verify_output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

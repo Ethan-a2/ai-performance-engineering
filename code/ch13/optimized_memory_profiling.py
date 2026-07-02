@@ -19,10 +19,15 @@ class OptimizedModel(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim, hidden_dim * 2)
         self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = checkpoint(self._fc1_relu, x, preserve_rng_state=False)
+        x = checkpoint(
+            self._fc1_relu,
+            x,
+            preserve_rng_state=False,
+            use_reentrant=False,
+        )
         x = self.fc2(x)
         return x
     
@@ -43,6 +48,7 @@ class OptimizedMemoryProfilingBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.targets: Optional[torch.Tensor] = None
         self.criterion: Optional[nn.Module] = None
         self.peak_memory_mb = 0.0
+        self._memory_bytes_to_mb = 1.0 / (1024 ** 2)
         self.batch_size = 32
         self.hidden_dim = 2048
         tokens = self.batch_size * self.hidden_dim
@@ -51,6 +57,7 @@ class OptimizedMemoryProfilingBenchmark(VerificationPayloadMixin, BaseBenchmark)
             tokens_per_iteration=float(tokens),
         )
         self.output = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.register_workload_metadata(
             requests_per_iteration=1.0,
             tokens_per_iteration=float(tokens),
@@ -66,6 +73,7 @@ class OptimizedMemoryProfilingBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.inputs = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float32)
         self.targets = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float32)
         self.criterion = nn.MSELoss()
+        self._verify_output_buffer = torch.empty_like(self.inputs, dtype=torch.float32)
 
         _ = self.model(self.inputs)
         self._synchronize()
@@ -76,18 +84,21 @@ class OptimizedMemoryProfilingBenchmark(VerificationPayloadMixin, BaseBenchmark)
             raise RuntimeError("Benchmark not configured")
 
         with self._nvtx_range("optimized_memory_profiling"):
+            self.model.zero_grad(set_to_none=True)
             outputs = self.model(self.inputs)
             loss = self.criterion(outputs, self.targets)
             loss.backward()
-            self.peak_memory_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
-            self.output = outputs.detach().clone()
+            self.output = outputs.detach_()
         if self.inputs is None or self.targets is None or self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self.inputs, "targets": self.targets},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.inputs.shape[0],
             precision_flags={
                 "fp16": False,
@@ -98,11 +109,20 @@ class OptimizedMemoryProfilingBenchmark(VerificationPayloadMixin, BaseBenchmark)
             output_tolerance=(0.5, 5.0),
         )
 
+    def finalize_iteration_metrics(self) -> Optional[dict]:
+        """Poll allocator peak after harness timing has already finalized."""
+        self.peak_memory_mb = torch.cuda.max_memory_allocated() * self._memory_bytes_to_mb
+        return None
+
     def teardown(self) -> None:
+        if torch.cuda.is_available():
+            self.finalize_iteration_metrics()
         self.model = None
         self.inputs = None
         self.targets = None
         self.criterion = None
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
     
     def get_config(self) -> BenchmarkConfig:

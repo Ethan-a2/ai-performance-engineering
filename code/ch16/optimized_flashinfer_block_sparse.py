@@ -30,6 +30,7 @@ class OptimizedFlashInferBlockSparseBenchmark(VerificationPayloadMixin, BaseBenc
         self.k: Optional[torch.Tensor] = None
         self.v: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.wrapper: Optional[flashinfer.BlockSparseAttentionWrapper] = None
         self.sparsity_ratio = 0.0
         tokens = self.seq_len * self.heads
@@ -48,6 +49,13 @@ class OptimizedFlashInferBlockSparseBenchmark(VerificationPayloadMixin, BaseBenc
         self.q = torch.randn(self.seq_len, self.heads, self.head_dim, device=self.device, dtype=torch.float16)
         self.k = torch.randn(self.seq_len, self.heads, self.head_dim, device=self.device, dtype=torch.float16)
         self.v = torch.randn(self.seq_len, self.heads, self.head_dim, device=self.device, dtype=torch.float16)
+        self._verify_output_buffer = torch.empty(
+            self.seq_len,
+            self.heads,
+            self.head_dim,
+            device=self.device,
+            dtype=torch.float16,
+        )
         block_mask = build_block_sparse_pattern(
             seq_len=self.seq_len,
             block_size=self.block_size,
@@ -74,16 +82,24 @@ class OptimizedFlashInferBlockSparseBenchmark(VerificationPayloadMixin, BaseBenc
         if self.q is None or self.k is None or self.v is None or self.wrapper is None:
             raise RuntimeError("Benchmark not initialized")
         with self._nvtx_range("optimized_flashinfer_block_sparse"):
-            self.output = self.wrapper.run(self.q, self.k, self.v)
+            with torch.inference_mode():
+                self.output = self.wrapper.run(self.q, self.k, self.v)
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
-        if self.q is None or self.k is None or self.v is None or self.output is None:
+        if (
+            self.q is None
+            or self.k is None
+            or self.v is None
+            or self.output is None
+            or self._verify_output_buffer is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"q": self.q, "k": self.k, "v": self.v},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.seq_len,
             parameter_count=0,
             precision_flags={
@@ -103,6 +119,7 @@ class OptimizedFlashInferBlockSparseBenchmark(VerificationPayloadMixin, BaseBenc
         self.k = None
         self.v = None
         self.output = None
+        self._verify_output_buffer = None
         self.wrapper = None
         torch.cuda.empty_cache()
 
@@ -120,5 +137,3 @@ class OptimizedFlashInferBlockSparseBenchmark(VerificationPayloadMixin, BaseBenc
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedFlashInferBlockSparseBenchmark()
-
-

@@ -15,7 +15,6 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
@@ -33,9 +32,9 @@ class UnoptimizedModel(nn.Module):
     def forward(self, x):
         # Anti-pattern 1: Separate operations that could be fused
         x = self.fc1(x)
-        x = torch.relu(x)  # Separate kernel
+        x = torch.relu_(x)  # Separate kernel
         x = self.fc2(x)
-        x = torch.relu(x)  # Another separate kernel
+        x = torch.relu_(x)  # Another separate kernel
         x = self.fc3(x)
         # Anti-pattern 2: Redundant normalization
         x = x / x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -53,6 +52,8 @@ class BaselineBF16MLPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model: Optional[nn.Module] = None
         self.x: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._materialization_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.batch_size = 128
         self.hidden_dim = 2048  # Smaller to make differences more visible
         tokens = self.batch_size * self.hidden_dim
@@ -60,40 +61,53 @@ class BaselineBF16MLPBenchmark(VerificationPayloadMixin, BaseBenchmark):
             requests_per_iteration=float(self.batch_size),
             tokens_per_iteration=float(tokens),
         )
+        self._payload_parameter_count = 0
     
     def setup(self) -> None:
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
         # FP32 - no tensor core acceleration
         self.model = UnoptimizedModel(hidden_dim=self.hidden_dim).to(self.device).float().eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         self.x = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float32)
         self.output = None
+        self._materialization_buffer = torch.empty((), device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty_like(self.x, dtype=torch.float32)
         # Warmup
         for _ in range(5):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self.x)
     
     def benchmark_fn(self) -> None:
         assert self.model is not None and self.x is not None
+        assert self._materialization_buffer is not None
         with self._nvtx_range("multiple_techniques_baseline"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = self.model(self.x)
-                _ = out.sum()  # Force materialization
-                self.output = out.detach()
+                torch.sum(out, dim=(0, 1), out=self._materialization_buffer)
+                self.output = out
 
     def capture_verification_payload(self) -> None:
-        assert self.model is not None and self.x is not None and self.output is not None
+        assert (
+            self.model is not None
+            and self.x is not None
+            and self.output is not None
+            and self._verify_output_buffer is not None
+        )
+        self._verify_output_buffer.copy_(self.output, non_blocking=False)
         self._set_verification_payload(
             inputs={"x": self.x},
-            output=self.output.float(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(0.5, 6.0),
         )
     
     def teardown(self) -> None:
         self.model = None
         self.x = None
+        self._materialization_buffer = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:

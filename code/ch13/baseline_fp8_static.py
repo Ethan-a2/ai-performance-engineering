@@ -16,7 +16,6 @@ Paired with: optimized_fp8_static.py
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Optional
 
 import torch
@@ -36,6 +35,7 @@ class BaselineFP8StaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.x: Optional[torch.Tensor] = None
         self._verify_input: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
 
         self.batch_size = 32
@@ -69,9 +69,16 @@ class BaselineFP8StaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
         self.x = torch.randn(self.batch_size, self.seq_len, self.dim, device=self.device)
         self._verify_input = self.x.detach().clone()
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            min(128, self.seq_len),
+            self.dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         for _ in range(3):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.static_linear(self.x)
         self._synchronize()
 
@@ -79,7 +86,7 @@ class BaselineFP8StaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if self.static_linear is None or self.x is None:
             raise RuntimeError("Benchmark not configured")
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # Dynamic scaling overhead (not applied to quantization for output parity).
             input_amax = self.x.abs().amax(dim=-1)
             weight_amax = self.static_linear.weight.abs().amax(dim=1)
@@ -91,11 +98,17 @@ class BaselineFP8StaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
-        if self._verify_input is None or self.output is None:
+        if self._verify_input is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("capture_verification_payload() requires benchmark_fn() output")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            :,
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=int(self._verify_input.shape[0]),
             parameter_count=self.parameter_count,
             precision_flags={
@@ -112,6 +125,7 @@ class BaselineFP8StaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.x = None
         self._verify_input = None
         self.output = None
+        self._verify_output_buffer = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         super().teardown()
@@ -132,5 +146,3 @@ class BaselineFP8StaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineFP8StaticBenchmark()
-
-

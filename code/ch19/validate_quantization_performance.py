@@ -28,11 +28,9 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
-import torch.nn as nn
 
 # PyTorch profiler
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -120,8 +118,10 @@ class ProfiledBenchmark:
         Returns:
             BenchmarkResult with comprehensive metrics
         """
+        cuda_available = torch.cuda.is_available()
+
         # Get GPU info
-        if torch.cuda.is_available():
+        if cuda_available:
             props = torch.cuda.get_device_properties(0)
             gpu_name = props.name
             compute_capability = f"{props.major}.{props.minor}"
@@ -129,46 +129,68 @@ class ProfiledBenchmark:
             gpu_name = "CPU"
             compute_capability = "N/A"
 
+        warmup_label = standardize_nvtx_label(f"warmup:{self.name}_{precision}")
+        compute_label = standardize_nvtx_label(f"compute_math:{self.name}_{precision}")
+        iteration_labels = [
+            standardize_nvtx_label(f"iteration:{self.name}_{precision}_{i}")
+            for i in range(benchmark_iters)
+        ]
+
         # Warmup
-        with nvtx.range(standardize_nvtx_label(f"warmup:{self.name}_{precision}")):
+        with nvtx.range(warmup_label):
             for _ in range(warmup_iters):
                 _ = func(*args)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+        if cuda_available:
+            torch.cuda.synchronize()
 
         # Clear memory stats
-        if torch.cuda.is_available():
+        if cuda_available:
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.empty_cache()
 
         # Benchmark
-        times: List[float] = []
-        with nvtx.range(standardize_nvtx_label(f"compute_math:{self.name}_{precision}")):
-            for i in range(benchmark_iters):
-                if torch.cuda.is_available():
-                    start_event = torch.cuda.Event(enable_timing=True)
-                    end_event = torch.cuda.Event(enable_timing=True)
-                    start_event.record()
-                    with nvtx.range(standardize_nvtx_label(f"iteration:{self.name}_{precision}_{i}")):
+        sample_count = 0
+        mean_time_ms = 0.0
+        m2_time_ms = 0.0
+        min_time_ms = float("inf")
+        max_time_ms = float("-inf")
+        with nvtx.range(compute_label):
+            if cuda_available:
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                current_stream = torch.cuda.current_stream()
+                for i in range(benchmark_iters):
+                    start_event.record(current_stream)
+                    with nvtx.range(iteration_labels[i]):
                         _ = func(*args)
-                    end_event.record()
-                    torch.cuda.synchronize()
+                    end_event.record(current_stream)
+                    end_event.synchronize()
                     elapsed_ms = start_event.elapsed_time(end_event)
-                    times.append(elapsed_ms)
-                else:
-                    start = time.time()
-                    _ = func(*args)
-                    elapsed_ms = (time.time() - start) * 1000
-                    times.append(elapsed_ms)
+                    sample_count += 1
+                    delta = elapsed_ms - mean_time_ms
+                    mean_time_ms += delta / sample_count
+                    m2_time_ms += delta * (elapsed_ms - mean_time_ms)
+                    min_time_ms = min(min_time_ms, elapsed_ms)
+                    max_time_ms = max(max_time_ms, elapsed_ms)
+            else:
+                for i in range(benchmark_iters):
+                    start = time.perf_counter()
+                    with nvtx.range(iteration_labels[i]):
+                        _ = func(*args)
+                    elapsed_ms = (time.perf_counter() - start) * 1000
+                    sample_count += 1
+                    delta = elapsed_ms - mean_time_ms
+                    mean_time_ms += delta / sample_count
+                    m2_time_ms += delta * (elapsed_ms - mean_time_ms)
+                    min_time_ms = min(min_time_ms, elapsed_ms)
+                    max_time_ms = max(max_time_ms, elapsed_ms)
 
         # Calculate statistics
-        avg_time_ms = sum(times) / len(times)
-        min_time_ms = min(times)
-        max_time_ms = max(times)
-        std_time_ms = (sum((t - avg_time_ms) ** 2 for t in times) / len(times)) ** 0.5
+        avg_time_ms = mean_time_ms
+        std_time_ms = (m2_time_ms / sample_count) ** 0.5
 
         # Memory statistics
-        if torch.cuda.is_available():
+        if cuda_available:
             memory_allocated_mb = torch.cuda.max_memory_allocated() / 1024**2
             memory_reserved_mb = torch.cuda.max_memory_reserved() / 1024**2
         else:

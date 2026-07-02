@@ -27,6 +27,7 @@ from core.harness.benchmark_harness import (
 )
 from ch04.distributed_helper import run_main_with_skip_status, setup_single_gpu_env
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 
 # Ensure consistent TF32 state before any operations (new API only)
@@ -45,8 +46,8 @@ class MultiLayerNet(nn.Module):
         self.fc3 = nn.Linear(size, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
+        x = torch.relu_(self.fc1(x))
+        x = torch.relu_(self.fc2(x))
         return self.fc3(x)
 
 
@@ -67,6 +68,8 @@ class OptimizedOverlapDdpBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.initialized = False
         self.batch_size = 128
         self.hidden_size = 1024
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
         tokens = self.batch_size * self.hidden_size
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
@@ -103,7 +106,10 @@ class OptimizedOverlapDdpBenchmark(VerificationPayloadMixin, BaseBenchmark):
         else:
             self.model = model
         
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
 
         self.data = torch.randn(self.batch_size, self.hidden_size, device=self.device)
         self.target = torch.randn(self.batch_size, 1, device=self.device)
@@ -111,28 +117,22 @@ class OptimizedOverlapDdpBenchmark(VerificationPayloadMixin, BaseBenchmark):
     
     def benchmark_fn(self) -> None:
         """Benchmark a step that overlaps gradient synchronization with backward."""
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range("overlap_ddp", enable=enable_nvtx):
+        with nvtx_range("overlap_ddp", enable=self._enable_nvtx):
             output = self.model(self.data)
             loss = nn.functional.mse_loss(output, self.target)
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
-        self.output = output.detach()
+        self.output = output.detach_()
 
     def capture_verification_payload(self) -> None:
         if self.data is None or self.target is None or self.output is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        param_count = sum(p.numel() for p in self.model.parameters()) if self.model is not None else 0
         self._set_verification_payload(
             inputs={"data": self.data, "target": self.target},
             output=self.output,
             batch_size=int(self.batch_size),
-            parameter_count=param_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,

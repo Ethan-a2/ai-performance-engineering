@@ -14,6 +14,7 @@ from core.harness.benchmark_harness import (  # noqa: E402
     BenchmarkConfig,
     WorkloadMetadata,
 )
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 # Import CUDA extension
 from ch12.cuda_extensions import load_kernel_fusion_extension
@@ -34,6 +35,8 @@ class OptimizedKernelFusionPersistentBufferBenchmark(VerificationPayloadMixin, B
             tokens_per_iteration=float(self.N * self.iterations),
         )
         self._initialized = False
+        self._enable_nvtx = False
+        self._verify_output_buffer: Optional[torch.Tensor] = None
     
     def setup(self) -> None:
         """Setup: Initialize tensors and load the fused-kernel extension.
@@ -45,6 +48,8 @@ class OptimizedKernelFusionPersistentBufferBenchmark(VerificationPayloadMixin, B
         # Load CUDA extension (will compile on first call)
         if self._extension is None:
             self._extension = load_kernel_fusion_extension()
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
 
         # Allocate data once and reuse it across benchmark iterations.
         # Keep the seed fixed so verification remains deterministic.
@@ -60,29 +65,26 @@ class OptimizedKernelFusionPersistentBufferBenchmark(VerificationPayloadMixin, B
         # Reset data contents to the canonical initial state without reallocating.
         torch.manual_seed(42)
         self.data.copy_(torch.arange(self.N, dtype=torch.float32, device=self.device))
+        self._verify_output_buffer = torch.empty_like(self.data)
         torch.cuda.synchronize(self.device)
 
         self._initialized = True
     
     def benchmark_fn(self) -> None:
         """Benchmark: Fused kernel (single memory round trip)."""
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-
-        with nvtx_range("kernel_fusion", enable=enable_nvtx):
+        with nvtx_range("kernel_fusion", enable=self._enable_nvtx):
             # Call CUDA extension with fused kernel
             self._extension.fused_kernel(self.data, self.iterations)
         if self.data is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.data is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output for verification")
+        self._verify_output_buffer.copy_(self.data)
         self._set_verification_payload(
             inputs={"data": self._verify_input},
-            output=self.data.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.N,
             precision_flags={
                 "fp16": False,
@@ -98,6 +100,7 @@ class OptimizedKernelFusionPersistentBufferBenchmark(VerificationPayloadMixin, B
         """Teardown: Clean up resources."""
         self.data = None
         self._verify_input = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:

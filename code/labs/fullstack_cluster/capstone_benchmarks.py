@@ -6,6 +6,7 @@ from typing import Callable, Optional
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.benchmark.utils import scalar_tensor_to_float
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
 from labs.fullstack_cluster import baseline_matmul
 
@@ -76,7 +77,8 @@ class CapstoneMatmulBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def benchmark_fn(self) -> None:
         with self._nvtx_range(self._label):
-            self._last_output = self._runner(self._lhs, self._rhs)
+            with torch.inference_mode():
+                self._last_output = self._runner(self._lhs, self._rhs)
 
     def teardown(self) -> None:
         self._last_output = None
@@ -108,7 +110,7 @@ class CapstoneMatmulBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if self._reference is None or self._last_output is None:
             return "Missing outputs for validation"
         diff = (self._last_output - self._reference).abs()
-        max_diff = diff.max().item()
+        max_diff = scalar_tensor_to_float(diff.max())
         if math.isnan(max_diff) or math.isinf(max_diff):
             return "Non-finite values detected in output tensor"
         # Empirically we see ~1e2 difference due to layout/pipeline differences.

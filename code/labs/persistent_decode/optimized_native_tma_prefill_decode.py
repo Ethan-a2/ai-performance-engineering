@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
+from typing import Optional
+
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
@@ -47,24 +50,52 @@ class OptimizedNativeTmaPrefillDecodeBenchmark(VerificationPayloadMixin, BaseBen
         self.graph_v = None
         self.graph_out = None
         self._tma_ext = None
+        self._prefill_events: list[torch.cuda.Event] = []
+        self._prefill_work: list[
+            tuple[torch.cuda.Stream, torch.Tensor, torch.Tensor, torch.cuda.Event]
+        ] = []
         self.register_workload_metadata(tokens_per_iteration=tokens_per_iteration())
         self.output: Optional[torch.Tensor] = None
+        self._output_view: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
     def setup(self) -> None:
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
         self.inputs = build_inputs(self.device)
+        self._output_view = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])]
+        self._verify_output_buffer = torch.empty_like(self._output_view, dtype=torch.float32)
         self.prefill_src = torch.randn(
             self.prefill_chunks, self.prefill_chunk_elems, device=self.device
         )
-        self.prefill_dst = torch.zeros_like(self.prefill_src)
+        self.prefill_dst = torch.empty_like(self.prefill_src)
         self._tma_ext = load_native_tma()  # raises if unsupported
+        self._prefill_events = [
+            torch.cuda.Event(enable_timing=False, blocking=False)
+            for _ in range(self.prefill_chunks)
+        ]
+        self._prefill_work = [
+            (
+                self.prefill_streams[idx % len(self.prefill_streams)],
+                src,
+                dst,
+                event,
+            )
+            for idx, (src, dst, event) in enumerate(
+                zip(
+                    self.prefill_src.unbind(0),
+                    self.prefill_dst.unbind(0),
+                    self._prefill_events,
+                    strict=True,
+                )
+            )
+        ]
 
         self.graph_q = self.inputs.q.clone()
         self.graph_k = self.inputs.k.clone()
         self.graph_v = self.inputs.v.clone()
-        self.graph_out = torch.zeros_like(self.inputs.out)
+        self.graph_out = torch.empty_like(self.inputs.out)
 
         torch.cuda.synchronize()
         with torch.cuda.graph(self.decode_graph, stream=self.decode_stream):
@@ -81,18 +112,20 @@ class OptimizedNativeTmaPrefillDecodeBenchmark(VerificationPayloadMixin, BaseBen
             dot = (q_t * k_t).sum(dim=-1, keepdim=True)
             out[:, t, :] = v_t * dot
 
-    def _prefill_shaped_native(self, *, async_only: bool = False) -> list[torch.cuda.Event] | None:
+    def _prefill_shaped_native(self, *, async_only: bool = False) -> deque[torch.cuda.Event] | None:
         """Launch native TMA copies on multiple streams with an in-flight cap."""
-        events = []
-        for idx in range(self.prefill_chunks):
-            stream = self.prefill_streams[idx % len(self.prefill_streams)]
+        if self._tma_ext is None:
+            raise RuntimeError("Native TMA extension not initialized")
+        if len(self._prefill_work) != self.prefill_chunks:
+            raise RuntimeError("Prefill work not initialized")
+        events: deque[torch.cuda.Event] = deque()
+        for stream, src, dst, evt in self._prefill_work:
             with torch.cuda.stream(stream):
-                self._tma_ext.tma_copy(self.prefill_src[idx], self.prefill_dst[idx])
-            evt = torch.cuda.Event(enable_timing=False, blocking=False)
+                self._tma_ext.tma_copy(src, dst)
             evt.record(stream)
             events.append(evt)
             if len(events) > self.cfg.max_in_flight:
-                stream.wait_event(events.pop(0))
+                stream.wait_event(events.popleft())
         if async_only:
             return events
         current_stream = torch.cuda.current_stream()
@@ -106,35 +139,38 @@ class OptimizedNativeTmaPrefillDecodeBenchmark(VerificationPayloadMixin, BaseBen
             self.graph_q.copy_(self.inputs.q)
             self.graph_k.copy_(self.inputs.k)
             self.graph_v.copy_(self.inputs.v)
-            self.graph_out.zero_()
             self.decode_graph.replay()
             self.inputs.out.copy_(self.graph_out)
 
     def benchmark_fn(self) -> None:
-        if self.inputs is None:
+        if self.inputs is None or self._output_view is None:
             raise RuntimeError("Inputs not initialized")
 
-        with self._nvtx_range("prefill_native_shaped_low_pri"):
+        current_stream = torch.cuda.current_stream()
+        with torch.inference_mode(), self._nvtx_range("prefill_native_shaped_low_pri"):
             pref_events = self._prefill_shaped_native(async_only=True)
-        with self._nvtx_range("decode_graph_high_pri"):
+        with torch.inference_mode(), self._nvtx_range("decode_graph_high_pri"):
             self._decode_graph()
         if pref_events:
             for evt in pref_events:
-                torch.cuda.current_stream().wait_event(evt)
-        torch.cuda.current_stream().wait_stream(self.decode_stream)
+                current_stream.wait_event(evt)
+        current_stream.wait_stream(self.decode_stream)
         if self.inputs is not None:
-            self.output = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])].detach()
+            self.output = self._output_view
         if self.inputs is None or self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
+        if self.inputs is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "q": self.inputs.q.detach(),
                 "k": self.inputs.k.detach(),
                 "v": self.inputs.v.detach(),
             },
-            output=self.output.float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch,
             parameter_count=0,
             precision_flags={
@@ -149,6 +185,10 @@ class OptimizedNativeTmaPrefillDecodeBenchmark(VerificationPayloadMixin, BaseBen
         torch.cuda.empty_cache()
         self.inputs = None
         self.output = None
+        self._output_view = None
+        self._verify_output_buffer = None
+        self._prefill_events = []
+        self._prefill_work = []
 
     def get_config(self) -> BenchmarkConfig:
         return BenchmarkConfig(
@@ -174,4 +214,3 @@ class OptimizedNativeTmaPrefillDecodeBenchmark(VerificationPayloadMixin, BaseBen
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedNativeTmaPrefillDecodeBenchmark()
-

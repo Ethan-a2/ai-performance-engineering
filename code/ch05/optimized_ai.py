@@ -10,9 +10,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ch05.ai_common import TinyBlock, compute_ai_workload_metrics
+from ch05.ai_common import BufferedTinyBlock, TinyBlock, compute_ai_workload_metrics
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
+
+__all__ = ["OptimizedAIBenchmark", "TinyBlock", "get_benchmark"]
 
 
 class OptimizedAIBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -34,6 +36,7 @@ class OptimizedAIBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.batch = 64
         self.hidden = 32
         self.num_blocks = 256
+        self._block_range = range(self.num_blocks)
         self.parameter_count = 0
         tokens = self.batch * self.hidden * self.num_blocks
         self._workload = WorkloadMetadata(
@@ -44,7 +47,7 @@ class OptimizedAIBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def setup(self) -> None:
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
-        self.block = TinyBlock(self.hidden).to(self.device).eval()
+        self.block = BufferedTinyBlock(self.hidden).to(self.device).eval()
         self.parameter_count = sum(p.numel() for p in self.block.parameters())
 
         host_batches = np.random.default_rng(42).standard_normal(
@@ -56,6 +59,7 @@ class OptimizedAIBenchmark(VerificationPayloadMixin, BaseBenchmark):
         f.close()
         np.save(self.inputs_path, host_batches)
         self.mapped_inputs = np.load(self.inputs_path, mmap_mode="r")
+        self._block_range = range(self.num_blocks)
 
         pin_memory = torch.cuda.is_available()
         self.host_buffers = [
@@ -75,40 +79,44 @@ class OptimizedAIBenchmark(VerificationPayloadMixin, BaseBenchmark):
         assert self.mapped_inputs is not None
         np.copyto(self.host_views[slot], self.mapped_inputs[step])
 
-    def _enqueue_copy(self, slot: int) -> None:
+    def _enqueue_copy(self, slot: int, wait_stream: Optional[torch.cuda.Stream] = None) -> None:
         if self.copy_stream is None:
             self.device_buffers[slot].copy_(self.host_buffers[slot], non_blocking=False)
             return
+        producer_stream = wait_stream or torch.cuda.current_stream()
         with torch.cuda.stream(self.copy_stream):
+            self.copy_stream.wait_stream(producer_stream)
             self.device_buffers[slot].copy_(self.host_buffers[slot], non_blocking=True)
 
-    def _wait_for_copy(self) -> None:
+    def _wait_for_copy(self, wait_stream: Optional[torch.cuda.Stream] = None) -> None:
         if self.copy_stream is not None:
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+            consumer_stream = wait_stream or torch.cuda.current_stream()
+            consumer_stream.wait_stream(self.copy_stream)
 
     def benchmark_fn(self) -> None:
         assert self.block is not None and self.mapped_inputs is not None
+        current_stream = torch.cuda.current_stream() if self.copy_stream is not None else None
         self._stage_to_host(0, 0)
-        self._enqueue_copy(0)
+        self._enqueue_copy(0, wait_stream=current_stream)
 
         out: Optional[torch.Tensor] = None
         last_input: Optional[torch.Tensor] = None
         with self._nvtx_range("optimized_ai_storage_pipeline"):
             with torch.inference_mode():
-                for step in range(self.num_blocks):
+                for step in self._block_range:
                     current = step & 1
                     next_slot = current ^ 1
-                    self._wait_for_copy()
+                    self._wait_for_copy(current_stream)
                     current_input = self.device_buffers[current]
-                    out = self.block(current_input)
-                    last_input = current_input
                     if step + 1 < self.num_blocks:
                         self._stage_to_host(next_slot, step + 1)
-                        self._enqueue_copy(next_slot)
+                        self._enqueue_copy(next_slot, wait_stream=current_stream)
+                    out = self.block(current_input)
+                    last_input = current_input
         if out is None or last_input is None:
             raise RuntimeError("benchmark_fn() must produce output")
         self._last_input = last_input
-        self.output = out.detach()
+        self.output = out
 
     def capture_verification_payload(self) -> None:
         self._set_verification_payload(

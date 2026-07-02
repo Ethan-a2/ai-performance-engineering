@@ -32,7 +32,7 @@ print_usage() {
 Usage:
   profile.sh --list
   profile.sh [HARNESS_FLAGS...]
-  profile.sh <script.py> [--arch sm_100] [--tool nsys|ncu|pytorch|hta|perf|all]
+  profile.sh <script.py> [--arch sm_100] [--tool nsys|ncu|pytorch|hta|perf|zymtrace|all]
                          [--pytorch-mode full] [--output-root DIR] [--python PYTHON]
                          [-- script-args ...]
 
@@ -43,12 +43,13 @@ Harness mode (preferred):
 
 Direct mode:
   Executes a specific script path with Nsight Systems, Nsight Compute,
-  PyTorch profiler, HTA, and/or perf. Optional script arguments can be
+  PyTorch profiler, HTA, perf, and/or Zymtrace CUDA injection. Optional script arguments can be
   provided after a literal "--".
 
 Examples:
   profile.sh --profile nsys --examples ch14_triton_examples
   profile.sh code/ch07/memory_access_pytorch.py --tool ncu
+  profile.sh code/ch15/speculative_decoding_benchmarks.py --tool zymtrace
   profile.sh code/ch09/fusion_pytorch.py --tool pytorch --pytorch-mode memory -- --batch-size 4
 USAGE
 }
@@ -92,9 +93,21 @@ resolve_architecture() {
     fi
 
     local detected="sm_100"
+    # Prefer the shared SM detector; it maps CC 10.3 -> sm_103 (Blackwell Ultra /
+    # GB300) and CC 10.0 -> sm_100 (B200/GB200), so it is GB300-correct.
+    local probed
+    probed=$(PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" "$PYTHON_DEFAULT" -m core.benchmark.detect_sm 2>/dev/null || true)
+    if [[ "$probed" =~ ^sm_[0-9]+a?$ ]]; then
+        echo "$probed"
+        return
+    fi
     if command -v nvidia-smi >/dev/null 2>&1; then
         local gpu_name
         gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -1 || true)
+        if [[ -n "$gpu_name" && "$gpu_name" =~ (B300|GB300) ]]; then
+            echo "sm_103"
+            return
+        fi
         if [[ -n "$gpu_name" && ! "$gpu_name" =~ (B200|B300) ]]; then
             echo "sm_100"
             echo "⚠ Non-Blackwell GPU detected (${gpu_name}); defaulting to sm_100" >&2
@@ -125,7 +138,7 @@ run_nsys() {
         cmd+=("${DEFAULT_NSYS_EXTRA_OPTS[@]}")
     fi
     cmd+=("$PYTHON_BIN" "$SCRIPT_PATH")
-    if ((${#SCRIPT_ARGS[@]})); then
+    if [[ -n "${SCRIPT_ARGS[*]-}" ]]; then
         cmd+=("${SCRIPT_ARGS[@]}")
     fi
     print_command "${cmd[@]}"
@@ -148,7 +161,7 @@ run_ncu() {
         -o "$base"
         "$PYTHON_BIN" "$SCRIPT_PATH"
     )
-    if ((${#SCRIPT_ARGS[@]})); then
+    if [[ -n "${SCRIPT_ARGS[*]-}" ]]; then
         cmd+=("${SCRIPT_ARGS[@]}")
     fi
     print_command "${cmd[@]}"
@@ -164,7 +177,7 @@ run_hta() {
         --stats=true \
         --capture-range=cudaProfilerApi --capture-range-end=stop --capture-range-op=both \
         --multi-gpu=all "$PYTHON_BIN" "$SCRIPT_PATH")
-    if ((${#SCRIPT_ARGS[@]})); then
+    if [[ -n "${SCRIPT_ARGS[*]-}" ]]; then
         cmd+=("${SCRIPT_ARGS[@]}")
     fi
     print_command "${cmd[@]}"
@@ -176,13 +189,95 @@ run_perf() {
     require_command perf "perf" || return
     local data_file="${SESSION_DIR}/perf_${ARCH_VALUE}_$(timestamp).data"
     local cmd=(perf record --call-graph dwarf -o "$data_file" "$PYTHON_BIN" "$SCRIPT_PATH")
-    if ((${#SCRIPT_ARGS[@]})); then
+    if [[ -n "${SCRIPT_ARGS[*]-}" ]]; then
         cmd+=("${SCRIPT_ARGS[@]}")
     fi
     print_command "${cmd[@]}"
     "${cmd[@]}"
     echo "  ↳ Perf data captured: ${data_file}"
     echo "     View with: perf report -i ${data_file}"
+}
+
+resolve_zymtrace_injection() {
+    local candidate
+    if [[ -n "${CUDA_INJECTION64_PATH:-}" ]]; then
+        candidate="${CUDA_INJECTION64_PATH}"
+        if [[ -r "$candidate" ]]; then
+            resolve_path "$candidate"
+            return 0
+        fi
+        echo "✗ CUDA_INJECTION64_PATH is set but does not point to a file or is not readable: ${candidate}" >&2
+        return 1
+    fi
+    if [[ -n "${ZYMTRACE_CUDA_INJECTION64_PATH:-}" ]]; then
+        candidate="${ZYMTRACE_CUDA_INJECTION64_PATH}"
+        if [[ -r "$candidate" ]]; then
+            resolve_path "$candidate"
+            return 0
+        fi
+        echo "✗ ZYMTRACE_CUDA_INJECTION64_PATH is set but does not point to a file or is not readable: ${candidate}" >&2
+        return 1
+    fi
+    candidate="/var/lib/zymtrace/profiler/libzymtracecudaprofiler.so"
+    if [[ -r "$candidate" ]]; then
+        echo "$candidate"
+        return 0
+    fi
+    echo "✗ Zymtrace CUDA injection library not found. Set CUDA_INJECTION64_PATH or ZYMTRACE_CUDA_INJECTION64_PATH." >&2
+    return 1
+}
+
+write_zymtrace_manifest() {
+    local manifest_path="$1"
+    local injection_lib="$2"
+    shift 2
+    "$PYTHON_BIN" - "$manifest_path" "$injection_lib" "$PYTHON_BIN" "$SCRIPT_PATH" "$@" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+payload = {
+    "tool": "zymtrace",
+    "cuda_injection64_path": sys.argv[2],
+    "python": sys.argv[3],
+    "script": sys.argv[4],
+    "script_args": sys.argv[5:],
+    "environment": {
+        "CUDA_INJECTION64_PATH": sys.argv[2],
+        "ZYMTRACE_CUDA_INJECTION64_PATH": sys.argv[2],
+        "CUDA_LAUNCH_BLOCKING": os.environ.get("CUDA_LAUNCH_BLOCKING"),
+        "PYTORCH_ALLOC_CONF": os.environ.get("PYTORCH_ALLOC_CONF"),
+    },
+}
+manifest.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+PY
+}
+
+run_zymtrace() {
+    local injection_lib
+    injection_lib="$(resolve_zymtrace_injection)"
+    local manifest="${SESSION_DIR}/zymtrace_launch_manifest.json"
+    if ((${#SCRIPT_ARGS[@]})); then
+        write_zymtrace_manifest "$manifest" "$injection_lib" "${SCRIPT_ARGS[@]}"
+    else
+        write_zymtrace_manifest "$manifest" "$injection_lib"
+    fi
+
+    local cmd=(
+        env
+        "CUDA_INJECTION64_PATH=${injection_lib}"
+        "ZYMTRACE_CUDA_INJECTION64_PATH=${injection_lib}"
+        "$PYTHON_BIN"
+        "$SCRIPT_PATH"
+    )
+    if ((${#SCRIPT_ARGS[@]})); then
+        cmd+=("${SCRIPT_ARGS[@]}")
+    fi
+    print_command "${cmd[@]}"
+    "${cmd[@]}"
+    echo "  ↳ Zymtrace launch manifest: ${manifest}"
 }
 
 run_pytorch() {
@@ -208,6 +303,9 @@ run_comprehensive() {
     run_pytorch
     run_hta
     run_perf
+    if resolve_zymtrace_injection >/dev/null 2>&1; then
+        run_zymtrace
+    fi
 }
 
 if (( $# == 0 )); then
@@ -324,7 +422,7 @@ if [[ "$SCRIPT_PATH" =~ /code/ch01/ || "$SCRIPT_PATH" =~ /code/ch02/ || "$SCRIPT
 fi
 
 
-PROFILE_SPEC="${PROFILE_SPEC,,}"
+PROFILE_SPEC="$(printf '%s' "$PROFILE_SPEC" | tr '[:upper:]' '[:lower:]')"
 IFS="," read -r -a RAW_TOOLS <<< "$PROFILE_SPEC"
 if ((${#RAW_TOOLS[@]} == 0)); then
     RAW_TOOLS=("all")
@@ -334,9 +432,12 @@ for tool in "${RAW_TOOLS[@]}"; do
     case "$tool" in
         all)
             TOOLS=(nsys ncu pytorch hta perf)
+            if resolve_zymtrace_injection >/dev/null 2>&1; then
+                TOOLS+=(zymtrace)
+            fi
             break
             ;;
-        nsys|ncu|hta|perf|pytorch|torch)
+        nsys|ncu|hta|perf|pytorch|torch|zymtrace)
             norm="$tool"
             [[ "$norm" == "torch" ]] && norm="pytorch"
             TOOLS+=("${norm}")
@@ -350,9 +451,11 @@ done
 
 # Deduplicate while preserving order
 DEDUP_TOOLS=()
-for tool in "${TOOLS[@]}"; do
+for tool in "${TOOLS[@]:-}"; do
+    [[ -z "$tool" ]] && continue
     seen=false
-    for existing in "${DEDUP_TOOLS[@]}"; do
+    for existing in "${DEDUP_TOOLS[@]:-}"; do
+        [[ -z "$existing" ]] && continue
         if [[ "$existing" == "$tool" ]]; then
             seen=true
             break
@@ -372,20 +475,35 @@ Architecture : ${ARCH_VALUE}
 Tools        : ${TOOLS[*]}
 Output Dir   : ${SESSION_DIR}
 SUMMARY
-if ((${#SCRIPT_ARGS[@]})); then
+if [[ -n "${SCRIPT_ARGS[*]-}" ]]; then
     printf 'Arguments    : %s\n' "$(printf '%q ' "${SCRIPT_ARGS[@]}")"
 fi
 
-declare -A TOOL_RUNNERS=(
-    [nsys]=run_nsys
-    [ncu]=run_ncu
-    [hta]=run_hta
-    [perf]=run_perf
-    [pytorch]=run_pytorch
-)
-
-for tool in "${TOOLS[@]}"; do
-    "${TOOL_RUNNERS[$tool]}"
+for tool in "${TOOLS[@]:-}"; do
+    case "$tool" in
+        nsys)
+            run_nsys
+            ;;
+        ncu)
+            run_ncu
+            ;;
+        hta)
+            run_hta
+            ;;
+        perf)
+            run_perf
+            ;;
+        pytorch)
+            run_pytorch
+            ;;
+        zymtrace)
+            run_zymtrace
+            ;;
+        *)
+            echo "✗ Unknown profile tool after normalization: ${tool}" >&2
+            exit 1
+            ;;
+    esac
 done
 
 echo

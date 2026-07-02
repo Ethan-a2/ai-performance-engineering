@@ -30,8 +30,18 @@ class ContextParallelConfig:
 class AttentionWorkspace:
     gather_k: Optional[list[torch.Tensor]] = None
     gather_v: Optional[list[torch.Tensor]] = None
+    k_full: Optional[torch.Tensor] = None
+    v_full: Optional[torch.Tensor] = None
     recv_k: Optional[torch.Tensor] = None
     recv_v: Optional[torch.Tensor] = None
+    recv_k_alt: Optional[torch.Tensor] = None
+    recv_v_alt: Optional[torch.Tensor] = None
+
+
+_CAUSAL_MASK_POSITION_CACHE: dict[tuple[int, int, int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+_CAUSAL_MASK_CACHE: dict[tuple[int, int, int, torch.device], torch.Tensor] = {}
+_RING_POSITION_VIEW_CACHE: dict[tuple[int, int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+_RING_CAUSAL_MASK_CACHE: dict[tuple[int, int, int, torch.device], torch.Tensor] = {}
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -60,13 +70,18 @@ def build_attention_workspace(
     device: torch.device,
 ) -> AttentionWorkspace:
     shape = (batch_size, num_heads, seq_shard, head_dim)
+    full_shape = (batch_size, num_heads, seq_shard * world_size, head_dim)
     if world_size <= 1:
         return AttentionWorkspace()
     return AttentionWorkspace(
         gather_k=[torch.empty(shape, device=device, dtype=dtype) for _ in range(world_size)],
         gather_v=[torch.empty(shape, device=device, dtype=dtype) for _ in range(world_size)],
+        k_full=torch.empty(full_shape, device=device, dtype=dtype),
+        v_full=torch.empty(full_shape, device=device, dtype=dtype),
         recv_k=torch.empty(shape, device=device, dtype=dtype),
         recv_v=torch.empty(shape, device=device, dtype=dtype),
+        recv_k_alt=torch.empty(shape, device=device, dtype=dtype),
+        recv_v_alt=torch.empty(shape, device=device, dtype=dtype),
     )
 
 
@@ -111,13 +126,73 @@ def _apply_causal_mask(
     seq_shard: int,
     world_size: int,
 ) -> torch.Tensor:
-    seq_total = seq_shard * world_size
-    global_q = (rank * seq_shard) + torch.arange(seq_shard, device=scores.device)
-    global_k = torch.arange(seq_total, device=scores.device)
-    return scores.masked_fill(
-        global_k.view(1, 1, 1, seq_total) > global_q.view(1, 1, seq_shard, 1),
-        float("-inf"),
-    )
+    mask = _causal_mask_for(rank, seq_shard, world_size, scores.device)
+    return scores.masked_fill_(mask, float("-inf"))
+
+
+def _causal_mask_position_views(
+    rank: int,
+    seq_shard: int,
+    world_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (int(rank), int(seq_shard), int(world_size), torch.device(device))
+    cached = _CAUSAL_MASK_POSITION_CACHE.get(key)
+    if cached is None:
+        seq_total = int(seq_shard) * int(world_size)
+        local_positions = torch.arange(seq_shard, device=device)
+        global_q = (int(rank) * int(seq_shard) + local_positions).view(1, 1, seq_shard, 1)
+        global_k = torch.arange(seq_total, device=device).view(1, 1, 1, seq_total)
+        cached = (global_q, global_k)
+        _CAUSAL_MASK_POSITION_CACHE[key] = cached
+    return cached
+
+
+def _causal_mask_for(
+    rank: int,
+    seq_shard: int,
+    world_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    key = (int(rank), int(seq_shard), int(world_size), torch.device(device))
+    mask = _CAUSAL_MASK_CACHE.get(key)
+    if mask is None:
+        global_q, global_k = _causal_mask_position_views(rank, seq_shard, world_size, device)
+        mask = global_k > global_q
+        _CAUSAL_MASK_CACHE[key] = mask
+    return mask
+
+
+def _ring_position_views(
+    rank: int,
+    seq_shard: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (int(rank), int(seq_shard), torch.device(device))
+    cached = _RING_POSITION_VIEW_CACHE.get(key)
+    if cached is None:
+        local_positions = torch.arange(seq_shard, device=device)
+        global_q = (int(rank) * int(seq_shard) + local_positions).view(1, 1, seq_shard, 1)
+        k_indices = local_positions.view(1, 1, 1, seq_shard)
+        cached = (global_q, k_indices)
+        _RING_POSITION_VIEW_CACHE[key] = cached
+    return cached
+
+
+def _ring_causal_mask_for(
+    rank: int,
+    target_rank: int,
+    seq_shard: int,
+    device: torch.device,
+) -> torch.Tensor:
+    key = (int(rank), int(target_rank), int(seq_shard), torch.device(device))
+    mask = _RING_CAUSAL_MASK_CACHE.get(key)
+    if mask is None:
+        global_q, k_indices = _ring_position_views(rank, seq_shard, device)
+        global_k = int(target_rank) * int(seq_shard) + k_indices
+        mask = global_k > global_q
+        _RING_CAUSAL_MASK_CACHE[key] = mask
+    return mask
 
 
 def all_gather_attention(
@@ -134,14 +209,22 @@ def all_gather_attention(
     workspace: Optional[AttentionWorkspace] = None,
 ) -> torch.Tensor:
     if world_size > 1 and dist.is_initialized():
-        if workspace is None or workspace.gather_k is None or workspace.gather_v is None:
+        if (
+            workspace is None
+            or workspace.gather_k is None
+            or workspace.gather_v is None
+            or workspace.k_full is None
+            or workspace.v_full is None
+        ):
             raise RuntimeError("all_gather_attention() requires preallocated gather buffers when world_size > 1")
         gather_k = workspace.gather_k
         gather_v = workspace.gather_v
         dist.all_gather(gather_k, k, group=process_group)
         dist.all_gather(gather_v, v, group=process_group)
-        k_full = torch.cat(gather_k, dim=2)
-        v_full = torch.cat(gather_v, dim=2)
+        torch.cat(gather_k, dim=2, out=workspace.k_full)
+        torch.cat(gather_v, dim=2, out=workspace.v_full)
+        k_full = workspace.k_full
+        v_full = workspace.v_full
     else:
         k_full = k
         v_full = v
@@ -185,17 +268,13 @@ def ring_attention(
     global_max: Optional[torch.Tensor] = None
     global_sum: Optional[torch.Tensor] = None
 
-    global_q = (rank * seq_shard) + torch.arange(seq_shard, device=q.device)
-    global_q = global_q.view(1, 1, seq_shard, 1)
-    k_indices = torch.arange(seq_shard, device=q.device).view(1, 1, 1, seq_shard)
-
     for step in range(world_size):
         target_rank = (rank - step) % world_size
         scores = torch.matmul(q, k_current.transpose(-2, -1)) * scale
 
         if causal:
-            global_k = target_rank * seq_shard + k_indices
-            scores = scores.masked_fill(global_k > global_q, float("-inf"))
+            mask = _ring_causal_mask_for(rank, target_rank, seq_shard, q.device)
+            scores.masked_fill_(mask, float("-inf"))
 
         local_max = scores.amax(dim=-1, keepdim=True)
         exp_scores = torch.exp(scores - local_max)
@@ -218,10 +297,20 @@ def ring_attention(
             next_rank = (rank + 1) % world_size
             prev_rank = (rank - 1) % world_size
 
-            if workspace is None or workspace.recv_k is None or workspace.recv_v is None:
+            if (
+                workspace is None
+                or workspace.recv_k is None
+                or workspace.recv_v is None
+                or workspace.recv_k_alt is None
+                or workspace.recv_v_alt is None
+            ):
                 raise RuntimeError("ring_attention() requires preallocated recv buffers when world_size > 1")
-            k_recv = workspace.recv_k
-            v_recv = workspace.recv_v
+            if step & 1:
+                k_recv = workspace.recv_k_alt
+                v_recv = workspace.recv_v_alt
+            else:
+                k_recv = workspace.recv_k
+                v_recv = workspace.recv_v
 
             ops = [
                 dist.P2POp(dist.isend, k_current, next_rank, group=process_group),
@@ -299,14 +388,15 @@ def run_context_parallel(
             x = layer.proj(layer.merge_heads(attn_out))
         return x
 
-    for _ in range(max(warmup, 0)):
-        _step()
-    torch.cuda.synchronize(device)
+    with torch.inference_mode():
+        for _ in range(max(warmup, 0)):
+            _step()
+        torch.cuda.synchronize(device)
 
-    start = time.perf_counter()
-    for _ in range(max(iters, 1)):
-        _step()
-    torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        for _ in range(max(iters, 1)):
+            _step()
+        torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
 
     if rank == 0:

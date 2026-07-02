@@ -16,12 +16,9 @@ def build_block_sparse_pattern(
     if seq_len % block_size != 0:
         raise ValueError("seq_len must be divisible by block_size")
     blocks = seq_len // block_size
-    mask = torch.zeros((blocks, blocks), dtype=torch.bool)
-    for row in range(blocks):
-        start = max(0, row - window_blocks)
-        end = min(blocks, row + window_blocks + 1)
-        mask[row, start:end] = True
-    return mask
+    row_ids = torch.arange(blocks).unsqueeze(1)
+    col_ids = torch.arange(blocks).unsqueeze(0)
+    return (col_ids >= row_ids - window_blocks) & (col_ids <= row_ids + window_blocks)
 
 
 def build_dense_attention_mask(
@@ -31,10 +28,13 @@ def build_dense_attention_mask(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    neg_inf = torch.tensor(float("-inf"), device=device, dtype=dtype)
-    zero = torch.tensor(0.0, device=device, dtype=dtype)
-    values = torch.where(block_mask.to(device), zero, neg_inf)
-    return values.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+    values = torch.full(block_mask.shape, float("-inf"), device=device, dtype=dtype)
+    values.masked_fill_(block_mask.to(device=device, dtype=torch.bool), 0.0)
+    blocks = values.shape[0]
+    return values[:, None, :, None].expand(blocks, block_size, blocks, block_size).reshape(
+        blocks * block_size,
+        blocks * block_size,
+    )
 
 
 def build_bsr_from_block_mask(
@@ -43,15 +43,15 @@ def build_bsr_from_block_mask(
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     blocks = block_mask.shape[0]
-    indices_list = []
-    indptr_list = [0]
-    for row in range(blocks):
-        cols = torch.nonzero(block_mask[row], as_tuple=False).flatten().tolist()
-        indices_list.extend(cols)
-        indptr_list.append(len(indices_list))
-    indptr = torch.tensor(indptr_list, dtype=torch.int32, device=device)
-    indices = torch.tensor(indices_list, dtype=torch.int32, device=device)
+    mask = block_mask.to(dtype=torch.bool)
+    row_counts = mask.sum(dim=1, dtype=torch.int32)
+    indptr_src = torch.empty(blocks + 1, dtype=torch.int32, device=mask.device)
+    indptr_src[0] = 0
+    torch.cumsum(row_counts, dim=0, out=indptr_src[1:])
+    indices_src = torch.nonzero(mask, as_tuple=False)[:, 1].to(torch.int32)
+    indptr = indptr_src.to(device=device)
+    indices = indices_src.to(device=device)
     total_blocks = float(blocks * blocks)
-    allowed_blocks = float(block_mask.sum().item())
+    allowed_blocks = float(indices_src.numel())
     sparsity_ratio = 1.0 - (allowed_blocks / total_blocks)
     return indptr, indices, sparsity_ratio

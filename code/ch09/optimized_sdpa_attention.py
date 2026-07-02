@@ -74,6 +74,7 @@ class OptimizedSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.key = None
         self.value = None
         self.output = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         
         # SDPA benchmark - fixed dimensions for attention comparison
         
@@ -96,13 +97,14 @@ class OptimizedSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.query = torch.randn(shape, device=self.device, dtype=torch.float16)
         self.key = torch.randn(shape, device=self.device, dtype=torch.float16)
         self.value = torch.randn(shape, device=self.device, dtype=torch.float16)
+        self._verify_output_buffer = torch.empty_like(self.query)
         
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
         """Fused SDPA: Single kernel, minimal HBM traffic."""
         with self._nvtx_range("optimized_sdpa_attention"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Force FlashAttention to avoid slow math fallback paths.
                 with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                     # This single call fuses Q@K^T, scale, softmax, attn@V
@@ -120,13 +122,16 @@ class OptimizedSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output before verification")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "query": self.query,
                 "key": self.key,
                 "value": self.value,
             },
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             parameter_count=0,
             precision_flags={
@@ -142,6 +147,8 @@ class OptimizedSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.query = None
         self.key = None
         self.value = None
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
@@ -182,4 +189,3 @@ class OptimizedSDPAAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedSDPAAttentionBenchmark()
-

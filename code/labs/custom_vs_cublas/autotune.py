@@ -12,13 +12,12 @@ How it works:
 4. Adapts to different matrix sizes (small vs large may prefer different kernels)
 """
 
-import torch
-import time
-from functools import lru_cache
-from typing import Dict, Tuple, Callable
-import hashlib
+import heapq
 import json
 import os
+from typing import Callable, Dict
+
+import torch
 
 # Import all kernel variants
 from tcgen05_loader import (
@@ -68,18 +67,24 @@ def _benchmark_kernel(fn: Callable, A: torch.Tensor, B: torch.Tensor,
     for _ in range(warmup):
         _ = fn(A, B)
     torch.cuda.synchronize()
-    
-    # Timed runs
-    times = []
+
+    # Timed runs: keep the k+1 smallest samples, whose max is the upper median.
+    target_heap_size = iters // 2 + 1
+    upper_median_heap = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
     for _ in range(iters):
-        start = time.perf_counter()
+        start_event.record(current_stream)
         _ = fn(A, B)
-        torch.cuda.synchronize()
-        times.append((time.perf_counter() - start) * 1000)
-    
-    # Return median
-    times.sort()
-    return times[len(times) // 2]
+        end_event.record(current_stream)
+        end_event.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event)
+        heapq.heappush(upper_median_heap, -elapsed_ms)
+        if len(upper_median_heap) > target_heap_size:
+            heapq.heappop(upper_median_heap)
+
+    return -upper_median_heap[0]
 
 
 # Available kernels with names (in order of progressive optimization)
@@ -216,4 +221,3 @@ if __name__ == "__main__":
     
     print("\nFinal cache:")
     show_cache()
-

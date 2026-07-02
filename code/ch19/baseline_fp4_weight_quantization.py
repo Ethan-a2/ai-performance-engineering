@@ -12,25 +12,53 @@ on every forward pass.
 
 from __future__ import annotations
 
-from pathlib import Path
+import math
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
-import math
 
+from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (
     BaseBenchmark,
     BenchmarkConfig,
     WorkloadMetadata,
 )
-from core.benchmark.verification_mixin import VerificationPayloadMixin
-
 
 # FP4 E2M1 representable values
 FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+FP4_SIGNED_VALUES = torch.cat((FP4_VALUES, -FP4_VALUES))
 FP4_MAX = 6.0
+_FP4_VALUES_CACHE: dict[torch.device, torch.Tensor] = {}
+_FP4_SIGNED_VALUES_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _fp4_values_for(device: torch.device) -> torch.Tensor:
+    if device.type == "cpu":
+        return FP4_VALUES
+    cached = _FP4_VALUES_CACHE.get(device)
+    if cached is None:
+        cached = FP4_VALUES.to(device=device)
+        _FP4_VALUES_CACHE[device] = cached
+    return cached
+
+
+def _fp4_signed_values_for(device: torch.device) -> torch.Tensor:
+    if device.type == "cpu":
+        return FP4_SIGNED_VALUES
+    cached = _FP4_SIGNED_VALUES_CACHE.get(device)
+    if cached is None:
+        cached = FP4_SIGNED_VALUES.to(device=device)
+        _FP4_SIGNED_VALUES_CACHE[device] = cached
+    return cached
+
+
+def _unpack_fp4_codes(packed_data: torch.Tensor) -> torch.Tensor:
+    unpacked = torch.empty(packed_data.numel() * 2, device=packed_data.device, dtype=torch.uint8)
+    torch.bitwise_right_shift(packed_data, 4, out=unpacked[0::2])
+    torch.bitwise_and(packed_data, 0x0F, out=unpacked[1::2])
+    return unpacked.long()
 
 
 def quantize_fp4_baseline(
@@ -42,22 +70,20 @@ def quantize_fp4_baseline(
     """
     device = tensor.device
     dtype = tensor.dtype
-    original_shape = tensor.shape
     
     # Flatten for quantization
     flat = tensor.flatten().float()
     
     # Per-tensor scale (baseline: no per-channel/block)
     absmax = flat.abs().max()
-    scale = absmax / FP4_MAX
-    scale = max(scale.item(), 1e-8)
+    scale = (absmax / FP4_MAX).clamp(min=1e-8)
     
     # Normalize to FP4 range
     normalized = flat / scale
     normalized = normalized.clamp(-FP4_MAX, FP4_MAX)
     
     # Quantize to nearest FP4 value (sequential loop - slow)
-    fp4_vals = FP4_VALUES.to(device)
+    fp4_vals = _fp4_values_for(device)
     abs_normalized = normalized.abs()
     
     # Find nearest FP4 value
@@ -77,7 +103,7 @@ def quantize_fp4_baseline(
     packed = (pairs[:, 0] << 4) | pairs[:, 1]
     
     # Return packed data and scalar scale
-    scale_tensor = torch.tensor([scale], dtype=dtype, device=device)
+    scale_tensor = scale.reshape(1).to(dtype=dtype, device=device)
     return packed.to(torch.uint8), scale_tensor
 
 
@@ -89,23 +115,16 @@ def dequantize_fp4_baseline(
 ) -> torch.Tensor:
     """Baseline FP4 dequantization - no caching."""
     device = packed_data.device
-    fp4_vals = FP4_VALUES.to(device)
+    signed_fp4_vals = _fp4_signed_values_for(device)
     
     # Unpack bytes
-    high = (packed_data >> 4) & 0x0F
-    low = packed_data & 0x0F
-    unpacked = torch.stack([high, low], dim=1).flatten()
+    unpacked = _unpack_fp4_codes(packed_data)
     
-    # Decode FP4
-    signs = (unpacked >> 3) & 0x01
-    indices = (unpacked & 0x07).long()
-    
-    # Get values
-    values = fp4_vals[indices]
-    values = torch.where(signs.bool(), -values, values)
+    # Decode FP4 directly from the packed sign+magnitude code.
+    values = signed_fp4_vals[unpacked]
     
     # Apply scale
-    dequantized = values * scale.item()
+    dequantized = values * scale.to(values.dtype)
     
     # Reshape to original
     n_orig = math.prod(original_shape)
@@ -167,7 +186,9 @@ class BaselineFP4Linear(nn.Module):
         else:
             weight = self._weight_fp16
         
-        return F.linear(x.to(weight.dtype), weight, self.bias)
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
+        return F.linear(x, weight, self.bias)
 
 
 class NaiveFP16MLP(nn.Module):
@@ -249,6 +270,7 @@ class BaselineFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBench
         self.d_ff = 8192
         
         self.input: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
         
         tokens = self.batch_size * self.seq_len
         self._workload = WorkloadMetadata(
@@ -280,6 +302,7 @@ class BaselineFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBench
         # Quantize weights to FP4
         self.model.quantize()
         self.model.eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         
         self.input = torch.randn(
             self.batch_size, self.seq_len, self.d_model,
@@ -287,7 +310,7 @@ class BaselineFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBench
         )
         
         # Warmup
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(5):
                 _ = self.model(self.input)
         
@@ -295,9 +318,9 @@ class BaselineFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBench
     def benchmark_fn(self) -> None:
         """Benchmark naive MLP."""
         with self._nvtx_range("baseline_naive_mlp"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 output = self.model(self.input)
-                self.output = output.detach()
+                self.output = output
         if self.output is None or self.input is None or self.model is None:
             raise RuntimeError("benchmark_fn() must produce output")
         dtype = self.output.dtype
@@ -309,7 +332,7 @@ class BaselineFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBench
             inputs={"input": self.input},
             output=self.output.float(),
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(0.5, 5.0),
             precision_flags={
                 "fp16": dtype == torch.float16,
@@ -352,7 +375,7 @@ class BaselineFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBench
         if self.input is None:
             return "Input not initialized"
         
-        with torch.no_grad():
+        with torch.inference_mode():
             output = self.model(self.input[:1, :32])
             if torch.isnan(output).any():
                 return "NaN in output"

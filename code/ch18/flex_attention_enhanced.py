@@ -18,8 +18,7 @@ import copy
 import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-import time
-from typing import Optional, Tuple
+from typing import Tuple
 
 from core.utils.compile_utils import enable_tf32, compile_model
 
@@ -103,7 +102,7 @@ class SlidingWindowCausalAttention(nn.Module):
     
     def forward(self, Q, K, V):
         B, H, T, D = Q.shape
-        block_mask = create_block_mask(self.mask_fn, B, H, T, T)
+        block_mask = create_block_mask(self.mask_fn, B, H, T, T, device=Q.device)
         return flex_attention(Q, K, V, block_mask=block_mask)
 
 
@@ -135,7 +134,7 @@ class LocalGlobalAttention(nn.Module):
     
     def forward(self, Q, K, V):
         B, H, T, D = Q.shape
-        block_mask = create_block_mask(self.mask_fn, B, H, T, T)
+        block_mask = create_block_mask(self.mask_fn, B, H, T, T, device=Q.device)
         return flex_attention(Q, K, V, block_mask=block_mask)
 
 
@@ -175,12 +174,14 @@ class DynamicSlidingWindowAttention(nn.Module):
 
         def _mask_fn(b, h, q_idx, kv_idx):
             # Different window per head
-            window_sizes = self.window_sizes_tensor.to(q_idx.device)
+            window_sizes = self.window_sizes_tensor
+            if window_sizes.device != q_idx.device:
+                window_sizes = window_sizes.to(q_idx.device)
             if isinstance(h, torch.Tensor):
                 idx = h.to(torch.long)
+                window_size = torch.take(window_sizes, idx)
             else:
-                idx = torch.tensor(h, device=q_idx.device, dtype=torch.long)
-            window_size = torch.take(window_sizes, idx)
+                window_size = window_sizes[int(h)]
             window = (q_idx - kv_idx).abs() <= window_size
             causal = q_idx >= kv_idx
             return causal & window
@@ -189,7 +190,7 @@ class DynamicSlidingWindowAttention(nn.Module):
     
     def forward(self, Q, K, V):
         B, H, T, D = Q.shape
-        block_mask = create_block_mask(self.mask_fn, B, H, T, T)
+        block_mask = create_block_mask(self.mask_fn, B, H, T, T, device=Q.device)
         return flex_attention(Q, K, V, block_mask=block_mask)
 
 
@@ -227,14 +228,18 @@ def benchmark_attention(
             _ = model(Q, K, V)
     torch.cuda.synchronize()
 
-    start = time.perf_counter()
+    count = max(num_iters, 1)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
     with torch.inference_mode():
-        for _ in range(num_iters):
+        current_stream = torch.cuda.current_stream(Q.device)
+        start.record(current_stream)
+        for _ in range(count):
             _ = model(Q, K, V)
-    torch.cuda.synchronize()
+        end.record(current_stream)
+    end.synchronize()
 
-    elapsed = time.perf_counter() - start
-    avg_time_ms = (elapsed / num_iters) * 1000
+    avg_time_ms = start.elapsed_time(end) / count
     print(f"  Average time: {avg_time_ms:.2f} ms")
 
     used_compiled = True

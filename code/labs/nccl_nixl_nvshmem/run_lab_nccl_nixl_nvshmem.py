@@ -16,6 +16,7 @@ if __package__ in {None, ""}:
 
 import torch
 
+from core.benchmark.utils import scalar_tensor_to_float
 from core.harness.benchmark_harness import lock_gpu_clocks
 from labs.nccl_nixl_nvshmem.baseline_tier_handoff import get_benchmark as get_baseline_benchmark
 from labs.nccl_nixl_nvshmem.comm_stack_common import (
@@ -35,21 +36,21 @@ def _measure(bench: Any, *, warmup: int, iterations: int) -> float:
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        timings = []
+        current_stream = torch.cuda.current_stream()
+        start.record(current_stream)
         for _ in range(max(iterations, 1)):
-            start.record()
             bench.benchmark_fn()
-            end.record()
-            torch.cuda.synchronize()
-            timings.append(start.elapsed_time(end))
-        return float(sum(timings) / len(timings))
+        end.record(current_stream)
+        end.synchronize()
+        return float(start.elapsed_time(end) / max(iterations, 1))
 
-    timings = []
-    for _ in range(max(iterations, 1)):
+    sample_count = max(iterations, 1)
+    total_ms = 0.0
+    for _ in range(sample_count):
         t0 = time.perf_counter()
         bench.benchmark_fn()
-        timings.append((time.perf_counter() - t0) * 1000.0)
-    return float(sum(timings) / len(timings))
+        total_ms += (time.perf_counter() - t0) * 1000.0
+    return float(total_ms / sample_count)
 
 
 def _run_compare(workload: TierHandoffWorkload, *, warmup: int, iterations: int) -> dict[str, Any]:
@@ -64,7 +65,9 @@ def _run_compare(workload: TierHandoffWorkload, *, warmup: int, iterations: int)
         optimized_ms = _measure(optimized, warmup=warmup, iterations=iterations)
         baseline_error = baseline.validate_result()
         optimized_error = optimized.validate_result()
-        max_abs_diff = float((baseline.output - optimized.output).abs().max().item())
+        max_abs_diff = scalar_tensor_to_float(
+            (baseline.output - optimized.output).abs().max()
+        )
         return {
             "workload": {
                 "total_blocks": workload.total_blocks,

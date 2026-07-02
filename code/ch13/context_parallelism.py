@@ -88,6 +88,63 @@ class RingAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        self._position_view_cache: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._causal_mask_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+        self._recv_k_buffers: list[torch.Tensor] = []
+        self._recv_v_buffers: list[torch.Tensor] = []
+
+    def _position_views_for(self, seq_shard: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (int(seq_shard), torch.device(device))
+        cached = self._position_view_cache.get(key)
+        if cached is None:
+            local_positions = torch.arange(seq_shard, device=device)
+            global_q = (self.rank * seq_shard + local_positions).view(1, 1, seq_shard, 1)
+            k_indices = local_positions.view(1, 1, 1, seq_shard)
+            cached = (global_q, k_indices)
+            self._position_view_cache[key] = cached
+        return cached
+
+    def _causal_mask_for(
+        self,
+        target_rank: int,
+        seq_shard: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (int(target_rank), int(seq_shard), torch.device(device))
+        cached = self._causal_mask_cache.get(key)
+        if cached is None:
+            global_q, k_indices = self._position_views_for(seq_shard, device)
+            global_k = int(target_rank) * int(seq_shard) + k_indices
+            cached = global_k > global_q
+            self._causal_mask_cache[key] = cached
+        return cached
+
+    def _recv_buffers_for(
+        self,
+        k_template: torch.Tensor,
+        v_template: torch.Tensor,
+        slot: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            len(self._recv_k_buffers) != 2
+            or len(self._recv_v_buffers) != 2
+            or self._recv_k_buffers[0].shape != k_template.shape
+            or self._recv_v_buffers[0].shape != v_template.shape
+            or self._recv_k_buffers[0].device != k_template.device
+            or self._recv_v_buffers[0].device != v_template.device
+            or self._recv_k_buffers[0].dtype != k_template.dtype
+            or self._recv_v_buffers[0].dtype != v_template.dtype
+        ):
+            self._recv_k_buffers = [
+                torch.empty(k_template.shape, device=k_template.device, dtype=k_template.dtype),
+                torch.empty(k_template.shape, device=k_template.device, dtype=k_template.dtype),
+            ]
+            self._recv_v_buffers = [
+                torch.empty(v_template.shape, device=v_template.device, dtype=v_template.dtype),
+                torch.empty(v_template.shape, device=v_template.device, dtype=v_template.dtype),
+            ]
+        recv_slot = int(slot) & 1
+        return self._recv_k_buffers[recv_slot], self._recv_v_buffers[recv_slot]
 
     def _ring_pass(
         self,
@@ -104,17 +161,13 @@ class RingAttention(nn.Module):
         global_max: Optional[torch.Tensor] = None
         global_sum: Optional[torch.Tensor] = None
 
-        global_q = (self.rank * seq_shard) + torch.arange(seq_shard, device=q.device)
-        global_q = global_q.view(1, 1, seq_shard, 1)
-        k_indices = torch.arange(seq_shard, device=q.device).view(1, 1, 1, seq_shard)
-
         for step in range(self.world_size):
             target_rank = (self.rank - step) % self.world_size
             scores = torch.matmul(q, k_current.transpose(-2, -1)) * self.scale
 
             if causal:
-                global_k = target_rank * seq_shard + k_indices
-                scores = scores.masked_fill(global_k > global_q, float("-inf"))
+                mask = self._causal_mask_for(target_rank, seq_shard, q.device)
+                scores.masked_fill_(mask, float("-inf"))
 
             local_max = scores.amax(dim=-1, keepdim=True)
             exp_scores = torch.exp(scores - local_max)
@@ -137,8 +190,7 @@ class RingAttention(nn.Module):
                 next_rank = (self.rank + 1) % self.world_size
                 prev_rank = (self.rank - 1) % self.world_size
 
-                k_recv = torch.empty_like(k_current)
-                v_recv = torch.empty_like(v_current)
+                k_recv, v_recv = self._recv_buffers_for(k_current, v_current, step & 1)
 
                 send_k = dist.isend(k_current.contiguous(), next_rank, group=self.process_group)
                 recv_k = dist.irecv(k_recv, prev_rank, group=self.process_group)
@@ -225,7 +277,7 @@ def main() -> None:
     x = torch.randn(args.batch_size, seq_shard, args.hidden_size, device=ctx.device, dtype=dtype)
     torch.cuda.synchronize(ctx.device)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for _ in range(args.warmup):
             y = x
             for layer in layers:

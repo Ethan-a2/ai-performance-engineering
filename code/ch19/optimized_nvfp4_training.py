@@ -7,7 +7,6 @@ which provides memory savings and potential speedups through reduced memory band
 from __future__ import annotations
 
 from functools import partial
-from pathlib import Path
 from typing import Optional, List
 
 import torch
@@ -18,6 +17,7 @@ from core.benchmark.verification import InputSignature, PrecisionFlags
 from core.common.device_utils import require_cuda_device
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 try:
     from transformer_engine.pytorch import Linear as TELinear
@@ -84,7 +84,9 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.inputs: List[torch.Tensor] = []
         self.targets: List[torch.Tensor] = []
+        self._micro_batch_pairs: List[tuple[torch.Tensor, torch.Tensor]] = []
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         
         # NVFP4 recipe with calibration
@@ -105,12 +107,16 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
             requests_per_iteration=float(self.micro_batches),
             tokens_per_iteration=float(tokens),
         )
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
 
     def setup(self) -> None:
         if not TE_AVAILABLE:
             raise RuntimeError(f"Transformer Engine not available: {TE_IMPORT_ERROR}")
 
         torch.manual_seed(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
 
         if not is_nvfp4_available() or self.nvfp4_recipe is None:
             raise RuntimeError("NVFP4 not available: ensure Blackwell GPU + Transformer Engine NVFP4 support")
@@ -126,6 +132,7 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         with quantized_model_init(enabled=True, recipe=self.active_recipe):
             self.model = nn.Sequential(*layers).to(self.device, dtype=torch.bfloat16)
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=3e-4, fused=True)
         
@@ -142,6 +149,7 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.targets = [
             torch.randn_like(self.inputs[0]) for _ in range(self.micro_batches)
         ]
+        self._micro_batch_pairs = list(zip(self.inputs, self.targets, strict=True))
         self._verify_input = torch.randn(
             self.batch_size,
             self.seq_len,
@@ -149,6 +157,7 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
             device=self.device,
             dtype=torch.bfloat16,
         )
+        self._verify_output_buffer = torch.empty_like(self._verify_input, dtype=torch.float32)
         
         # Calibration warmup (important for quantization)
         self._calibration_warmup()
@@ -161,14 +170,12 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         # Run several forward passes to calibrate quantization scales
         for _ in range(5):
-            for idx in range(self.micro_batches):
-                self._train_step(idx)
+            for inp, target in self._micro_batch_pairs:
+                self._train_step(inp, target)
         torch.cuda.synchronize()
 
-    def _train_step(self, idx: int) -> None:
+    def _train_step(self, inp: torch.Tensor, target: torch.Tensor) -> None:
         assert self.model is not None and self.optimizer is not None
-        inp = self.inputs[idx]
-        target = self.targets[idx]
 
         self.optimizer.zero_grad(set_to_none=True)
         with te_autocast(enabled=True, recipe=self.active_recipe):
@@ -178,36 +185,32 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.optimizer.step()
 
     def benchmark_fn(self) -> None:
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
+        with nvtx_range("nvfp4_training", enable=self._enable_nvtx):
+            for inp, target in self._micro_batch_pairs:
+                self._train_step(inp, target)
+        self.output = None
 
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range("nvfp4_training", enable=enable_nvtx):
-            for idx in range(self.micro_batches):
-                self._train_step(idx)
-        # Capture output AFTER benchmark for verification
+    def capture_verification_payload(self) -> None:
         if self._verify_input is None or self.model is None:
             raise RuntimeError("Verification input/model missing")
-        with torch.no_grad():
+        with torch.inference_mode():
             with te_autocast(enabled=True, recipe=self.active_recipe):
                 out = self.model(self._verify_input)
-            self.output = out.float().clone()
+            if self._verify_output_buffer is None:
+                raise RuntimeError("Verification output buffer missing")
+            self._verify_output_buffer.copy_(out)
+            self.output = self._verify_output_buffer
         precision_flags = {
             "fp16": False,
             "bf16": True,
             "fp8": False,
             "tf32": torch.backends.cuda.matmul.allow_tf32,
         }
-        self._payload_precision_flags = precision_flags
-
-    def capture_verification_payload(self) -> None:
-        precision_flags = self._payload_precision_flags
         self._set_verification_payload(
             inputs={"verify_input": self._verify_input},
             output=self.output,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags=precision_flags,
             output_tolerance=(0.5, 5.0),
         )
@@ -239,6 +242,10 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.optimizer = None
         self.inputs = []
         self.targets = []
+        self._micro_batch_pairs = []
+        self._verify_input = None
+        self._verify_output_buffer = None
+        self.output = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -269,4 +276,3 @@ class OptimizedNVFP4TrainingBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedNVFP4TrainingBenchmark()
-

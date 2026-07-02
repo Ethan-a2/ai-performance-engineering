@@ -16,11 +16,9 @@ guarantees.
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from typing import Optional, List, Tuple, Dict, Any
-import random
-import time
 
+from core.benchmark.utils import scalar_tensor_to_float
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (
     BaseBenchmark,
@@ -72,7 +70,7 @@ class ManualKernelVerifier:
                 ref_out = reference_fn(x)
                 
                 if not torch.allclose(kernel_out, ref_out, rtol=rtol, atol=atol):
-                    max_diff = (kernel_out - ref_out).abs().max().item()
+                    max_diff = scalar_tensor_to_float((kernel_out - ref_out).abs().max())
                     errors.append(f"Test {i}: max diff = {max_diff}")
             except Exception as e:
                 errors.append(f"Test {i}: Exception - {e}")
@@ -129,7 +127,7 @@ class ManualKernelVerifier:
                 
                 # Use looser tolerance for CUDA - parallel reduction has ~1e-3 variance
                 if not torch.allclose(kernel_out, ref_out, rtol=1e-3, atol=1e-3, equal_nan=True):
-                    max_diff = (kernel_out - ref_out).abs().max().item()
+                    max_diff = scalar_tensor_to_float((kernel_out - ref_out).abs().max())
                     errors.append(f"Edge case '{name}': max diff = {max_diff}")
             except Exception as e:
                 errors.append(f"Edge case '{name}': Exception - {e}")
@@ -171,7 +169,7 @@ class ManualKernelVerifier:
                 
                 # Use looser tolerance for CUDA - parallel reduction has ~1e-3 variance
                 if not torch.allclose(kernel_out, ref_out, rtol=1e-3, atol=1e-3):
-                    max_diff = (kernel_out - ref_out).abs().max().item()
+                    max_diff = scalar_tensor_to_float((kernel_out - ref_out).abs().max())
                     errors.append(f"Shape {shape}: max diff = {max_diff}")
             except Exception as e:
                 errors.append(f"Shape {shape}: Exception - {e}")
@@ -213,7 +211,14 @@ class BaselineKernelVerificationBenchmark(VerificationPayloadMixin, BaseBenchmar
             requests_per_iteration=1.0,
             tokens_per_iteration=float(self.shape[0] * self.shape[1]),
         )
-        self._verification_results: Dict[str, Any] = {}
+        self._random_test_result: Dict[str, Any] = {"passed": False, "errors": []}
+        self._edge_case_result: Dict[str, Any] = {"passed": False, "errors": []}
+        self._boundary_test_result: Dict[str, Any] = {"passed": False, "errors": []}
+        self._verification_results: Dict[str, Any] = {
+            "random_tests": self._random_test_result,
+            "edge_cases": self._edge_case_result,
+            "boundary_tests": self._boundary_test_result,
+        }
     
     def setup(self) -> None:
         """Setup: Initialize verifier and test functions."""
@@ -249,7 +254,7 @@ class BaselineKernelVerificationBenchmark(VerificationPayloadMixin, BaseBenchmar
         This runs the full manual verification workflow and measures
         the time and completeness of the approach.
         """
-        with self._nvtx_range("baseline_kernel_verification"):
+        with torch.inference_mode(), self._nvtx_range("baseline_kernel_verification"):
             # Run random tests
             random_pass, random_errors = self.verifier.random_test(
                 self.test_kernel, 
@@ -272,24 +277,25 @@ class BaselineKernelVerificationBenchmark(VerificationPayloadMixin, BaseBenchmar
                 base_shape=self.shape,
             )
             
-            self._verification_results = {
-                "random_tests": {"passed": random_pass, "errors": random_errors},
-                "edge_cases": {"passed": edge_pass, "errors": edge_errors},
-                "boundary_tests": {"passed": boundary_pass, "errors": boundary_errors},
-            }
+            self._random_test_result["passed"] = random_pass
+            self._random_test_result["errors"] = random_errors
+            self._edge_case_result["passed"] = edge_pass
+            self._edge_case_result["errors"] = edge_errors
+            self._boundary_test_result["passed"] = boundary_pass
+            self._boundary_test_result["errors"] = boundary_errors
 
             if self._verify_input is None:
                 raise RuntimeError("setup() must initialize verification input")
             if self.test_kernel is None:
                 raise RuntimeError("setup() must initialize test kernel")
-            self.output = self.test_kernel(self._verify_input)[:32, :32].contiguous()
+            self.output = self.test_kernel(self._verify_input)[:32, :32]
 
     def capture_verification_payload(self) -> None:
         if self._verify_input is None or self.output is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output,
+            output=self.output.contiguous(),
             batch_size=int(self.shape[0]),
             parameter_count=0,
             precision_flags={
@@ -347,4 +353,3 @@ class BaselineKernelVerificationBenchmark(VerificationPayloadMixin, BaseBenchmar
 def get_benchmark() -> BaseBenchmark:
     """Factory function for harness discovery."""
     return BaselineKernelVerificationBenchmark()
-

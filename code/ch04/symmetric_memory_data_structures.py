@@ -86,11 +86,10 @@ import datetime
 import hashlib
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 
 
 # ============================================================================
@@ -594,6 +593,19 @@ class LockFreeRingBuffer:
         if tail_handle is not None:
             self.tail_handle = tail_handle
             self.tail = tail_handle.buffer
+
+        self._head_tail_readback = torch.empty(
+            2, dtype=torch.int64, device=self.head.device
+        )
+
+    def _read_queue_pointer_pair(
+        self, first: torch.Tensor, second: torch.Tensor
+    ) -> tuple[int, int]:
+        readback = self._head_tail_readback
+        readback[0].copy_(first)
+        readback[1].copy_(second)
+        readback_host = readback.detach().cpu()
+        return int(readback_host[0]), int(readback_host[1])
     
     def enqueue(self, data: torch.Tensor) -> bool:
         """
@@ -604,12 +616,13 @@ class LockFreeRingBuffer:
         if data.numel() != self.element_size:
             raise ValueError(f"Data size mismatch: {data.numel()} vs {self.element_size}")
         
-        # Read current tail
-        current_tail = self.tail.item()
+        # Read current queue pointers in a single host transfer.
+        current_tail, current_head = self._read_queue_pointer_pair(
+            self.tail[0], self.head[0]
+        )
         next_tail = (current_tail + 1) % self.capacity
         
         # Check if full
-        current_head = self.head.item()
         if next_tail == current_head:
             return False  # Full
         
@@ -627,9 +640,10 @@ class LockFreeRingBuffer:
         
         Returns None if buffer is empty.
         """
-        # Read current head
-        current_head = self.head.item()
-        current_tail = self.tail.item()
+        # Read current queue pointers in a single host transfer.
+        current_head, current_tail = self._read_queue_pointer_pair(
+            self.head[0], self.tail[0]
+        )
         
         # Check if empty
         if current_head == current_tail:
@@ -646,8 +660,7 @@ class LockFreeRingBuffer:
     
     def size(self) -> int:
         """Get current number of elements in buffer."""
-        head = self.head.item()
-        tail = self.tail.item()
+        head, tail = self._read_queue_pointer_pair(self.head[0], self.tail[0])
         if tail >= head:
             return tail - head
         else:

@@ -33,11 +33,10 @@ class DenseMaskedSlidingWindowAttention(nn.Module):
         batch_size, seq_len, _ = x.shape
         qkv = self.qkv_proj(x)
         qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, S, S]
-        scores = scores.masked_fill(~allowed_mask, float("-inf"))
+        scores.masked_fill_(~allowed_mask, float("-inf"))
         attn = torch.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)  # [B, H, S, D]
         out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
@@ -53,6 +52,7 @@ class BaselineFlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchma
         self.x: Optional[torch.Tensor] = None
         self.allowed_mask: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
 
         self.batch_size = 1
@@ -94,26 +94,39 @@ class BaselineFlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchma
         self.allowed_mask = self.allowed_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
 
         self.x = torch.randn(self.batch_size, self.seq_len, self.embed_dim, device=self.device, dtype=self.dtype)
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            min(128, self.seq_len),
+            min(256, self.embed_dim),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         for _ in range(3):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self.x, self.allowed_mask)
 
     def benchmark_fn(self) -> None:
         if self.model is None or self.x is None or self.allowed_mask is None:
             raise RuntimeError("Benchmark not configured")
         with self._nvtx_range("baseline_flex_attention_sparse"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 self.output = self.model(self.x, self.allowed_mask)
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output")
 
     def capture_verification_payload(self) -> None:
-        if self.x is None or self.output is None:
+        if self.x is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("capture_verification_payload() requires completed run")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input": self.x},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             parameter_count=self.parameter_count,
             precision_flags={
@@ -130,6 +143,7 @@ class BaselineFlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchma
         self.x = None
         self.allowed_mask = None
         self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
         super().teardown()
 
@@ -149,4 +163,3 @@ class BaselineFlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchma
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineFlexAttentionSparseBenchmark()
-

@@ -27,6 +27,7 @@ ENGINE_PATH_ENV = "AISP_PHI35_MOE_ENGINE_PATH"
 PROMPT_TEXT = "Explain GPU kernel fusion in one sentence."
 _ACCELERATE_IMPORT_PATCHED = False
 VERIFICATION_TOKEN_PREFIX = 8
+_TOKEN_OFFSET_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
 _OPTIONAL_MODELOPT_PLUGIN_WARNING_PATTERNS: tuple[str, ...] = (
     r"Failed to import vllm plugin due to: .*You may ignore this warning if you do not need this plugin\.",
     r"Failed to import transformer[_ ]engine plugin due to: .*You may ignore this warning if you do not need this plugin\.",
@@ -235,7 +236,8 @@ def build_prompt_tokens(tokenizer, *, prompt_len: int, batch_size: int) -> Tuple
     encoded = encoded[:prompt_len]
     if not encoded:
         raise ValueError("Prompt encoding produced no tokens")
-    input_ids = torch.tensor([encoded] * batch_size, dtype=torch.long)
+    encoded_ids = torch.tensor(encoded, dtype=torch.long)
+    input_ids = encoded_ids.unsqueeze(0).expand(batch_size, -1).contiguous()
     # Keep prompt lengths identical across baseline and TRT-LLM by avoiding right-padding.
     attention_mask = torch.ones_like(input_ids, dtype=torch.long)
     return input_ids, attention_mask
@@ -245,6 +247,15 @@ def slice_logits(logits: torch.Tensor, vocab_slice: int) -> torch.Tensor:
     if logits.dim() != 2:
         raise ValueError("Expected logits of shape [batch, vocab]")
     return logits[:, :vocab_slice]
+
+
+def _token_offsets_for(max_new_tokens: int, device: torch.device) -> torch.Tensor:
+    key = (int(max_new_tokens), device)
+    cached = _TOKEN_OFFSET_CACHE.get(key)
+    if cached is None:
+        cached = torch.arange(max_new_tokens, device=device, dtype=torch.long)
+        _TOKEN_OFFSET_CACHE[key] = cached
+    return cached
 
 
 def slice_generated_token_ids(
@@ -281,28 +292,29 @@ def slice_generated_token_ids(
     if max_new_tokens <= 0:
         raise ValueError(f"max_new_tokens must be positive, got {max_new_tokens}")
 
-    rows = []
+    prompt_lengths_list = [int(prompt_len) for prompt_len in prompt_lengths]
     pad_value = int(pad_token_id)
-    for batch_idx, prompt_len in enumerate(prompt_lengths):
-        prompt_len = int(prompt_len)
+    for prompt_len in prompt_lengths_list:
         if prompt_len < 0 or prompt_len > output_ids.size(1):
             raise ValueError(
                 f"Prompt length {prompt_len} is out of bounds for output_ids shape "
                 f"{tuple(output_ids.shape)}"
             )
-        generated = output_ids[batch_idx, prompt_len:]
-        if generated.numel() > max_new_tokens:
-            generated = generated[:max_new_tokens]
-        elif generated.numel() < max_new_tokens:
-            pad = torch.full(
-                (max_new_tokens - generated.numel(),),
-                pad_value,
-                dtype=output_ids.dtype,
-                device=output_ids.device,
-            )
-            generated = torch.cat((generated, pad), dim=0)
-        rows.append(generated)
-    return torch.stack(rows, dim=0).contiguous()
+    if output_ids.size(1) == 0:
+        return torch.full(
+            (output_ids.size(0), max_new_tokens),
+            pad_value,
+            dtype=output_ids.dtype,
+            device=output_ids.device,
+        )
+
+    prompt_offsets = torch.tensor(prompt_lengths_list, device=output_ids.device, dtype=torch.long)
+    token_offsets = _token_offsets_for(max_new_tokens, output_ids.device)
+    gather_positions = prompt_offsets.unsqueeze(1) + token_offsets.unsqueeze(0)
+    valid_positions = gather_positions < output_ids.size(1)
+    gathered = output_ids.gather(1, gather_positions.clamp_max(output_ids.size(1) - 1))
+    gathered.masked_fill_(valid_positions.logical_not_(), pad_value)
+    return gathered.contiguous()
 
 
 def verification_token_prefix_length(max_new_tokens: int) -> int:

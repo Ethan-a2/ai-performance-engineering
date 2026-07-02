@@ -35,7 +35,7 @@ def time_kernel(fn, iters: int, warmup: int = 5) -> float:
     for _ in range(iters):
         fn()
     end.record()
-    torch.cuda.synchronize()
+    end.synchronize()
     return start.elapsed_time(end) / iters
 
 
@@ -62,10 +62,18 @@ def run_benchmark(
     extension.fused_kernel(x, bias, residual, out_fused, 1)
 
     expected = torch.relu(x + bias) + residual
-    max_abs_baseline = torch.max(torch.abs(out_baseline - expected)).item()
-    max_abs_fused = torch.max(torch.abs(out_fused - expected)).item()
-    l2_baseline = torch.norm(out_baseline - expected).item()
-    l2_fused = torch.norm(out_fused - expected).item()
+    baseline_error = out_baseline - expected
+    fused_error = out_fused - expected
+    error_stats = torch.empty(4, device=x.device, dtype=torch.float32)
+    error_stats[0].copy_(baseline_error.abs().amax())
+    error_stats[1].copy_(fused_error.abs().amax())
+    error_stats[2].copy_(torch.linalg.vector_norm(baseline_error))
+    error_stats[3].copy_(torch.linalg.vector_norm(fused_error))
+    error_stats_host = error_stats.detach().cpu()
+    max_abs_baseline = float(error_stats_host[0])
+    max_abs_fused = float(error_stats_host[1])
+    l2_baseline = float(error_stats_host[2])
+    l2_fused = float(error_stats_host[3])
 
     baseline_ms = time_kernel(
         lambda: extension.separate_kernels(x, bias, residual, tmp, out_baseline, iterations),

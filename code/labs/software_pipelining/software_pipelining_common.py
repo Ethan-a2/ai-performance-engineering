@@ -9,6 +9,7 @@ from typing import Any, Optional
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.benchmark.utils import scalar_tensor_to_float
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
 from labs.software_pipelining.software_pipelining_extension import (
     load_software_pipelining_extension,
@@ -88,6 +89,7 @@ class TilePipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._rhs: Optional[torch.Tensor] = None
         self._output: Optional[torch.Tensor] = None
         self._reference: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self._config = BenchmarkConfig(
             iterations=20,
             warmup=5,
@@ -161,7 +163,12 @@ class TilePipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
             self._lhs,
             self._rhs,
             self._workload.repeat_fmas,
-        ).detach().clone()
+        ).detach()
+        self._verify_output_buffer = torch.empty(
+            min(4096, self._workload.length),
+            device=self.device,
+            dtype=torch.float32,
+        )
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
@@ -171,11 +178,13 @@ class TilePipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
             self._output = self._runner(self._lhs, self._rhs, self._workload.repeat_fmas)
 
     def capture_verification_payload(self) -> None:
-        if self._lhs is None or self._rhs is None or self._output is None:
+        if self._lhs is None or self._rhs is None or self._output is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        output_slice = self._output[: self._verify_output_buffer.shape[0]]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"lhs": self._lhs, "rhs": self._rhs},
-            output=self._output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=1,
             precision_flags={"fp16": False, "bf16": False, "fp8": False, "tf32": False},
             output_tolerance=(1e-4, 2e-4),
@@ -186,7 +195,7 @@ class TilePipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
             return "benchmark_fn() did not produce output"
         if torch.isnan(self._output).any():
             return "NaNs detected in output tensor"
-        max_diff = (self._output - self._reference).abs().max().item()
+        max_diff = scalar_tensor_to_float((self._output - self._reference).abs().max())
         if max_diff > 5e-4:
             return f"Max abs diff {max_diff:.6f} exceeds tolerance 5e-4"
         return None
@@ -196,6 +205,7 @@ class TilePipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._rhs = None
         self._output = None
         self._reference = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

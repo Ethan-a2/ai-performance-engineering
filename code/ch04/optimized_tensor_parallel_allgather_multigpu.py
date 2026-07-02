@@ -89,6 +89,18 @@ def _build_layers(hidden: int, hidden_per_rank: int, num_layers: int, device: to
     return shard, proj, aux
 
 
+def _replicate_tensor_parallel_shard(
+    local_out: torch.Tensor,
+    world_size: int,
+    full_out: torch.Tensor,
+) -> torch.Tensor:
+    hidden_per_rank = local_out.shape[-1]
+    full_out.view(*local_out.shape[:-1], world_size, hidden_per_rank).copy_(
+        local_out.unsqueeze(-2)
+    )
+    return full_out
+
+
 def _run_worker(
     iters: int,
     warmup: int,
@@ -115,31 +127,30 @@ def _run_worker(
         for _ in range(world_size)
     ]
     full_out = torch.empty(batch, seq_length, hidden, device=device, dtype=torch.bfloat16)
-    shard_slices = [
-        slice(rank_idx * hidden_per_rank, (rank_idx + 1) * hidden_per_rank)
-        for rank_idx in range(world_size)
-    ]
+    layer_range = range(num_layers)
+    aux_pass_range = range(_AUX_PASSES)
     def _step() -> None:
         x = inputs
-        for layer_idx in range(num_layers):
+        for layer_idx in layer_range:
             local_out = shard_layers[layer_idx](x)
             dist.all_gather(gather_list, local_out)
             aux_out = x
-            for _ in range(_AUX_PASSES):
+            for _ in aux_pass_range:
                 aux_out = aux_layers[layer_idx](aux_out)
-            for rank_idx, shard_slice in enumerate(shard_slices):
-                full_out[..., shard_slice].copy_(gather_list[rank_idx])
+            torch.cat(gather_list, dim=-1, out=full_out)
             proj_out = proj_layers[layer_idx](full_out)
-            x = proj_out + aux_out
+            proj_out.add_(aux_out)
+            x = proj_out
 
-    for _ in range(max(warmup, 0)):
-        _step()
-    torch.cuda.synchronize(device)
+    with torch.inference_mode():
+        for _ in range(max(warmup, 0)):
+            _step()
+        torch.cuda.synchronize(device)
 
-    start = time.perf_counter()
-    for _ in range(max(iters, 1)):
-        _step()
-    torch.cuda.synchronize(device)
+        start = time.perf_counter()
+        for _ in range(max(iters, 1)):
+            _step()
+        torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start
 
     tokens_per_iter = batch * seq_length
@@ -190,9 +201,13 @@ class OptimizedTensorParallelAllGatherBenchmark(VerificationPayloadMixin, BaseBe
         self._aux_layers: Optional[nn.ModuleList] = None
         self._input: Optional[torch.Tensor] = None
         self._output: Optional[torch.Tensor] = None
+        self._full_out: Optional[torch.Tensor] = None
         self._world_size = 1
         self._hidden = _DEFAULT_HIDDEN
         self._hidden_per_rank = _DEFAULT_HIDDEN
+        self._payload_parameter_count = 0
+        self._layer_range = range(_DEFAULT_LAYERS)
+        self._aux_pass_range = range(_AUX_PASSES)
 
     def setup(self) -> None:
         require_min_gpus(2, "optimized_tensor_parallel_allgather_multigpu.py")
@@ -207,7 +222,19 @@ class OptimizedTensorParallelAllGatherBenchmark(VerificationPayloadMixin, BaseBe
             _DEFAULT_LAYERS,
             self.device,
         )
+        self._payload_parameter_count = sum(
+            p.numel()
+            for module in (self._shard_layers, self._proj_layers, self._aux_layers)
+            for p in module.parameters()
+        )
         self._input = torch.randn(
+            _DEFAULT_BATCH,
+            _DEFAULT_SEQ,
+            self._hidden,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        self._full_out = torch.empty(
             _DEFAULT_BATCH,
             _DEFAULT_SEQ,
             self._hidden,
@@ -216,32 +243,34 @@ class OptimizedTensorParallelAllGatherBenchmark(VerificationPayloadMixin, BaseBe
         )
 
     def benchmark_fn(self) -> None:
-        if self._input is None or self._shard_layers is None or self._proj_layers is None or self._aux_layers is None:
+        if (
+            self._input is None
+            or self._shard_layers is None
+            or self._proj_layers is None
+            or self._aux_layers is None
+            or self._full_out is None
+        ):
             raise RuntimeError("setup() must run before benchmark_fn()")
         x = self._input
-        for layer_idx in range(_DEFAULT_LAYERS):
+        for layer_idx in self._layer_range:
             local_out = self._shard_layers[layer_idx](x)
-            full_out = torch.cat([local_out] * self._world_size, dim=-1)
+            _replicate_tensor_parallel_shard(local_out, self._world_size, self._full_out)
             aux_out = x
-            for _ in range(_AUX_PASSES):
+            for _ in self._aux_pass_range:
                 aux_out = self._aux_layers[layer_idx](aux_out)
-            proj_out = self._proj_layers[layer_idx](full_out)
-            x = proj_out + aux_out
+            proj_out = self._proj_layers[layer_idx](self._full_out)
+            proj_out.add_(aux_out)
+            x = proj_out
         self._output = x
 
     def capture_verification_payload(self) -> None:
         if self._output is None or self._input is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
-        param_count = sum(
-            p.numel()
-            for module in (self._shard_layers, self._proj_layers, self._aux_layers)
-            for p in module.parameters()
-        )
         self._set_verification_payload(
             inputs={"input": self._input},
             output=self._output,
             batch_size=_DEFAULT_BATCH,
-            parameter_count=int(param_count),
+            parameter_count=self._payload_parameter_count,
             precision_flags=PrecisionFlags(bf16=True, tf32=False),
             output_tolerance=(0.1, 1.0),
             signature_overrides={
@@ -269,6 +298,7 @@ class OptimizedTensorParallelAllGatherBenchmark(VerificationPayloadMixin, BaseBe
         self._aux_layers = None
         self._input = None
         self._output = None
+        self._full_out = None
         torch.cuda.empty_cache()
 
     def validate_result(self) -> Optional[str]:
@@ -302,4 +332,3 @@ class OptimizedTensorParallelAllGatherBenchmark(VerificationPayloadMixin, BaseBe
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedTensorParallelAllGatherBenchmark()
-

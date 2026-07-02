@@ -60,11 +60,16 @@ class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params: list[Tensor] = [*params]
+        groups_by_size = {}
+        for p in params:
+            groups_by_size.setdefault(p.numel(), []).append(p)
         param_groups = []
-        for size in {p.numel() for p in params}:
-            group = dict(params=[p for p in params if p.numel() == size])
-            param_groups.append(group)
+        for size in sorted(groups_by_size):
+            param_groups.append(dict(params=groups_by_size[size]))
         super().__init__(param_groups, defaults)
+        for group in self.param_groups:
+            for p in group["params"]:
+                self.state[p]["momentum_buffer"] = torch.zeros_like(p)
 
     @torch.no_grad()
     def step(self):
@@ -74,8 +79,6 @@ class Muon(torch.optim.Optimizer):
                 g = p.grad
                 assert g is not None
                 state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
                 buf: Tensor = state["momentum_buffer"]
                 buf.lerp_(g, 1 - group["momentum"])
                 g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
@@ -111,17 +114,35 @@ class DistMuon(torch.optim.Optimizer):
         assert all(p.ndim == 2 for p in params), "Muon expects 2D parameters only"
         rank = dist.get_rank()
         # Group all parameters by their shape
-        shapes = sorted({p.shape for p in params}) # sort to ensure consistent / deterministic ordering
+        groups_by_shape = {}
+        for p in params:
+            groups_by_shape.setdefault(p.shape, []).append(p)
         param_groups = []
-        for shape in shapes:
-            group_params = [p for p in params if p.shape == shape]
+        world_size = dist.get_world_size()
+        for shape in sorted(groups_by_shape): # sort to ensure consistent / deterministic ordering
+            group_params = groups_by_shape[shape]
             device, dtype = group_params[0].device, group_params[0].dtype
             assert all(p.device == device for p in group_params)
             assert all(p.dtype == dtype for p in group_params)
             if rank == 0:
                 print(f"Muon: Grouping {len(group_params)} params of shape {shape}, device {device}, dtype {dtype}")
-            param_groups.append(dict(params=group_params, zero_buffer=torch.zeros_like(group_params[0])))
+            param_groups.append(dict(
+                params=group_params,
+                zero_buffer=torch.zeros_like(group_params[0]),
+                scatter_pad_buffer=torch.empty_like(group_params[0]),
+                gather_pad_buffers=[
+                    torch.empty_like(group_params[0])
+                    for _ in range(world_size - 1)
+                ],
+            ))
         super().__init__(param_groups, defaults)
+        for group in self.param_groups:
+            params = group["params"]
+            for base_i in range(0, len(params), world_size):
+                owner_idx = base_i + rank
+                if owner_idx < len(params):
+                    p = params[owner_idx]
+                    self.state[p]["momentum_buffer"] = torch.zeros_like(p)
 
     @torch.no_grad()
     def step(self):
@@ -136,6 +157,7 @@ class DistMuon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             zero_buffer = group["zero_buffer"]
+            scatter_pad_buffer = group["scatter_pad_buffer"]
             # Go through params in groups of world_size.
             for base_i in range(0, len(params), world_size):
                 # The compute owner of each param is rank i % world_size
@@ -145,7 +167,7 @@ class DistMuon(torch.optim.Optimizer):
                 # pad rs_input with the zero buffer to complete the group
                 rs_input.extend([zero_buffer] * (world_size - len(rs_input)))
                 # the output buffer gets strided across the group based on the rank
-                rs_output = params[owner_idx].grad if owner_idx < len(params) else torch.empty_like(zero_buffer)
+                rs_output = params[owner_idx].grad if owner_idx < len(params) else scatter_pad_buffer
                 # reduce scatter the gradients within this group of world_size params
                 work = dist.reduce_scatter(rs_output, rs_input, op=dist.ReduceOp.AVG, async_op=True).get_future()
                 all_reduce_futures.append(work)
@@ -156,6 +178,7 @@ class DistMuon(torch.optim.Optimizer):
         for group in self.param_groups:
             params = group["params"]
             zero_buffer = group["zero_buffer"]
+            gather_pad_buffers = group["gather_pad_buffers"]
             # Go through params in groups of world_size.
             for base_i in range(0, len(params), world_size):
                 # The compute owner of each param is rank i % world_size
@@ -168,8 +191,6 @@ class DistMuon(torch.optim.Optimizer):
                     p = params[owner_idx]
                     g = p.grad  # now averaged across ranks
                     state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
                     buf: Tensor = state["momentum_buffer"]
                     buf.lerp_(g, 1.0 - group["momentum"])
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
@@ -179,7 +200,9 @@ class DistMuon(torch.optim.Optimizer):
                 # Replicate updated parameters to all ranks
                 ag_input = params[owner_idx] if owner_idx < len(params) else zero_buffer
                 ag_output = params[base_i:base_i + world_size]
-                ag_output.extend([torch.empty_like(zero_buffer) for _ in range(world_size - len(ag_output))]) # pad
+                missing = world_size - len(ag_output)
+                if missing:
+                    ag_output.extend(gather_pad_buffers[:missing]) # pad
                 work = dist.all_gather(ag_output, ag_input, async_op=True).get_future()
                 all_gather_futures.append(work)
 

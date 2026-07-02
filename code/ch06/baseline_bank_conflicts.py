@@ -22,6 +22,7 @@ class BaselineBankConflictsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.N = 8_000_000
         self._extension = None
         self.repeats = 8
+        self._repeat_range = range(self.repeats)
         # Bank conflicts benchmark - fixed input size to demonstrate shared memory patterns
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.repeats),
@@ -44,8 +45,8 @@ class BaselineBankConflictsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         """Benchmark: access pattern causing bank conflicts."""
         assert self._extension is not None and self.input is not None
         assert self._output_buffer is not None and self._output_buffer.shape == self.input.shape
-        with self._nvtx_range("bank_conflicts_baseline"):
-            for _ in range(self.repeats):
+        with torch.inference_mode(), self._nvtx_range("bank_conflicts_baseline"):
+            for _ in self._repeat_range:
                 self._extension.bank_conflicts(self._output_buffer, self.input)
             self.output = self._output_buffer
 

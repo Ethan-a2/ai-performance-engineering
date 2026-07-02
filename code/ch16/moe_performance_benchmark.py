@@ -17,11 +17,12 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from core.optimization.moe_inference import MoEFeedForwardSortedDispatch
 
 
 @dataclass
@@ -51,35 +52,14 @@ class ExpertMLP(nn.Module):
         return self.net(x)
 
 
-class MoEFeedForward(nn.Module):
+class MoEFeedForward(MoEFeedForwardSortedDispatch):
     def __init__(self, config: MoEConfig) -> None:
-        super().__init__()
-        self.num_experts = config.num_experts
-        self.top_k = config.top_k
-        self.d_model = config.d_model
-        self.gate = nn.Linear(config.d_model, config.num_experts)
-        self.experts = nn.ModuleList([ExpertMLP(config.d_model, config.d_ff) for _ in range(config.num_experts)])
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch, seq, hidden]
-        batch, seq, hidden = x.shape
-        flat = x.view(batch * seq, hidden)
-        logits = self.gate(flat)
-        scores = F.softmax(logits, dim=-1)
-        top_scores, top_indices = torch.topk(scores, k=self.top_k, dim=-1)
-
-        output = torch.zeros_like(flat)
-        for k in range(self.top_k):
-            expert_ids = top_indices[:, k]
-            weights = top_scores[:, k].unsqueeze(-1)
-            for expert_id, expert in enumerate(self.experts):
-                mask = expert_ids == expert_id
-                if mask.any():
-                    expert_input = flat[mask]
-                    expert_out = expert(expert_input)
-                    output[mask] += expert_out * weights[mask]
-
-        return output.view(batch, seq, hidden)
+        super().__init__(
+            hidden=config.d_model,
+            ffn=config.d_ff,
+            num_experts=config.num_experts,
+            top_k=config.top_k,
+        )
 
 
 class DenseFeedForward(nn.Module):
@@ -158,12 +138,21 @@ def benchmark_model(
     if input_ids.device.type == "cuda":
         torch.cuda.synchronize(input_ids.device)
 
-    start = time.time()
-    for _ in range(iters):
-        _ = model(input_ids)
     if input_ids.device.type == "cuda":
-        torch.cuda.synchronize(input_ids.device)
-    elapsed = time.time() - start
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream(input_ids.device)
+        start_event.record(current_stream)
+        for _ in range(iters):
+            _ = model(input_ids)
+        end_event.record(current_stream)
+        end_event.synchronize()
+        elapsed = start_event.elapsed_time(end_event) / 1000.0
+    else:
+        start = time.perf_counter()
+        for _ in range(iters):
+            _ = model(input_ids)
+        elapsed = time.perf_counter() - start
 
     avg_ms = (elapsed / iters) * 1000.0
     tokens = input_ids.numel()

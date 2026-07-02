@@ -216,14 +216,12 @@ class _VllmWrapper:
             if rt is None:
                 continue
             # Detect first token
-            if rt.ttft_ms is None and ro.outputs:
-                total_tokens = sum(len(o.token_ids) for o in ro.outputs)
-                if total_tokens > 0:
+            if ro.outputs:
+                output_token_count = sum(len(o.token_ids) for o in ro.outputs)
+                if rt.ttft_ms is None and output_token_count > 0:
                     rt.ttft_ms = (now - rt.admitted_at) * 1000.0
                     ttft_samples.append((rid, rt.ttft_ms))
-            # Track tokens
-            if ro.outputs:
-                tokens_emitted += sum(len(o.token_ids) for o in ro.outputs)
+                tokens_emitted += output_token_count
             if ro.finished:
                 finished_ids.append(rid)
                 rt.finished = True
@@ -338,14 +336,21 @@ class _VllmV1Wrapper(_VllmWrapper):
                     rt = self._inflight.get(rid)
                     if rt is None:
                         continue
-                    if rt.ttft_ms is None and getattr(ro, "outputs", None):
-                        total_tokens = sum(len(o.token_ids) for o in ro.outputs)
-                        if total_tokens > 0:
+                    try:
+                        ro_outputs = ro.outputs
+                    except AttributeError:
+                        ro_outputs = None
+                    if ro_outputs:
+                        output_token_count = sum(len(o.token_ids) for o in ro_outputs)
+                        if rt.ttft_ms is None and output_token_count > 0:
                             rt.ttft_ms = (now - rt.admitted_at) * 1000.0
                             ttft_samples.append((rid, rt.ttft_ms))
-                    if getattr(ro, "outputs", None):
-                        tokens_emitted += sum(len(o.token_ids) for o in ro.outputs)
-                    if getattr(ro, "finished", False):
+                        tokens_emitted += output_token_count
+                    try:
+                        is_finished = ro.finished
+                    except AttributeError:
+                        is_finished = False
+                    if is_finished:
                         finished_ids.append(rid)
                         rt.finished = True
                         self._inflight.pop(rid, None)
@@ -381,11 +386,8 @@ def _parse_device_list(raw: Optional[str], default: str, max_device: int) -> Lis
     return sorted(set(ids))
 
 
-def _percentile(data: List[float], pct: float) -> float:
-    if not data:
-        return 0.0
+def _percentile_from_ordered(data_sorted: List[float], pct: float) -> float:
     assert 0.0 <= pct <= 100.0
-    data_sorted = sorted(data)
     k = (len(data_sorted) - 1) * (pct / 100.0)
     f = int(k // 1)
     c = int(k // 1 + 1)
@@ -396,10 +398,18 @@ def _percentile(data: List[float], pct: float) -> float:
     return d0 + d1
 
 
-def _mean(data: List[float]) -> float:
+def _percentile(data: List[float], pct: float) -> float:
     if not data:
         return 0.0
-    return float(sum(data) / len(data))
+    data.sort()
+    return _percentile_from_ordered(data, pct)
+
+
+def _percentiles(data: List[float], pcts: Tuple[float, ...]) -> Tuple[float, ...]:
+    if not data:
+        return tuple(0.0 for _ in pcts)
+    data.sort()
+    return tuple(_percentile_from_ordered(data, pct) for pct in pcts)
 
 
 def _build_handles(
@@ -475,11 +485,12 @@ def run_vllm_routing_with_topology(
                 numa_node=gpu_numa.get(int(gid.replace("gpu", ""))),
             )
 
-    requests: Dict[str, _RequestRuntime] = {}
     ttft_samples: List[float] = []
+    ttft_total_ms = 0.0
     completed = 0
     tpot_ema: Dict[str, float] = {gid: 0.0 for gid in engines}
     alpha = 0.3
+    engine_ids = tuple(engines)
 
     # Submit all requests up front
     for i in range(req_count_val):
@@ -490,10 +501,9 @@ def run_vllm_routing_with_topology(
             # Round-trip through Router for placement
             gid = router.choose_prefill_gpu() or "gpu0"
         else:
-            gid = list(engines.keys())[i % len(engines)]
+            gid = engine_ids[i % len(engine_ids)]
         rt = _RequestRuntime(req=req, gpu_id=gid, admitted_at=admitted)
         engines[gid].add_request(rt)
-        requests[rid] = rt
 
     active = True
     while active:
@@ -503,8 +513,11 @@ def run_vllm_routing_with_topology(
             finished_ids, ttft_new, tokens = eng.step(now)
             if finished_ids or eng.queue_depth() > 0:
                 active = True
+            completed += len(finished_ids)
             if ttft_new:
-                ttft_samples.extend([sample for _, sample in ttft_new])
+                for _, sample in ttft_new:
+                    ttft_samples.append(sample)
+                    ttft_total_ms += sample
             # Update simple TPOT EMA
             if tokens > 0:
                 tpot_ema[gid] = alpha * (tokens) + (1.0 - alpha) * tpot_ema[gid]
@@ -512,8 +525,6 @@ def run_vllm_routing_with_topology(
             if router:
                 router.update_metrics(gid, eng.snapshot_metrics(ttft_ema=tpot_ema[gid], tpot_ema=tpot_ema[gid]))
         time.sleep(0.01)
-        # Count completed
-        completed = sum(1 for r in requests.values() if r.finished)
         if completed >= req_count_val:
             break
 
@@ -521,14 +532,9 @@ def run_vllm_routing_with_topology(
         "mode": mode,
         "requests": req_count_val,
         "completed": completed,
-        "ttft_ms_mean": float(sum(ttft_samples) / len(ttft_samples)) if ttft_samples else 0.0,
+        "ttft_ms_mean": float(ttft_total_ms / len(ttft_samples)) if ttft_samples else 0.0,
     }
-    if ttft_samples:
-        summary["ttft_ms_p50"] = _percentile(ttft_samples, 50.0)
-        summary["ttft_ms_p95"] = _percentile(ttft_samples, 95.0)
-    else:
-        summary["ttft_ms_p50"] = 0.0
-        summary["ttft_ms_p95"] = 0.0
+    summary["ttft_ms_p50"], summary["ttft_ms_p95"] = _percentiles(ttft_samples, (50.0, 95.0))
     for gid in engines:
         summary[f"tpot_tok_per_step_{gid}"] = tpot_ema[gid]
     return summary
@@ -657,7 +663,6 @@ def run_dual_pool_vllm_with_topology(
 
     prefill_pool_ids = [h.gpu_id for h in prefill_handles]
     decode_pool_ids = [h.gpu_id for h in decode_handles]
-    prefill_numa_hint = prefill_handles[0].numa_node if prefill_handles else None
     decode_numa_hint = decode_handles[0].numa_node if decode_handles else None
 
     requests: Dict[str, _RequestRuntime] = {}
@@ -690,7 +695,8 @@ def run_dual_pool_vllm_with_topology(
 
     ttft_samples: List[float] = []
     pool_ttft: Dict[str, List[float]] = {"prefill": [], "decode": []}
-    queue_samples: Dict[str, List[float]] = {"prefill": [], "decode": []}
+    queue_depth_totals: Dict[str, float] = {"prefill": 0.0, "decode": 0.0}
+    queue_depth_counts: Dict[str, int] = {"prefill": 0, "decode": 0}
     completed: Set[str] = set()
     alpha = 0.3
     ttft_ema: Dict[str, float] = {h.gpu_id: 0.0 for h in handles}
@@ -719,14 +725,20 @@ def run_dual_pool_vllm_with_topology(
             )
             qd = eng.queue_depth()
             if handle.is_prefill:
-                queue_samples["prefill"].append(float(qd))
+                queue_depth_totals["prefill"] += float(qd)
+                queue_depth_counts["prefill"] += 1
             if handle.is_decode:
-                queue_samples["decode"].append(float(qd))
+                queue_depth_totals["decode"] += float(qd)
+                queue_depth_counts["decode"] += 1
             for rid in finished_ids:
                 completed.add(rid)
         time.sleep(0.01)
         if len(completed) >= len(req_roles):
             break
+
+    ttft_p50, ttft_p95 = _percentiles(ttft_samples, (50.0, 95.0))
+    prefill_ttft_p50, prefill_ttft_p95 = _percentiles(pool_ttft["prefill"], (50.0, 95.0))
+    decode_ttft_p50, decode_ttft_p95 = _percentiles(pool_ttft["decode"], (50.0, 95.0))
 
     summary: Dict[str, float] = {
         "mode": normalized_mode,
@@ -734,14 +746,22 @@ def run_dual_pool_vllm_with_topology(
         "completed": len(completed),
         "prefill_gpu_count": len(prefill_ids),
         "decode_gpu_count": len(decode_ids),
-        "ttft_ms_p50": _percentile(ttft_samples, 50.0),
-        "ttft_ms_p95": _percentile(ttft_samples, 95.0),
-        "prefill_ttft_ms_p50": _percentile(pool_ttft["prefill"], 50.0),
-        "prefill_ttft_ms_p95": _percentile(pool_ttft["prefill"], 95.0),
-        "decode_ttft_ms_p50": _percentile(pool_ttft["decode"], 50.0),
-        "decode_ttft_ms_p95": _percentile(pool_ttft["decode"], 95.0),
-        "queue_depth_prefill_mean": _mean(queue_samples["prefill"]),
-        "queue_depth_decode_mean": _mean(queue_samples["decode"]),
+        "ttft_ms_p50": ttft_p50,
+        "ttft_ms_p95": ttft_p95,
+        "prefill_ttft_ms_p50": prefill_ttft_p50,
+        "prefill_ttft_ms_p95": prefill_ttft_p95,
+        "decode_ttft_ms_p50": decode_ttft_p50,
+        "decode_ttft_ms_p95": decode_ttft_p95,
+        "queue_depth_prefill_mean": (
+            queue_depth_totals["prefill"] / queue_depth_counts["prefill"]
+            if queue_depth_counts["prefill"]
+            else 0.0
+        ),
+        "queue_depth_decode_mean": (
+            queue_depth_totals["decode"] / queue_depth_counts["decode"]
+            if queue_depth_counts["decode"]
+            else 0.0
+        ),
         "long_prompt_tokens": float(long_prompt_tokens),
         "short_prompt_tokens": float(short_prompt_tokens),
         "prefill_burst": float(prefill_burst),

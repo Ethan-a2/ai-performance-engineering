@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -17,8 +16,8 @@ from ch18.cudagraph_bucketing_common import (  # noqa: E402
     load_vllm_config,
     pad_fn_from_vllm_config,
 )
-from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig  # noqa: E402
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig  # noqa: E402
 
 
 class BaselineCUDAGraphBucketing:
@@ -38,17 +37,21 @@ class BaselineCUDAGraphBucketing:
         self.traffic = list(traffic) if traffic is not None else demo_traffic()
         self.vllm_model = vllm_model
         self.use_vllm_bins = use_vllm_bins
+        self._vllm_config = load_vllm_config(vllm_model) if use_vllm_bins else None
+        self._capture_bins = (
+            capture_bins_from_vllm_config(self._vllm_config)
+            if self._vllm_config
+            else DEFAULT_CAPTURE_BATCH_SIZES
+        )
+        self._pad_fn = pad_fn_from_vllm_config(self._vllm_config) if self._vllm_config else None
 
     def build_simulator(self) -> GraphTreeSimulator:
         bands = BucketBands(batch_buckets=[], seqlen_buckets=[])
-        vllm_config = load_vllm_config(self.vllm_model) if self.use_vllm_bins else None
-        capture_bins = capture_bins_from_vllm_config(vllm_config) if vllm_config else DEFAULT_CAPTURE_BATCH_SIZES
-        pad_fn = pad_fn_from_vllm_config(vllm_config) if vllm_config else None
         return GraphTreeSimulator(
             bucket_bands=bands,
-            capture_batch_sizes=capture_bins,
+            capture_batch_sizes=self._capture_bins,
             name="baseline_cudagraphs",
-            pad_fn=pad_fn,
+            pad_fn=self._pad_fn,
             # Model expensive graph capture vs cheap replay.
             capture_cost_iters=5000,
         )
@@ -91,8 +94,15 @@ class BaselineCUDAGraphBucketingBenchmark(VerificationPayloadMixin, BaseBenchmar
         self.use_vllm_bins = True
         self._last = None
         self.output: Optional[torch.Tensor] = None
+        self._baseline_runner: Optional[BaselineCUDAGraphBucketing] = None
+        self._output_values: Optional[list[float]] = None
+        self._payload_traffic: list[Tuple[int, int]] = []
+        self._payload_output_values: list[float] = []
+        self._output_tensor: Optional[torch.Tensor] = None
+        self._traffic_shape_tensor: Optional[torch.Tensor] = None
         self._verification_payload = None
         self.register_workload_metadata(requests_per_iteration=1.0)
+        self._refresh_payload_metadata()
 
     def _resolve_device(self) -> torch.device:
         # Simulator is CPU-only.
@@ -107,27 +117,55 @@ class BaselineCUDAGraphBucketingBenchmark(VerificationPayloadMixin, BaseBenchmar
         except SystemExit:
             # Ignore parse errors in override path.
             pass
+        self._refresh_payload_metadata()
 
-    def benchmark_fn(self) -> None:
-        runner = BaselineCUDAGraphBucketing(
+    def _refresh_payload_metadata(self) -> None:
+        traffic = demo_traffic()
+        total_tokens = sum(batch * seqlen for batch, seqlen in traffic)
+        self._payload_traffic = traffic
+        self._payload_output_values = [float(len(traffic)), float(total_tokens)]
+        self._baseline_runner = None
+        self._output_tensor = None
+        self._traffic_shape_tensor = None
+
+    def _build_baseline_runner(self) -> BaselineCUDAGraphBucketing:
+        return BaselineCUDAGraphBucketing(
+            traffic=self._payload_traffic,
             vllm_model=self.vllm_model,
             use_vllm_bins=self.use_vllm_bins,
         )
+
+    def _baseline_simulator_runner(self) -> BaselineCUDAGraphBucketing:
+        runner = self._baseline_runner
+        if runner is None:
+            runner = self._build_baseline_runner()
+            self._baseline_runner = runner
+        return runner
+
+    def setup(self) -> None:
+        self._baseline_runner = self._build_baseline_runner()
+        self._output_tensor = torch.empty(len(self._payload_output_values), dtype=torch.float32)
+        self._traffic_shape_tensor = torch.empty(1, dtype=torch.int64)
+
+    def benchmark_fn(self) -> None:
+        runner = self._baseline_simulator_runner()
         sim = runner.run()
         self._last = sim
-        traffic = getattr(runner, "traffic", demo_traffic())
-        total_tokens = sum(batch * seqlen for batch, seqlen in traffic)
-        self.output = torch.tensor(
-            [float(len(traffic)), float(total_tokens)],
-            dtype=torch.float32,
-        )
-        self._payload_traffic = traffic
+        self._output_values = self._payload_output_values
 
     def capture_verification_payload(self) -> None:
         traffic = self._payload_traffic
+        if self._output_values is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        if self._output_tensor is None or self._traffic_shape_tensor is None:
+            raise RuntimeError("setup() must initialize verification tensors")
+        for idx, value in enumerate(self._output_values):
+            self._output_tensor[idx] = value
+        self._traffic_shape_tensor[0] = len(traffic)
+        self.output = self._output_tensor
         self._set_verification_payload(
             inputs={
-                "traffic_shape": torch.tensor([len(traffic)], dtype=torch.int64),
+                "traffic_shape": self._traffic_shape_tensor,
             },
             output=self.output,
             batch_size=len(traffic) if len(traffic) > 0 else 1,
@@ -140,7 +178,7 @@ class BaselineCUDAGraphBucketingBenchmark(VerificationPayloadMixin, BaseBenchmar
         """Return simulator-derived graph bucketing metrics."""
         if self._last is None:
             return None
-        summary = self._last.summary()
+        summary = self._last.stats.summary()
         return {
             "graph_tree.captures": float(summary["captures"]),
             "graph_tree.prewarm_captures": float(summary["prewarm_captures"]),
@@ -155,4 +193,3 @@ class BaselineCUDAGraphBucketingBenchmark(VerificationPayloadMixin, BaseBenchmar
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineCUDAGraphBucketingBenchmark()
-

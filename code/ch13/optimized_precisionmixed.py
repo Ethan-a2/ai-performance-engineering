@@ -52,6 +52,7 @@ class OptimizedPrecisionMixedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         # against the same training shape as the FP32 baseline.
         self.hidden_dim = 3072
         self.micro_steps = 4
+        self._micro_step_range = range(self.micro_steps)
         tokens = self.batch_size * self.hidden_dim
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.micro_steps),
@@ -59,6 +60,7 @@ class OptimizedPrecisionMixedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         )
         self.output = None
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         self.register_workload_metadata(
             requests_per_iteration=float(self.micro_steps),
@@ -81,7 +83,9 @@ class OptimizedPrecisionMixedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.targets_fp32 = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float32)
         self.inputs = self.inputs_fp32.to(dtype=torch.bfloat16)
         self.targets = self.targets_fp32.to(dtype=torch.bfloat16)
+        self._micro_step_range = range(self.micro_steps)
         self._verify_input = self.inputs_fp32.detach().clone()
+        self._verify_output_buffer = torch.empty_like(self._verify_input, dtype=torch.float32)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
         self.criterion = nn.MSELoss()
         
@@ -97,10 +101,16 @@ class OptimizedPrecisionMixedBenchmark(VerificationPayloadMixin, BaseBenchmark):
     
     def benchmark_fn(self) -> None:
         """Function to benchmark - mixed precision training."""
-        if any(v is None for v in (self.model, self.inputs, self.targets, self.optimizer, self.criterion)):
+        if (
+            self.model is None
+            or self.inputs is None
+            or self.targets is None
+            or self.optimizer is None
+            or self.criterion is None
+        ):
             raise RuntimeError("Benchmark not configured")
         with self._nvtx_range("optimized_precision_mixed"):
-            for _ in range(self.micro_steps):
+            for _ in self._micro_step_range:
                 self.optimizer.zero_grad(set_to_none=True)
                 
                 with autocast("cuda", dtype=torch.bfloat16):
@@ -109,16 +119,17 @@ class OptimizedPrecisionMixedBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 
                 loss.backward()
                 self.optimizer.step()
-            self.output = outputs.detach().clone()
+            self.output = outputs.detach_()
         if self._verify_input is None or self.output is None:
             raise RuntimeError("Verification input/output not initialized")
 
     def capture_verification_payload(self) -> None:
-        if self._verify_input is None:
-            raise RuntimeError("Verification input not initialized")
+        if self._verify_input is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("Verification input/output not initialized")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -135,8 +146,13 @@ class OptimizedPrecisionMixedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model = None
         self.inputs = None
         self.targets = None
+        self.inputs_fp32 = None
+        self.targets_fp32 = None
         self.optimizer = None
         self.criterion = None
+        self.output = None
+        self._verify_input = None
+        self._verify_output_buffer = None
         super().teardown()
     
     def get_config(self) -> BenchmarkConfig:

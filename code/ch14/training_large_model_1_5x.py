@@ -20,12 +20,12 @@ Hardware: NVIDIA B200 (SM 10.0, 178 GB HBM3e)
 """
 
 import os
+import sys
 
 
 import torch
 from core.utils.compile_utils import enable_tf32
 import torch.nn as nn
-import time
 from dataclasses import dataclass
 
 
@@ -87,8 +87,7 @@ class TransformerBlock(nn.Module):
         head_dim = d_model // n_heads
         
         qkv = self.qkv(x).reshape(batch, seq_len, 3, n_heads, head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
         
         # Flash Attention
         attn_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -175,7 +174,7 @@ def training_step(model, input_ids, labels, optimizer):
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     
-    return loss.item()
+    return loss.detach()
 
 
 def benchmark_training(model, input_ids, labels, optimizer, name, num_warmup=10, num_iters=100):
@@ -196,13 +195,17 @@ def benchmark_training(model, input_ids, labels, optimizer, name, num_warmup=10,
     
     # Benchmark
     print(f"  Running benchmark...", end='', flush=True)
-    start = time.perf_counter()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream(input_ids.device)
+    start.record(current_stream)
     for i in range(num_iters):
         if i % 20 == 0:
             print('.', end='', flush=True)
         _ = training_step(model, input_ids, labels, optimizer)
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+    end.record(current_stream)
+    end.synchronize()
+    elapsed = start.elapsed_time(end) / 1000.0
     print(" done")
     
     avg_time_ms = (elapsed / num_iters) * 1000

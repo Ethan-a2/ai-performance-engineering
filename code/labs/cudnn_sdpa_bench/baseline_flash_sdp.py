@@ -73,7 +73,7 @@ def _ensure_backend_available(backend: str) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("SDP benchmark requires a CUDA device.")
     q = torch.randn(1, 1, 4, 64, device="cuda", dtype=torch.float16)
-    with _sdpa_context(backend):
+    with torch.inference_mode(), _sdpa_context(backend):
         _ = F.scaled_dot_product_attention(q, q, q, is_causal=False)
     torch.cuda.synchronize()
 
@@ -92,8 +92,10 @@ class SDPAAttentionModule(nn.Module):
         B, T, _ = x.shape
         qkv = self.qkv(x)
         qkv = qkv.view(B, T, 3, self.num_heads, self.hidden_dim // self.num_heads)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         with _sdpa_context(self.backend):
             out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
         out = out.transpose(1, 2).reshape(B, T, self.hidden_dim)
@@ -117,6 +119,8 @@ class FlashSDPLabBenchmark(VerificationPayloadMixin, BaseBenchmark):
             requests_per_iteration=float(self.batch),
             tokens_per_iteration=float(tokens),
         )
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
         self.register_workload_metadata(
             requests_per_iteration=float(self.batch),
             tokens_per_iteration=float(tokens),
@@ -140,21 +144,22 @@ class FlashSDPLabBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         self.model = SDPAAttentionModule(hidden_dim=self.hidden, num_heads=8, backend=self.backend).to(
             self.device, dtype=torch.float16
         )
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         # Use CPU randn + to(device) to avoid CUDA RNG graph issues
         self.inputs = torch.randn(self.batch, self.seq_len, self.hidden, dtype=torch.float16).to(self.device)
 
     def benchmark_fn(self) -> None:
         if self.model is None or self.inputs is None:
             raise RuntimeError("Model/inputs not initialized")
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
         nvtx_label = f"sdp_{self.backend}_baseline"
-        with nvtx_range(nvtx_label, enable=enable_nvtx):
-            out = self.model(self.inputs)
-        self.output = out.detach()
+        with nvtx_range(nvtx_label, enable=self._enable_nvtx):
+            with torch.inference_mode():
+                self.output = self.model(self.inputs)
         if self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
@@ -163,7 +168,7 @@ class FlashSDPLabBenchmark(VerificationPayloadMixin, BaseBenchmark):
             inputs={"input": self.inputs.detach()},
             output=self.output,
             batch_size=self.batch,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags={"fp16": True, "bf16": False, "tf32": torch.backends.cuda.matmul.allow_tf32},
             output_tolerance=(0.1, 1.0),
         )
@@ -223,5 +228,3 @@ def _parse_cli_backend(argv: Optional[list[str]] = None) -> Optional[str]:
     )
     args, _ = parser.parse_known_args(argv)
     return args.backend
-
-

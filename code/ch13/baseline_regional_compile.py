@@ -7,20 +7,19 @@ whole-graph versus regional compilation rather than BF16 versus FP32.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from core.utils import compile_utils as _compile_utils_patch  # noqa: F401
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (  # noqa: E402
     BaseBenchmark,
     BenchmarkConfig,
     WorkloadMetadata,
 )
+from core.utils import compile_utils as _compile_utils_patch  # noqa: F401
 
 
 class MLP(nn.Module):
@@ -87,6 +86,7 @@ class BaselineFullGraphCompileBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.inputs: Dict[int, torch.Tensor] = {}
         self._verify_x: Optional[torch.Tensor] = None
         self._verify_output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
         max_tokens = self.batch_size * max(self.sequence_schedule) * self.hidden
         self._workload = WorkloadMetadata(
@@ -122,8 +122,15 @@ class BaselineFullGraphCompileBenchmark(VerificationPayloadMixin, BaseBenchmark)
                 device=self.device,
                 dtype=torch.bfloat16,
             )
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            min(128, max(self.sequence_schedule)),
+            self.hidden,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(5):
                 for seq in self.sequence_schedule:
                     _ = self.compiled_model(self.inputs[seq])
@@ -145,21 +152,28 @@ class BaselineFullGraphCompileBenchmark(VerificationPayloadMixin, BaseBenchmark)
         seq_len = self._next_sequence_length()
         x = self.inputs[seq_len]
 
-        with torch.no_grad(), self._nvtx_range("baseline_full_graph_compile"):
-            self.output = self.compiled_model(x).detach().clone()
+        with torch.inference_mode(), self._nvtx_range("baseline_full_graph_compile"):
+            self.output = self.compiled_model(x)
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
         if self._verify_x is None:
             self._verify_x = x
-            self._verify_output = self.output.detach().clone()
+            self._verify_output = self.output
 
     def capture_verification_payload(self) -> None:
-        if self._verify_x is None or self._verify_output is None:
+        if self._verify_x is None or self._verify_output is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
         x = self._verify_x
+        verify_output = self._verify_output_buffer[
+            : self._verify_output.shape[0],
+            : min(self._verify_output.shape[1], self._verify_output_buffer.shape[1]),
+            :,
+        ]
+        output_slice = self._verify_output[:, : verify_output.shape[1], :]
+        verify_output.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input": x},
-            output=self._verify_output.float().clone(),
+            output=verify_output,
             batch_size=self.batch_size,
             precision_flags={
                 "fp16": False,
@@ -174,6 +188,10 @@ class BaselineFullGraphCompileBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.model = None
         self.compiled_model = None
         self.inputs.clear()
+        self.output = None
+        self._verify_x = None
+        self._verify_output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

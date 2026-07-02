@@ -36,10 +36,12 @@ class BaselinePieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.num_heads = 8
 
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
 
         self.graph_cache: dict[int, GraphCacheEntry] = {}
         self._seq_len_used: Optional[int] = None
+        self._enable_nvtx = False
 
         self._workload = WorkloadMetadata(
             requests_per_iteration=1.0,
@@ -53,6 +55,8 @@ class BaselinePieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def setup(self) -> None:
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
 
         self.model = RegionalPieceGraph(
             hidden_dim=self.hidden_dim,
@@ -68,6 +72,7 @@ class BaselinePieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
             device=self.device,
             dtype=torch.float16,
         )
+        self._verify_output_buffer = torch.empty_like(self._verify_input, dtype=torch.float32)
 
         self.graph_cache.clear()
         static_input = torch.empty_like(self._verify_input)
@@ -88,9 +93,7 @@ class BaselinePieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.graph_cache[self.seq_len] = (graph, static_input, static_output)
 
     def benchmark_fn(self) -> None:
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        with nvtx_range("baseline_piece_graphs", enable=enable_nvtx):
+        with nvtx_range("baseline_piece_graphs", enable=self._enable_nvtx):
             if self.model is None or self._verify_input is None:
                 raise RuntimeError("Model/inputs not initialized")
             entry = self.graph_cache.get(self.seq_len)
@@ -103,13 +106,14 @@ class BaselinePieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
             self._seq_len_used = self.seq_len
 
     def capture_verification_payload(self) -> None:
-        if self.output is None:
+        if self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
         if self._verify_input is None:
             raise RuntimeError("Verification input not initialized")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -124,6 +128,7 @@ class BaselinePieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.model = None
         self._verify_input = None
+        self._verify_output_buffer = None
         self.graph_cache.clear()
         torch.cuda.empty_cache()
 

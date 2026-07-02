@@ -43,6 +43,20 @@ class OptimizedStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.results: Optional[List[torch.Tensor]] = None
         self.stream_h2d: Optional[torch.cuda.Stream] = None
         self.stream_compute: Optional[torch.cuda.Stream] = None
+        self._scratch0: Optional[torch.Tensor] = None
+        self._scratch1: Optional[torch.Tensor] = None
+        self._scratch_pair: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._chunk_triplets: List[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._pipeline_steps: List[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                Optional[tuple[torch.Tensor, torch.Tensor]],
+            ]
+        ] = []
+        self._verify_output: Optional[torch.Tensor] = None
+        self._verify_indices: tuple[int, int, int] = ()
+        self._verify_slice_len = 0
         self.N = 5_000_000  # Elements per chunk - balanced for H2D/compute overlap
         self.num_chunks = 20  # More chunks to amortize pipeline startup
         # Stream benchmark - fixed dimensions for overlap measurement
@@ -79,6 +93,24 @@ class OptimizedStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
             torch.empty(self.N, dtype=torch.float32, device=self.device)
             for _ in range(self.num_chunks)
         ]
+        self._scratch0 = torch.empty(self.N, dtype=torch.float32, device=self.device)
+        self._scratch1 = torch.empty(self.N, dtype=torch.float32, device=self.device)
+        self._scratch_pair = (self._scratch0, self._scratch1)
+        self._chunk_triplets = list(zip(self.host_data, self.device_data, self.results, strict=True))
+        self._pipeline_steps = []
+        for chunk_idx, (_host_chunk, device_chunk, result_chunk) in enumerate(self._chunk_triplets):
+            next_transfer: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+            if chunk_idx + 1 < len(self._chunk_triplets):
+                next_host, next_device, _next_result = self._chunk_triplets[chunk_idx + 1]
+                next_transfer = (next_host, next_device)
+            self._pipeline_steps.append((device_chunk, result_chunk, next_transfer))
+        self._verify_slice_len = min(256, self.N)
+        self._verify_indices = (0, self.num_chunks // 2, self.num_chunks - 1)
+        self._verify_output = torch.empty(
+            self._verify_slice_len * len(self._verify_indices),
+            dtype=torch.float32,
+            device=self.device,
+        )
         
         self._synchronize()
         processed = float(self.N * self.num_chunks)
@@ -87,17 +119,26 @@ class OptimizedStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
             requests_per_iteration=float(self.num_chunks),
         )
     
-    def _compute(self, data: torch.Tensor) -> torch.Tensor:
+    def _compute(self, data: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Compute-intensive operation on GPU data.
         
         Multiple trig operations to ensure compute time is meaningful
         relative to H2D transfer time for proper overlap demonstration.
         """
+        if self._scratch_pair is None:
+            raise RuntimeError("setup() must initialize compute scratch buffers")
+        scratch0, scratch1 = self._scratch_pair
         result = data
         for _ in range(3):  # Multiple passes to increase compute time
-            result = torch.sin(result) * torch.cos(result) + result * 0.1
-            result = torch.tanh(result) + torch.sigmoid(result) * 0.5
-        return result
+            torch.sin(result, out=scratch0)
+            torch.cos(result, out=scratch1)
+            scratch0.mul_(scratch1)
+            scratch0.add_(result, alpha=0.1)
+            torch.tanh(scratch0, out=out)
+            torch.sigmoid(scratch0, out=scratch1)
+            out.add_(scratch1, alpha=0.5)
+            result = out
+        return out
     
     def benchmark_fn(self) -> None:
         """Benchmark: Pipelined H2D transfer overlapping with compute.
@@ -113,25 +154,29 @@ class OptimizedStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
            - Compute on current chunk
         3. Synchronize all streams
         """
-        with self._nvtx_range("streams_pipelined"):
+        if not self._chunk_triplets or not self._pipeline_steps:
+            raise RuntimeError("setup() must initialize chunk views")
+        chunks = self._chunk_triplets
+        pipeline_steps = self._pipeline_steps
+        with torch.inference_mode(), self._nvtx_range("streams_pipelined"):
             # Stage 0: Kick off first transfer
+            first_host, first_device, _ = chunks[0]
             with torch.cuda.stream(self.stream_h2d):
-                self.device_data[0].copy_(self.host_data[0], non_blocking=True)
+                first_device.copy_(first_host, non_blocking=True)
             
-            for i in range(self.num_chunks):
+            for device_chunk, result_chunk, next_transfer in pipeline_steps:
                 # Ensure this chunk's transfer is complete before computing
                 self.stream_compute.wait_stream(self.stream_h2d)
                 
                 # Start next transfer while we compute (double buffering)
-                if i + 1 < self.num_chunks:
+                if next_transfer is not None:
+                    next_host, next_device = next_transfer
                     with torch.cuda.stream(self.stream_h2d):
-                        self.device_data[i + 1].copy_(
-                            self.host_data[i + 1], non_blocking=True
-                        )
+                        next_device.copy_(next_host, non_blocking=True)
                 
                 # Compute on current chunk
                 with torch.cuda.stream(self.stream_compute):
-                    self.results[i] = self._compute(self.device_data[i])
+                    self._compute(device_chunk, result_chunk)
             
             current = torch.cuda.current_stream(device=self.device)
             current.wait_stream(self.stream_compute)
@@ -144,6 +189,14 @@ class OptimizedStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.results = None
         self.stream_h2d = None
         self.stream_compute = None
+        self._scratch0 = None
+        self._scratch1 = None
+        self._scratch_pair = None
+        self._chunk_triplets = []
+        self._pipeline_steps = []
+        self._verify_output = None
+        self._verify_indices = ()
+        self._verify_slice_len = 0
         super().teardown()
     
     def get_config(self) -> BenchmarkConfig:
@@ -185,14 +238,17 @@ class OptimizedStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         return [self.stream_h2d, self.stream_compute]
 
     def capture_verification_payload(self) -> None:
-        if self.host_data is None or self.results is None:
+        if self.host_data is None or self.results is None or self._verify_output is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        sample = self.host_data[0][:256]
-        indices = [0, self.num_chunks // 2, self.num_chunks - 1]
-        verify_output = torch.cat([self.results[i][:256].detach() for i in indices], dim=0)
+        slice_len = self._verify_slice_len
+        sample = self.host_data[0][:slice_len]
+        with torch.no_grad():
+            for slot, result_idx in enumerate(self._verify_indices):
+                start = slot * slice_len
+                self._verify_output[start : start + slice_len].copy_(self.results[result_idx][:slice_len])
         self._set_verification_payload(
             inputs={"host_data": sample},
-            output=verify_output,
+            output=self._verify_output,
             batch_size=int(self.num_chunks),
             parameter_count=int(self.N * self.num_chunks),
             precision_flags={
@@ -208,4 +264,3 @@ class OptimizedStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> OptimizedStreamsBenchmark:
     """Factory function for benchmark discovery."""
     return OptimizedStreamsBenchmark()
-

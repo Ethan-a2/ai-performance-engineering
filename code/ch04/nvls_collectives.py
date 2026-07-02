@@ -26,11 +26,14 @@ class NVLSCollectivesBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def __init__(self) -> None:
         super().__init__()
         self.tensor: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self._initialized = False
         self._workload = WorkloadMetadata(
             requests_per_iteration=1.0,
             bytes_per_iteration=float(32 * 32 * 4),
         )
+        self._enable_nvtx = False
+        self._empty_iteration_result = {}
 
     def setup(self) -> None:
         if torch.cuda.device_count() < 2:
@@ -50,24 +53,30 @@ class NVLSCollectivesBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
         self.tensor = torch.randn(32, 32, device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty_like(self.tensor)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         self._initialized = True
 
     def benchmark_fn(self) -> Optional[dict]:
         if not self._initialized or self.tensor is None:
             raise RuntimeError("SKIPPED: NVLS benchmark not initialized")
 
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        with nvtx_range("nvls_allreduce", enable=enable_nvtx):
+        with nvtx_range("nvls_allreduce", enable=self._enable_nvtx):
             dist.all_reduce(self.tensor)
-        return {}
+        return self._empty_iteration_result
 
     def capture_verification_payload(self) -> None:
-        if not self._initialized or self.tensor is None:
+        if (
+            not self._initialized
+            or self.tensor is None
+            or self._verify_output_buffer is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        output = self.tensor.detach().clone()
+        self._verify_output_buffer.copy_(self.tensor)
         self._set_verification_payload(
             inputs={"tensor": self.tensor},
-            output=output,
+            output=self._verify_output_buffer,
             batch_size=int(self.tensor.shape[0]),
             parameter_count=0,
             precision_flags={
@@ -82,6 +91,9 @@ class NVLSCollectivesBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         if dist.is_initialized():
             dist.destroy_process_group()
+        self.tensor = None
+        self._verify_output_buffer = None
+        self._initialized = False
         super().teardown()
 
     def get_workload_metadata(self) -> Optional[WorkloadMetadata]:

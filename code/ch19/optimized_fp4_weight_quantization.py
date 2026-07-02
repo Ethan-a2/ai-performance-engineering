@@ -24,25 +24,53 @@ Requirements:
 
 from __future__ import annotations
 
-from pathlib import Path
+import math
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
-import math
 
+from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (
     BaseBenchmark,
     BenchmarkConfig,
     WorkloadMetadata,
 )
-from core.benchmark.verification_mixin import VerificationPayloadMixin
-
 
 # FP4 E2M1 representable values
 FP4_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+FP4_SIGNED_VALUES = torch.cat((FP4_VALUES, -FP4_VALUES))
 FP4_MAX = 6.0
+_FP4_VALUES_CACHE: dict[torch.device, torch.Tensor] = {}
+_FP4_SIGNED_VALUES_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _fp4_values_for(device: torch.device) -> torch.Tensor:
+    if device.type == "cpu":
+        return FP4_VALUES
+    cached = _FP4_VALUES_CACHE.get(device)
+    if cached is None:
+        cached = FP4_VALUES.to(device=device)
+        _FP4_VALUES_CACHE[device] = cached
+    return cached
+
+
+def _fp4_signed_values_for(device: torch.device) -> torch.Tensor:
+    if device.type == "cpu":
+        return FP4_SIGNED_VALUES
+    cached = _FP4_SIGNED_VALUES_CACHE.get(device)
+    if cached is None:
+        cached = FP4_SIGNED_VALUES.to(device=device)
+        _FP4_SIGNED_VALUES_CACHE[device] = cached
+    return cached
+
+
+def _unpack_fp4_codes(packed_data: torch.Tensor) -> torch.Tensor:
+    unpacked = torch.empty(packed_data.numel() * 2, device=packed_data.device, dtype=torch.long)
+    torch.bitwise_right_shift(packed_data, 4, out=unpacked[0::2])
+    torch.bitwise_and(packed_data, 0x0F, out=unpacked[1::2])
+    return unpacked
 
 
 def is_blackwell() -> bool:
@@ -92,7 +120,7 @@ def quantize_fp4_optimized(
     normalized = normalized.clamp(-FP4_MAX, FP4_MAX)
     
     # Vectorized quantization to nearest FP4 value
-    fp4_vals = FP4_VALUES.to(device)
+    fp4_vals = _fp4_values_for(device)
     abs_normalized = normalized.abs()
     
     # Find nearest FP4 value (vectorized)
@@ -123,30 +151,23 @@ def dequantize_fp4_optimized(
 ) -> torch.Tensor:
     """Optimized FP4 dequantization with per-block scaling."""
     device = packed_data.device
-    fp4_vals = FP4_VALUES.to(device)
+    signed_fp4_vals = _fp4_signed_values_for(device)
     
     # Unpack bytes to pairs of 4-bit codes
-    high = (packed_data >> 4) & 0x0F
-    low = packed_data & 0x0F
-    unpacked = torch.stack([high, low], dim=1).flatten()
+    unpacked = _unpack_fp4_codes(packed_data)
     
-    # Decode FP4
-    signs = (unpacked >> 3) & 0x01
-    indices = (unpacked & 0x07).long()
-    
-    # Get magnitude values
-    values = fp4_vals[indices]
-    values = torch.where(signs.bool(), -values, values)
+    # Decode FP4 directly from the packed sign+magnitude code.
+    values = signed_fp4_vals[unpacked]
     
     # Reshape to blocks and apply per-block scales
     n_blocks = len(scales)
     n_elements = n_blocks * block_size
     blocks = values[:n_elements].reshape(n_blocks, block_size)
-    dequantized = blocks * scales.unsqueeze(-1)
+    blocks.mul_(scales.unsqueeze(-1))
     
     # Reshape to original
     n_orig = math.prod(original_shape)
-    flat = dequantized.flatten()[:n_orig]
+    flat = blocks.flatten()[:n_orig]
     return flat.reshape(original_shape).to(dtype)
 
 
@@ -190,6 +211,11 @@ class OptimizedFP4Linear(nn.Module):
         self.register_buffer('weight_scales', None)
         self.register_buffer('_weight_cache', None)
         self.register_buffer('_weight_fp8_cache', None)
+        self.register_buffer('_weight_fp8_t_cache', None)
+        fp8_dtype = getattr(torch, "float8_e4m3fn", torch.uint8)
+        self.register_buffer('_input_fp8_buffer', torch.empty(0, dtype=fp8_dtype), persistent=False)
+        self.register_buffer('_fp8_scale_a', torch.ones(1, dtype=torch.float32), persistent=False)
+        self.register_buffer('_fp8_scale_b', torch.ones(1, dtype=torch.float32), persistent=False)
         self._quantized = False
         
         if bias:
@@ -209,6 +235,7 @@ class OptimizedFP4Linear(nn.Module):
             self._weight_fp16 = None
             self._weight_cache = None
             self._weight_fp8_cache = None
+            self._weight_fp8_t_cache = None
             self._quantized = True
     
     def _get_weight(self) -> torch.Tensor:
@@ -239,6 +266,7 @@ class OptimizedFP4Linear(nn.Module):
         """Clear weight cache to free memory."""
         self._weight_cache = None
         self._weight_fp8_cache = None
+        self._weight_fp8_t_cache = None
 
     def _get_weight_fp8(self) -> torch.Tensor:
         """Get a cached row-major FP8 bridge for tensor-core execution."""
@@ -259,6 +287,40 @@ class OptimizedFP4Linear(nn.Module):
         weight_fp8 = weight.to(torch.float8_e4m3fn).contiguous()
         self._weight_fp8_cache = weight_fp8
         return weight_fp8
+
+    def _get_weight_fp8_t(self) -> torch.Tensor:
+        """Get a cached transposed FP8 bridge for scaled_mm."""
+        if self._weight_fp8_t_cache is not None:
+            return self._weight_fp8_t_cache
+
+        weight_fp8 = self._get_weight_fp8()
+        weight_fp8_t = weight_fp8.T
+        self._weight_fp8_t_cache = weight_fp8_t
+        return weight_fp8_t
+
+    def _activation_fp8_buffer(self, x_2d: torch.Tensor) -> torch.Tensor:
+        input_fp8 = self._input_fp8_buffer
+        if (
+            input_fp8.dim() != x_2d.dim()
+            or input_fp8.size(0) < x_2d.size(0)
+            or tuple(input_fp8.shape[1:]) != tuple(x_2d.shape[1:])
+            or input_fp8.device != x_2d.device
+            or input_fp8.dtype != torch.float8_e4m3fn
+        ):
+            input_fp8 = torch.empty(
+                x_2d.shape,
+                device=x_2d.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            self._input_fp8_buffer = input_fp8
+        return input_fp8[: x_2d.size(0)]
+
+    def _fp8_scale_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._fp8_scale_a.device != device or self._fp8_scale_a.dtype != torch.float32:
+            self._fp8_scale_a = torch.ones(1, device=device, dtype=torch.float32)
+        if self._fp8_scale_b.device != device or self._fp8_scale_b.dtype != torch.float32:
+            self._fp8_scale_b = torch.ones(1, device=device, dtype=torch.float32)
+        return self._fp8_scale_a, self._fp8_scale_b
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with FP4 weights."""
@@ -266,30 +328,33 @@ class OptimizedFP4Linear(nn.Module):
             return self._forward_fp8(x)
         
         weight = self._get_weight()
-        return F.linear(x.to(weight.dtype), weight, self.bias)
+        if x.dtype != weight.dtype:
+            x = x.to(weight.dtype)
+        return F.linear(x, weight, self.bias)
     
     def _forward_fp8(self, x: torch.Tensor) -> torch.Tensor:
         """Forward using FP8 tensor cores for acceleration."""
-        weight_fp8 = self._get_weight_fp8()
+        weight_fp8_t = self._get_weight_fp8_t()
         
         # Reshape for matmul
         batch_shape = x.shape[:-1]
-        x_2d = x.reshape(-1, x.shape[-1]).to(torch.float8_e4m3fn)
+        x_2d = x.reshape(-1, x.shape[-1])
+        x_fp8 = self._activation_fp8_buffer(x_2d)
+        x_fp8.copy_(x_2d)
         
         # Scales for _scaled_mm
-        scale_a = torch.ones(1, device=x.device, dtype=torch.float32)
-        scale_b = torch.ones(1, device=x.device, dtype=torch.float32)
+        scale_a, scale_b = self._fp8_scale_buffers(x.device)
         
         # _scaled_mm: (M, K) @ (N, K).T -> (M, N)
         result = torch._scaled_mm(
-            x_2d, weight_fp8.T,
+            x_fp8, weight_fp8_t,
             scale_a, scale_b,
             out_dtype=self.dtype
         )
         
         output = result.reshape(*batch_shape, -1)
         if self.bias is not None:
-            output = output + self.bias
+            output.add_(self.bias)
         return output
     
     @property
@@ -352,6 +417,13 @@ class OptimizedFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBenc
         self.mode = "storage"
         
         self.input: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
+        self._payload_precision_flags = {
+            "fp16": False,
+            "bf16": False,
+            "fp8": False,
+            "tf32": False,
+        }
         
         tokens = self.batch_size * self.seq_len
         self._workload = WorkloadMetadata(
@@ -387,6 +459,7 @@ class OptimizedFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBenc
         # inference rather than cached FP16 execution.
         self.model.quantize()
         self.model.eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         
         self.input = torch.randn(
             self.batch_size, self.seq_len, self.d_model,
@@ -395,7 +468,7 @@ class OptimizedFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBenc
         
         # Warm up the steady-state quantized execution path. In FP8 mode this
         # materializes the bridge once and then reuses it for timed iterations.
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(10):
                 _ = self.model(self.input)
         
@@ -403,19 +476,17 @@ class OptimizedFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBenc
     def benchmark_fn(self) -> None:
         """Benchmark optimized inference."""
         with self._nvtx_range("optimized_mlp"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 output = self.model(self.input)
-                self.output = output.detach()
+                self.output = output
         if self.output is None or self.input is None or self.model is None:
             raise RuntimeError("benchmark_fn() must produce output")
         dtype = self.output.dtype
-        precision_flags = {
-            "fp16": dtype == torch.float16,
-            "bf16": dtype == torch.bfloat16,
-            "fp8": False,
-            "tf32": False,
-        }
-        self._payload_precision_flags = precision_flags
+        precision_flags = self._payload_precision_flags
+        precision_flags["fp16"] = dtype == torch.float16
+        precision_flags["bf16"] = dtype == torch.bfloat16
+        precision_flags["fp8"] = False
+        precision_flags["tf32"] = False
 
     def capture_verification_payload(self) -> None:
         precision_flags = self._payload_precision_flags
@@ -423,7 +494,7 @@ class OptimizedFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBenc
             inputs={"input": self.input},
             output=self.output.float() if self.output is not None else None,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()) if self.model is not None else 0,
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(1.0, 10.0),
             precision_flags=precision_flags,
         )
@@ -483,7 +554,7 @@ class OptimizedFP4WeightQuantizationBenchmark(VerificationPayloadMixin, BaseBenc
         if self.input is None:
             return "Input not initialized"
         
-        with torch.no_grad():
+        with torch.inference_mode():
             output = self.model(self.input[:1, :32])
             if torch.isnan(output).any():
                 return "NaN in output"

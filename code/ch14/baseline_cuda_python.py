@@ -101,7 +101,7 @@ class BaselineCudaPythonBenchmark(VerificationPayloadMixin, BaseBenchmark):
         Each operation is a separate kernel launch with dispatcher overhead.
         Intermediate tensors are allocated for each step.
         """
-        with self._nvtx_range("baseline_cuda_python"):
+        with torch.inference_mode(), self._nvtx_range("baseline_cuda_python"):
             # Step 1: Layer normalization (separate kernel)
             normalized = F.layer_norm(
                 self.input, 
@@ -115,13 +115,10 @@ class BaselineCudaPythonBenchmark(VerificationPayloadMixin, BaseBenchmark):
             
             # Step 3: Masked fill (separate kernel)
             # Zero out positions where mask is False
-            masked = activated.masked_fill(
-                ~self.mask.unsqueeze(-1), 
-                0.0
-            )
+            activated.masked_fill_(~self.mask.unsqueeze(-1), 0.0)
             
             # Step 4: Residual connection (separate kernel)
-            self.output = masked + self.input
+            self.output = activated + self.input
         
 
     def capture_verification_payload(self) -> None:
@@ -181,4 +178,3 @@ class BaselineCudaPythonBenchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> BaseBenchmark:
     """Factory function for harness discovery."""
     return BaselineCudaPythonBenchmark()
-

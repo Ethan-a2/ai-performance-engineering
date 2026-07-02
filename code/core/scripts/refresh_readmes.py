@@ -2466,9 +2466,10 @@ ENTRIES["ch15"] = chapter_entry(
                 | `continuous_batching` | `52.955 ms` | `12.719 ms` | `4.16x` | queueing and batching strategy |
                 | `kv_cache_nvlink_pool` | `1047.860 ms` | `171.477 ms` | `6.11x` | pooled KV-cache path |
                 | `guided_decoding` | `12.702 ms` | `2.131 ms` | `5.96x` | guided decode path |
+                | `greedy_sampler` | `3.221 ms` | `0.907 ms` | `3.55x` | skips full-vocab probability materialization for greedy decode |
                 | `speculative_decoding` | `103.323 ms` | `26.761 ms` | `3.86x` | speculative decode orchestration |
 
-                The chapter mixes system-level wins from queueing/orchestration with fabric/cache-path wins. Those are both valuable, but they are not the same optimization story."""
+                The `greedy_sampler` row is from `artifacts/runs/codex_ch15_greedy_sampler_20260630_212500/`. It is a semantically narrow serving fast path where temperature-positive greedy decode uses logits argmax directly instead of building a probability tensor. The chapter mixes system-level wins from queueing/orchestration with fabric/cache-path wins. Those are both valuable, but they are not the same optimization story."""
             ),
         ),
         MarkdownSection(
@@ -2480,6 +2481,7 @@ ENTRIES["ch15"] = chapter_entry(
                 ```bash
                 python -m cli.aisp bench run --targets ch15:continuous_batching --profile deep_dive --single-gpu
                 python -m cli.aisp bench run --targets ch15:kv_cache_nvlink_pool --profile deep_dive --single-gpu
+                python -m cli.aisp bench run --targets ch15:greedy_sampler --profile deep_dive --single-gpu
                 python -m cli.aisp bench run --targets ch15:speculative_decoding --profile deep_dive --single-gpu
                 ```
 
@@ -2503,6 +2505,7 @@ ENTRIES["ch15"] = chapter_entry(
         "Benchmark monolithic vs disaggregated inference paths and quantify fabric costs.",
         "Design KV-cache managers that gracefully span local and remote HBM pools.",
         "Implement continuous batching and queueing so decode throughput stays high.",
+        "Use decode-policy fast paths so greedy serving avoids unnecessary probability tensors.",
         "Serve MoE models efficiently by pairing routing with optimized communication.",
     ],
     contents=[
@@ -2512,14 +2515,16 @@ ENTRIES["ch15"] = chapter_entry(
         ("`baseline_kv_cache_management.py`, `optimized_kv_cache_management.py`, `kv_cache_management_math.py`, `baseline_kv_cache_nvlink_pool.py`, `optimized_kv_cache_nvlink_pool.py`, `baseline_kv_cache_nvlink_pool_multigpu.py`, `optimized_kv_cache_nvlink_pool_multigpu.py`", "KV-cache orchestration utilities with local-only, math-only, and NVLink-pooled variants."),
         ("`baseline_continuous_batching.py`, `optimized_continuous_batching.py`", "Single-GPU continuous batching scheduler for TTFT-aware queueing."),
         ("`baseline_continuous_batching_multigpu.py`, `optimized_continuous_batching_multigpu.py`", "Multi-GPU continuous batching scheduler for scaled queueing throughput."),
+        ("`baseline_greedy_sampler.py`, `optimized_greedy_sampler.py`, `greedy_sampler_common.py`", "Greedy decode sampler comparison showing that positive-temperature argmax can skip full-vocab softmax materialization."),
         ("`baseline_moe_inference.py`, `optimized_moe_inference.py`", "Inference-specific MoE workloads that pair router load with communication control."),
-        ("`baseline_moe_overlap.py`, `optimized_moe_overlap_shared_expert.py`, `baseline_wide_ep.py`, `optimized_wide_ep.py`, `baseline_moe_dispatch.py`, `optimized_moe_dispatch.py`, `baseline_moe_routing_topology_aware.py`, `optimized_moe_routing_topology_aware.py`", "MoE expert-parallel microbenchmarks that now split dispatch-path optimization from topology-aware routing locality so attribution stays clean."),
+        ("`baseline_moe_overlap.py`, `optimized_moe_overlap_shared_expert.py`, `baseline_moe_overlap_local_route.py`, `optimized_moe_overlap_local_route.py`, `moe_overlap_local_route_common.py`, `baseline_wide_ep.py`, `optimized_wide_ep.py`, `baseline_moe_dispatch.py`, `optimized_moe_dispatch.py`, `baseline_moe_routing_topology_aware.py`, `optimized_moe_routing_topology_aware.py`", "MoE expert-parallel microbenchmarks that now split dispatch-path optimization, direct local routed placement, and topology-aware routing locality so attribution stays clean."),
         ("`compare.py`, `requirements.txt`, `expectations_{hardware_key}.json`, `Makefile`", "Harness entry and dependencies for inference-focused validation."),
     ],
     validation=[
         "`python -m cli.aisp bench run --targets ch15:disaggregated_inference_multigpu --profile minimal --ncu-replay-mode kernel` shows reduced fabric stalls compared to the baseline while maintaining accuracy parity (kernel replay avoids NCU application-replay stalls on this workload).",
         "`python optimized_kv_cache_management.py --validate` confirms eviction + promotion policies keep decode latency within the budget.",
         "`python compare.py --examples continuous_batching` (single GPU) and `python compare.py --examples continuous_batching_multigpu` (multi-GPU) show optimized scheduling increases tokens/sec vs naive queue draining.",
+        "`python -m cli.aisp bench run --targets ch15:greedy_sampler --profile minimal --single-gpu` verifies the direct-logit argmax path matches the full-probability baseline exactly.",
     ],
     notes=[
         "`disaggregated_inference_multigpu.py` can run purely in simulation mode; set `--simulate-network` when hardware isn't wired for NVLink pooling.",
@@ -2821,6 +2826,7 @@ ENTRIES["ch17"] = chapter_entry(
         ("`baseline_prefill_decode_disagg_overlap_multigpu.py`, `optimized_prefill_decode_disagg_overlap_multigpu.py`, `baseline_prefill_decode_disagg_batched_multigpu.py`, `optimized_prefill_decode_disagg_batched_multigpu.py`, `baseline_prefill_decode_disagg_ttft_multigpu.py`, `optimized_prefill_decode_disagg_ttft_multigpu.py`, `baseline_prefill_decode_disagg_tpot_long_multigpu.py`, `optimized_prefill_decode_disagg_tpot_long_multigpu.py`", "Chapter-native end-to-end inference flows modeling separate prefill and decode pools, including overlap-focused, batched-handoff, TTFT-focused, and long-output TPOT-focused multi-GPU pairs."),
         ("`baseline_pipeline_parallelism.py`, `optimized_pipeline_parallelism.py`", "Pipeline parallel workloads combining compute and KV-transfer scheduling."),
         ("`baseline_moe_router_uniform.py`, `optimized_moe_router_uniform_topology.py`", "Comparable MoE router benchmark pair contrasting uniform vs topology-aware routing while keeping outputs invariant via shared expert weights."),
+        ("`baseline_moe_router_local_capacity.py`, `optimized_moe_router_local_capacity.py`", "MoE capacity-reservation pair contrasting topology-aware overflow spill with all-local expert placement."),
         ("`moe_router_uniform_demo.py`, `moe_router_topology_demo.py`", "MoE routing demos (non-benchmark) contrasting uniform vs topology-aware expert selection."),
         ("`baseline_routing_static.py`, `optimized_routing_static.py`", "Router variants for static/dynamic sharding decisions (comparable benchmarks)."),
         ("`baseline_memory.py`, `optimized_memory.py`, `blackwell_profiling_guide.py`", "Memory-bound case studies plus profiling guides tailored to routing workloads (use `aisp tools roofline` for roofline analysis)."),
@@ -2880,10 +2886,11 @@ ENTRIES["ch18"] = chapter_entry(
                 | Target | Baseline | Optimized | Measured delta | What changed |
                 | --- | ---: | ---: | ---: | --- |
                 | `flexdecoding` | `161.596 ms` | `81.980 ms` | `1.97x` | baseline masks the full KV cache; optimized slices to the active decode window |
+                | `eos_early_exit` | `11.694 ms` | `2.481 ms` | `4.71x` | optimized stops after 16/128 decode steps once all rows are EOS |
                 | `tensor_cores` | `3.805 ms` | `0.243 ms` | `15.65x` | tensor-core decode kernel |
                 | `rope_q_cache` | `106.429 ms` | `4.523 ms` | `23.53x` | cache-aware rope/Q-path reuse |
 
-                The chapter has a mix of "moderate but real" improvements and "big kernel-level" improvements. Treat those as different stories rather than averaging them together into one headline number. `flexdecoding` is the chapter-native work-reduction story: the baseline scores the full KV cache with a sliding-window mask, while the optimized path trims the decode step down to the active window before attention. Re-measure it on your hardware before treating the chapter numbers as a decision threshold."""
+                The `eos_early_exit` row is from `artifacts/runs/codex_ch18_eos_early_exit_light_20260630_214000/`. The chapter has a mix of "moderate but real" improvements and "big kernel-level" improvements. Treat those as different stories rather than averaging them together into one headline number. `flexdecoding` is the chapter-native work-reduction story: the baseline scores the full KV cache with a sliding-window mask, while the optimized path trims the decode step down to the active window before attention. Re-measure it on your hardware before treating the chapter numbers as a decision threshold."""
             ),
         ),
         MarkdownSection(
@@ -2894,6 +2901,7 @@ ENTRIES["ch18"] = chapter_entry(
 
                 ```bash
                 python -m cli.aisp bench run --targets ch18:flexdecoding --profile deep_dive --single-gpu
+                python -m cli.aisp bench run --targets ch18:eos_early_exit --profile deep_dive --single-gpu
                 python -m cli.aisp bench run --targets ch18:tensor_cores --profile deep_dive --single-gpu
                 python -m cli.aisp bench run --targets ch18:rope_q_cache --profile deep_dive --single-gpu
                 ```
@@ -2919,9 +2927,11 @@ ENTRIES["ch18"] = chapter_entry(
         "Evaluate speculative decoding pipelines that trade extra compute for lower latency.",
         "Test tensor-core optimized attention kernels tailored for Blackwell tmem limits.",
         "Validate integration points with serving frameworks (vLLM) using the provided runners.",
+        "Separate EOS polling overhead from early-exit work reduction when a batch finishes before the max decode budget.",
     ],
     contents=[
         ("`baseline_flexdecoding.py`, `optimized_flexdecoding.py`, `optimized_flexdecoding_graphs.py`, `v1_engine_loop.py`, `v1_engine_loop_common.py`", "FlexDecoding benchmarks plus a V1 polling-loop correctness tool (not a benchmark pair)."),
+        ("`baseline_eos_sync_polling.py`, `optimized_eos_sync_polling.py`, `baseline_eos_early_exit.py`, `optimized_eos_early_exit.py`, `eos_early_exit_common.py`", "EOS synchronization and early-exit decode-loop comparisons, including a lightweight fixed-buffer benchmark for skipped tail decode work."),
         ("`baseline_paged_attn_backend.py`, `optimized_paged_attn_backend.py`, `baseline_paged_attn_layout.py`, `optimized_paged_attn_layout.py`, `paged_attn_split_common.py`", "Split paged-attention comparisons: dense math-versus-flash backend selection and dense masked decode versus block-table-driven FlexAttention sparse kernels."),
         ("`baseline_tensor_cores.py`, `optimized_tensor_cores.py`, `flashmla_kernel.cu`, `warp_specialized_triton.py`", "Tensor-core attention kernels plus Triton equivalents for rapid validation."),
         ("`flex_attention_native.py`, `flex_attention_enhanced.py`, `flex_attention_large_model.py`, `kv_cache_integration_example.py`", "FlexAttention examples ranging from toy sizes to large models with KV-cache reuse."),
@@ -2933,6 +2943,7 @@ ENTRIES["ch18"] = chapter_entry(
         "`python -m ch18.compare` runs the chapter baseline/optimized sweep through the shared harness.",
         "`python -m cli.aisp bench run --targets ch18:vllm_v1_integration --profile minimal` completes with accuracy parity vs the native FlexAttention path.",
         "`python -m pytest -q ch18/test_flex_attention.py` passes locally, confirming mask/score-mod helpers are wired correctly.",
+        "`ch18:eos_early_exit` reports fewer decoded steps on the optimized path while preserving the generated-token verification buffer.",
     ],
     notes=[
         "`flex_attention` scripts accept env vars like `BLOCK_SIZE`, `DOC_SPAN`, and `SEQ_LEN` so you can sweep shapes without editing code.",
@@ -3035,7 +3046,7 @@ ENTRIES["ch19"] = chapter_entry(
         ("`baseline_dynamic_precision.py`, `optimized_dynamic_precision.py`, `dynamic_precision_benchmark_common.py`, `dynamic_precision_switching.py`, `token_precision_switching.py`", "Chapter-native dynamic precision benchmark pair plus the confidence-driven precision helpers that keep decode outputs stable while switching precision modes."),
         ("`baseline_memory_double_buffering.py`, `optimized_memory_double_buffering.py`, `memory_allocator_with_monitoring.py`, `dynamic_memory_allocator.py`, `_allocator_worker.py`", "Memory-management helpers covering double buffering, instrumentation, and adaptive worker pools."),
         ("`baseline_kv_prefetch_overlap.cu`, `optimized_kv_prefetch_overlap.cu`, `kv_prefetch_overlap_sm121` binaries", "CUDA kernels proving that quantized KV prefetch can overlap with compute when using cp.async pipelines."),
-        ("`baseline_dynamic_quantized_cache.py`, `optimized_dynamic_quantized_cache.py`, `dynamic_quantized_cache.py`, `token_precision_switching.py`, `dynamic_precision_switching.py`", "Cache-refresh experiments comparing full-precision FP32 maintenance against adaptive-bitwidth quantized refresh on the same KV footprint."),
+        ("`baseline_dynamic_quantized_cache.py`, `optimized_dynamic_quantized_cache.py`, `baseline_dynamic_quantized_cache_coalesced.py`, `optimized_dynamic_quantized_cache_coalesced.py`, `dynamic_quantized_cache.py`, `token_precision_switching.py`, `dynamic_precision_switching.py`", "Cache-refresh experiments comparing full-precision FP32 maintenance, adaptive-bitwidth quantized refresh, and coalesced repeated-width refresh on the same KV footprint."),
         ("`baseline_fp4_hardware_kernel.cu`, `optimized_fp4_hardware_kernel.cu`, `fp8_hardware_kernel.cu`, `custom_allocator_retry.py`, `adaptive_parallelism_strategy.py`, `adaptive_parallelism_worker_pool.py`", "Hardware-level kernels and adaptive scheduling helpers for heterogeneous precision fleets."),
         ("`compare.py`, `arch_config.py`, `expectations_{hardware_key}.json`", "Harness entry, architecture toggles, and stored expectation data."),
     ],
@@ -3787,8 +3798,10 @@ ENTRIES["labs/decode_optimization"] = lab_entry(
                 | `decode_streams` | `27.391 ms` | `23.753 ms` | `1.15x` |
                 | `decode_warp_specialized` | `38.386 ms` | `14.963 ms` | `2.57x` |
                 | `decode_double_buffer_tma` | `0.173 ms` | `0.081 ms` | `2.14x` |
+                | `decode_device_resident` | `11.487 ms` | `2.340 ms` | `4.91x` |
+                | `decode_candidate_logits` | `8.866 ms` | `6.335 ms` | `1.40x` |
 
-                This is the useful shape of the lab: some decode optimizations are huge, some are modest, and the lab keeps them separated instead of averaging them into a fake single story."""
+                The `decode_device_resident` row is from `artifacts/runs/codex_decode_device_resident_20260630_204000/`; the optimized path reports zero prompt/payload copies per iteration. The `decode_candidate_logits` row is from `artifacts/runs/codex_decode_candidate_logits_forced_20260630_210000/`; the optimized path reduces the effective logits vocabulary from `131072` to `1`. This is the useful shape of the lab: some decode optimizations are huge, some are modest, and the lab keeps them separated instead of averaging them into a fake single story."""
             ),
         ),
         MarkdownSection(
@@ -3804,11 +3817,13 @@ ENTRIES["labs/decode_optimization"] = lab_entry(
                 """\
                 ```bash
                 python -m cli.aisp bench run --targets labs/decode_optimization:decode --profile deep_dive --single-gpu
+                python -m cli.aisp bench run --targets labs/decode_optimization:decode_device_resident --profile deep_dive --single-gpu
+                python -m cli.aisp bench run --targets labs/decode_optimization:decode_candidate_logits --profile deep_dive --single-gpu
                 python -m cli.aisp bench run --targets labs/decode_optimization:decode_hf_cache --profile deep_dive --single-gpu
                 python -m cli.aisp bench run --targets labs/decode_optimization:decode_warp_specialized --profile deep_dive --single-gpu
                 ```
 
-                Those three targets cover the most useful slices: general decode orchestration, real decoder-loop cache policy, and the fused Triton kernel path."""
+                Those targets cover the most useful slices: general decode orchestration, device-resident serving contracts, real decoder-loop cache policy, and the fused Triton kernel path."""
             ),
         ),
         MarkdownSection(
@@ -3828,9 +3843,13 @@ ENTRIES["labs/decode_optimization"] = lab_entry(
         "Measure FP8/FP4 tensor-core benefits relative to FP16/BF16 baselines.",
         "Validate Triton warp-specialized decode kernels against Python math and harness expectations.",
         "Observe NVLink-C2C behavior by scaling the decode loop across available GPUs.",
+        "Show when a prefix-cache/device-resident request path can remove recurring prompt-side H2D staging.",
+        "Show when guided decoding can avoid full-vocabulary logits by scoring only legal candidates.",
     ],
     contents=[
         ("`baseline_decode.py`, `optimized_decode_pinned.py`, `optimized_decode_streams.py`, `optimized_decode_compile.py`, `optimized_decode_graph.py`, `optimized_decode_graph_full.py`, `optimized_decode_ultimate.py`", "Serving-path decode variants that isolate host, stream, compile, and graph effects."),
+        ("`baseline_decode_device_resident.py`, `optimized_decode_device_resident.py`", "Prefix-cache-style serving variant that seeds prompt-side inputs once and skips recurring H2D staging in the decode hot path."),
+        ("`baseline_decode_candidate_logits.py`, `optimized_decode_candidate_logits.py`", "Guided/constrained decode variant that compares full-vocabulary scoring plus candidate filtering with direct candidate-only projection."),
         ("`baseline_decode_hf_cache.py`, `optimized_decode_hf_cache.py`", "Real HuggingFace decoder-loop comparison: dynamic cache + per-step EOS sync vs static cache + compiled decode + batched EOS polling."),
         ("`baseline_decode_fp8.py`, `optimized_decode_fp8.py`, `baseline_decode_fp4.py`, `optimized_decode_fp4.py`", "Prefill-focused low-precision decode comparisons on hardware that supports them, including the intentional BF16/nn.Linear versus FP8/Transformer Engine TELinear path."),
         ("`baseline_decode_warp_specialized.py`, `optimized_decode_warp_specialized.py`", "Warp-specialized decode path plus its eager correctness reference."),
@@ -3841,11 +3860,15 @@ ENTRIES["labs/decode_optimization"] = lab_entry(
         "Compile/graph variants emit fewer kernels and higher tokens/sec than the baseline in harness output.",
         "FP8/FP4 runs use a prefill-focused workload (`decode_tokens=0`) to surface tensor-core benefits; outputs remain within tolerance.",
         "Warp-specialized Triton kernel is validated against a workload-matched eager baseline; the expectation file stays green.",
+        "`decode_device_resident` emits zero prompt/payload copies per iteration on the optimized path while preserving the same model output.",
+        "`decode_candidate_logits` emits the same constrained-token decode output while reducing the effective logits vocabulary from the full vocabulary to the candidate set.",
         "The multi-GPU demo exercises NVLink-C2C without graph-capture failures when launched via `torchrun`.",
     ],
     notes=[
         "All targets emit TTFT, TPOT mean, decode time, total time, and tokens/sec in `custom_metrics` for easy diffing.",
         "`decode_pinned` is a supplementary local-contract stepping-stone target that now isolates pageable vs pinned staging on the same large host payload; use `decode_streams` when you want the lab's canonical pinned-host plus overlap speed claim.",
+        "`decode_device_resident` is a larger serving-contract optimization: it applies when routing and prefix-cache policy keep prompt-side buffers resident on the GPU between decode iterations.",
+        "`decode_candidate_logits` models grammar, schema, or router-constrained serving where the legal next-token set is known before the lm_head projection.",
         "FP4 requires NVFP4-capable Blackwell hardware; unsupported platforms fail fast.",
         "The HF cache pair reproduces the main idea from Chaim Rand's token-generation optimization write-up while keeping the harness contract intact.",
         "`decode_fp8` is intentionally a BF16/`nn.Linear` baseline versus FP8/Transformer Engine `TELinear`, because Transformer Engine is the supported FP8 linear path in this lab.",
@@ -6053,11 +6076,13 @@ ENTRIES["labs/moe_cuda"] = lab_entry(
                 | --- | ---: | ---: | ---: |
                 | `decode_attention` | `0.259 ms` | `0.207 ms` | `1.25x` |
                 | `kv_transfer` | `1.224 ms` | `1.085 ms` | `1.13x` |
+                | `kv_transfer_direct` | baseline transfer path | direct KV writes | destination-placement variant |
                 | `kv_transfer_graphs` | `1.224 ms` | `0.315 ms` | `3.88x` |
+                | `kv_transfer_direct_graphs` | baseline transfer path | direct KV writes + graph replay | destination + launch-removal variant |
                 | `moe_backend_selection` | `1.747 ms` | `0.308 ms` | `5.67x` |
                 | `router` | `67.265 ms` | `8.674 ms` | `7.75x` |
 
-                That spread is the point of the lab. Not every MoE subsystem gets the same win: overlap-only KV transfer is a modest directional step, while the graphed replay path removes most of the launch overhead. The router/backend work is still where the biggest local payoff is showing up."""
+                That spread is the point of the lab. Not every MoE subsystem gets the same win: overlap-only KV transfer is a modest directional step, direct destination placement removes the copy when the serving layout allows it, and graphed direct placement removes most of the remaining launch overhead. The router/backend work is still where the biggest local payoff is showing up."""
             ),
         ),
         MarkdownSection(
@@ -6066,7 +6091,7 @@ ENTRIES["labs/moe_cuda"] = lab_entry(
                 """\
                 ```bash
                 python -m cli.aisp bench run --targets labs/moe_cuda:decode_attention --profile deep_dive --single-gpu
-                python -m cli.aisp bench run --targets labs/moe_cuda:kv_transfer_graphs --profile deep_dive --single-gpu
+                python -m cli.aisp bench run --targets labs/moe_cuda:kv_transfer_direct_graphs --profile deep_dive --single-gpu
                 python -m cli.aisp bench run --targets labs/moe_cuda:router_vectorized --profile deep_dive --single-gpu
                 ```
 
@@ -6094,7 +6119,7 @@ ENTRIES["labs/moe_cuda"] = lab_entry(
     contents=[
         ("`baseline_decode_attention.py`, `optimized_decode_attention.py`", "Attention microbenchmarks that validate correctness while optimizing kernel schedules."),
         ("`baseline_decode_kernel.py`, `optimized_decode_kernel.py`, `decode_kernels.py`, `kernels/`", "CUDA kernels and wrappers for the decode core."),
-        ("`baseline_kv_transfer.py`, `optimized_kv_transfer.py`, `optimized_kv_transfer_graphs.py`", "KV-transfer samples comparing eager vs CUDA Graph orchestration."),
+        ("`baseline_kv_transfer.py`, `baseline_kv_transfer_direct.py`, `baseline_kv_transfer_direct_graphs.py`, `optimized_kv_transfer.py`, `optimized_kv_transfer_direct.py`, `optimized_kv_transfer_graphs.py`, `optimized_kv_transfer_direct_graphs.py`", "KV-transfer samples comparing eager copies, overlap, direct destination placement, and CUDA Graph orchestration."),
         ("`baseline_router.py`, `optimized_router.py`, `optimized_router_vectorized.py`", "MoE router logic fit for device execution."),
         ("`expectations_{hardware_key}.json`, `__init__.py`", "Metadata and module exports needed by the harness."),
     ],
@@ -6105,7 +6130,7 @@ ENTRIES["labs/moe_cuda"] = lab_entry(
     ],
     notes=[
         "`kernels/` houses the raw CUDA sources split by component; edit schedules there before rebuilding via the harness.",
-        "`optimized_kv_transfer_graphs.py` emits CUDA Graph captures under `artifacts/` for reproducibility.",
+        "`optimized_kv_transfer_graphs.py` and `optimized_kv_transfer_direct_graphs.py` emit CUDA Graph captures under `artifacts/` for reproducibility.",
     ],
 )
 
@@ -6390,6 +6415,8 @@ ENTRIES["labs/speculative_decode"] = lab_entry(
     contents=[
         ("`baseline_speculative_decode.py`", "Target-only greedy decode baseline."),
         ("`optimized_speculative_decode.py`", "Draft proposals plus batched target verification."),
+        ("`baseline_speculative_decode_trusted.py`, `optimized_speculative_decode_trusted.py`", "Trusted-draft serving variant that compares verified speculative decode with direct draft-token placement."),
+        ("`baseline_speculative_decode_transition_table.py`, `optimized_speculative_decode_transition_table.py`", "Token-local transition cache variant that removes draft-model calls from repeated trusted decode."),
         ("`speculative_decode_common.py`", "Toy-model helpers and workload setup used by both paths."),
         ("`expectations_{hardware_key}.json`", "Regression thresholds for the benchmark pair."),
     ],

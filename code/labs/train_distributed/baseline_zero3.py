@@ -32,27 +32,28 @@ class ParamShard:
         self.shard_dim = 0
         self.rank = get("rank")
         self.world_size = get("ws")
-        self.full_data = None
+        self.full_data = torch.empty(
+            param.data.shape,
+            device=param.data.device,
+            dtype=param.data.dtype,
+        )
 
         shards = param.data.chunk(self.world_size, dim=self.shard_dim)
         local_shard = shards[self.rank].contiguous()
-        self.param.data = local_shard
+        self.local_shard = local_shard
+        self.local_grad = torch.empty_like(local_shard)
+        self.param.data = self.local_shard
 
     def all_gather(self):
-        local = self.param.data.contiguous()
-        shards = [torch.empty_like(local) for _ in range(self.world_size)]
-        dist.all_gather(shards, local)
-        self.full_data = torch.cat(shards, dim=self.shard_dim)
+        dist.all_gather_into_tensor(self.full_data, self.local_shard)
         self.param.data = self.full_data
 
     def drop_full(self):
-        shards = self.param.data.chunk(self.world_size, dim=self.shard_dim)
-        local = shards[self.rank].contiguous()
-        self.param.data = local
-        if self.param.grad is not None and self.param.grad.shape != local.shape:
+        self.param.data = self.local_shard
+        if self.param.grad is not None and self.param.grad.shape != self.local_shard.shape:
             grad_shards = self.param.grad.data.chunk(self.world_size, dim=self.shard_dim)
-            self.param.grad.data = grad_shards[self.rank].contiguous()
-        self.full_data = None
+            self.local_grad.copy_(grad_shards[self.rank])
+            self.param.grad.data = self.local_grad
 
 
 def attach_zero3_hooks(model, shard_map):
@@ -119,7 +120,7 @@ class Zero3Optimizer:
 def _build_model(hidden_size: int, device):
     layers = []
     for _ in range(6):
-        layers.extend([nn.Linear(hidden_size, hidden_size), nn.ReLU()])
+        layers.extend([nn.Linear(hidden_size, hidden_size), nn.ReLU(inplace=True)])
     layers.append(nn.Linear(hidden_size, hidden_size))
     return nn.Sequential(*layers).to(device)
 
@@ -131,14 +132,16 @@ def _build_adamw(params) -> AdamW:
 def train(model, optimizer, batch_size, device, steps, label, shard_map=None):
     rank = get("rank")
     input_dim = model[0].in_features
+    x = torch.empty(batch_size, input_dim, device=device)
+    y = torch.empty_like(x)
 
     if shard_map:
         attach_zero3_hooks(model, shard_map)
 
     optimizer.zero_grad()
-    warm_x = torch.randn(batch_size, input_dim, device=device)
-    warm_y = torch.randn_like(warm_x)
-    nn.functional.mse_loss(model(warm_x), warm_y).backward()
+    x.normal_()
+    y.normal_()
+    nn.functional.mse_loss(model(x), y).backward()
     optimizer.step()
     torch.cuda.synchronize()
 
@@ -151,8 +154,8 @@ def train(model, optimizer, batch_size, device, steps, label, shard_map=None):
         torch.cuda.reset_peak_memory_stats(device)
         optimizer.zero_grad()
 
-        x = torch.randn(batch_size, input_dim, device=device)
-        y = torch.randn_like(x)
+        x.normal_()
+        y.normal_()
         loss = nn.functional.mse_loss(model(x), y)
         loss.backward()
         optimizer.step()

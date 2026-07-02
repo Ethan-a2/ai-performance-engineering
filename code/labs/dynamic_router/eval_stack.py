@@ -17,6 +17,7 @@ that emits a consistent artifact layout:
 from __future__ import annotations
 
 import argparse
+import heapq
 import io
 import json
 import math
@@ -67,7 +68,12 @@ def _read_json(path: Path) -> Dict:
 def _percentile(values: Sequence[float], pct: float) -> float:
     if not values:
         return 0.0
-    ordered = sorted(values)
+    return _percentile_from_ordered(sorted(values), pct)
+
+
+def _percentile_from_ordered(ordered: Sequence[float], pct: float) -> float:
+    if not ordered:
+        return 0.0
     k = (len(ordered) - 1) * (pct / 100.0)
     lo = math.floor(k)
     hi = math.ceil(k)
@@ -93,26 +99,71 @@ def _dirichlet(rng: random.Random, alpha: float, k: int) -> List[float]:
     return [d / total for d in draws]
 
 
-def _percentiles(values: Sequence[float]) -> Dict[str, float]:
+def _rank_top_experts(
+    probs: Sequence[float],
+    expert_ids: range,
+    ranked_count: int,
+) -> List[int]:
+    if ranked_count <= 0:
+        return []
+    if ranked_count == 1:
+        best_id: int | None = None
+        best_prob = float("-inf")
+        for expert_id in expert_ids:
+            prob = probs[expert_id]
+            if best_id is None or prob > best_prob:
+                best_id = expert_id
+                best_prob = prob
+        return [] if best_id is None else [best_id]
+    if ranked_count == 2:
+        best_id: int | None = None
+        second_id: int | None = None
+        best_prob = float("-inf")
+        second_prob = float("-inf")
+        for expert_id in expert_ids:
+            prob = probs[expert_id]
+            if best_id is None or prob > best_prob:
+                second_id = best_id
+                second_prob = best_prob
+                best_id = expert_id
+                best_prob = prob
+            elif second_id is None or prob > second_prob:
+                second_id = expert_id
+                second_prob = prob
+        if best_id is None:
+            return []
+        return [best_id] if second_id is None else [best_id, second_id]
+    return heapq.nsmallest(
+        ranked_count,
+        expert_ids,
+        key=lambda expert_id: (-probs[expert_id], expert_id),
+    )
+
+
+def _percentiles(values: List[float]) -> Dict[str, float]:
+    values.sort()
     return {
-        "p50": _percentile(values, 50),
-        "p95": _percentile(values, 95),
+        "p50": _percentile_from_ordered(values, 50),
+        "p95": _percentile_from_ordered(values, 95),
     }
 
 
 def _summarize_quality_rows(rows: Sequence[Dict]) -> Dict:
     """Aggregate per-task accuracy from already-evaluated rows."""
-    per_task_acc: Dict[str, List[int]] = {}
+    correct_by_task: Dict[str, int] = {}
+    total_by_task: Dict[str, int] = {}
     for row in rows:
         task = row.get("task", "unknown")
         correct = 1 if row.get("correct") else 0
-        per_task_acc.setdefault(task, []).append(correct)
-    per_task_summary = {
-        t: (sum(v) / len(v) if v else 0.0) for t, v in per_task_acc.items()
-    }
-    avg_acc = (
-        sum(per_task_summary.values()) / len(per_task_summary) if per_task_summary else 0.0
-    )
+        correct_by_task[task] = correct_by_task.get(task, 0) + correct
+        total_by_task[task] = total_by_task.get(task, 0) + 1
+    per_task_summary: Dict[str, float] = {}
+    accuracy_total = 0.0
+    for task, correct in correct_by_task.items():
+        accuracy = correct / total_by_task[task]
+        per_task_summary[task] = accuracy
+        accuracy_total += accuracy
+    avg_acc = accuracy_total / len(per_task_summary) if per_task_summary else 0.0
     return {"per_task": per_task_summary, "avg_accuracy": avg_acc}
 
 
@@ -133,15 +184,19 @@ def _summarize_moe(
     # Drops may be per-token or per-window; support both.
     dropped_tokens = 0.0
     total_tokens = 0.0
-    entropy_samples: List[float] = []
-    margin_samples: List[float] = []
+    entropy_total = 0.0
+    entropy_count = 0
+    margin_total = 0.0
+    margin_count = 0
     for row in moe_router_rows:
         dropped_tokens += float(row.get("drops", 0))
         total_tokens += float(row.get("total_tokens", 0.0))
         if "entropy" in row:
-            entropy_samples.append(float(row["entropy"]))
+            entropy_total += float(row["entropy"])
+            entropy_count += 1
         if "margin" in row:
-            margin_samples.append(float(row.get("margin", 0.0)))
+            margin_total += float(row.get("margin", 0.0))
+            margin_count += 1
     if total_tokens <= 0 and moe_router_rows:
         total_tokens = float(len(moe_router_rows))
 
@@ -149,8 +204,8 @@ def _summarize_moe(
     return {
         "token_drop_rate": drop_rate,
         "imbalance_cv": imbalance,
-        "entropy": mean(entropy_samples) if entropy_samples else 0.0,
-        "gate_margin": mean(margin_samples) if margin_samples else 0.0,
+        "entropy": entropy_total / entropy_count if entropy_count else 0.0,
+        "gate_margin": margin_total / margin_count if margin_count else 0.0,
     }
 
 
@@ -369,16 +424,20 @@ class CheapEvalStack:
         }
         (run_dir / "sys_meta.json").write_text(json.dumps(sys_meta, indent=2))
 
+        latency_summary = scorecard["latency"]
+        ttft_summary = latency_summary["ttft"]
+        decode_summary = latency_summary["decode"]
+
         summary = {
             "run_dir": str(run_dir),
             "accuracy_overall": quality_summary["avg_accuracy"],
             "accuracy_mmlu": quality_summary["per_task"].get("mmlu-mini", 0.0),
             "accuracy_math": quality_summary["per_task"].get("gsm8k-lite", 0.0),
             "accuracy_truthful": quality_summary["per_task"].get("truthfulqa-lite", 0.0),
-            "ttft_p50_ms": _percentile([r["ttft_ms"] for r in latency_rows], 50),
-            "ttft_p95_ms": _percentile([r["ttft_ms"] for r in latency_rows], 95),
-            "decode_p50_ms": _percentile([r["decode_ms"] for r in latency_rows], 50),
-            "decode_p95_ms": _percentile([r["decode_ms"] for r in latency_rows], 95),
+            "ttft_p50_ms": ttft_summary["p50"],
+            "ttft_p95_ms": ttft_summary["p95"],
+            "decode_p50_ms": decode_summary["p50"],
+            "decode_p95_ms": decode_summary["p95"],
             "token_drop_rate": moe_summary["token_drop_rate"],
             "expert_imbalance_cv": moe_summary["imbalance_cv"],
             "router_entropy": moe_summary["entropy"],
@@ -393,18 +452,16 @@ class CheapEvalStack:
     # ------------------------------------------------------------------ Quality
     def _run_quality(self, optimized: bool) -> Tuple[List[Dict], Dict]:
         rows: List[Dict] = []
-        per_task_acc: Dict[str, List[int]] = {k: [] for k in QUALITY_TASKS}
         base_acc = 0.62 if not optimized else 0.74
         consistency_bonus = 0.0 if not optimized else 0.03
 
         if self._llm_available and self.cfg.use_vllm:
-            rows, per_task_acc = self._run_quality_with_llm()
+            rows = self._run_quality_with_llm()
         else:
             # Synthetic fallback when vLLM is unavailable in the current environment.
             for task, qas in QUALITY_TASKS.items():
                 for _, expected in qas:
                     correct = self._rng.random() < (base_acc + consistency_bonus)
-                    per_task_acc[task].append(1 if correct else 0)
                     rows.append(
                         {
                             "task": task,
@@ -415,15 +472,11 @@ class CheapEvalStack:
                         }
                     )
 
-        per_task_summary = {t: (sum(v) / len(v) if v else 0.0) for t, v in per_task_acc.items()}
-        avg_acc = (
-            sum(per_task_summary.values()) / len(per_task_summary) if per_task_summary else 0.0
-        )
-        return rows, {"per_task": per_task_summary, "avg_accuracy": avg_acc}
+        return rows, _summarize_quality_rows(rows)
 
-    def _run_quality_with_llm(self) -> Tuple[List[Dict], Dict[str, List[int]]]:
+    def _run_quality_with_llm(self) -> List[Dict]:
         if self._llm is None:
-            return [], {}
+            return []
 
         prompts: List[Tuple[str, str, str]] = []  # (task, prompt, expected)
         for task, qas in QUALITY_TASKS.items():
@@ -441,7 +494,6 @@ class CheapEvalStack:
         )
 
         rows: List[Dict] = []
-        per_task_acc: Dict[str, List[int]] = {k: [] for k in QUALITY_TASKS}
         for meta, out in zip(prompts, outputs):
             task, prompt, expected = meta
             completion = out.outputs[0].text if out.outputs else ""
@@ -458,8 +510,7 @@ class CheapEvalStack:
                     "source": "vllm",
                 }
             )
-            per_task_acc[task].append(int(correct))
-        return rows, per_task_acc
+        return rows
 
     # ----------------------------------------------------------------- Latency
     def _simulate_latency(self, optimized: bool) -> List[Dict]:
@@ -497,12 +548,18 @@ class CheapEvalStack:
         traffic_rows: List[Dict] = []
 
         rng = self._rng
-        expert_hist = [0 for _ in range(self.cfg.experts)]
-        entropy_samples: List[float] = []
-        margin_samples: List[float] = []
+        experts = self.cfg.experts
+        top_k = self.cfg.top_k
+        ranked_count = min(experts, max(top_k, 2))
+        expert_ids = range(experts)
+        expert_hist = [0 for _ in expert_ids]
+        entropy_total = 0.0
+        margin_total = 0.0
+        router_sample_count = 0
 
         drop_chance = 0.0065 if not optimized else 0.0008
         imbalance_tilt = 0.35 if not optimized else 0.15
+        dirichlet_alpha = 0.85 if optimized else 0.55
 
         total_tokens = 0
         dropped_tokens = 0
@@ -513,16 +570,16 @@ class CheapEvalStack:
         for step in range(total_steps):
             probs = _dirichlet(
                 rng,
-                alpha=0.55 if not optimized else 0.85,
-                k=self.cfg.experts,
+                alpha=dirichlet_alpha,
+                k=experts,
             )
-            sorted_probs = sorted(probs, reverse=True)
+            ranked_experts = _rank_top_experts(probs, expert_ids, ranked_count)
             entropy = -sum(p * math.log(p + 1e-9) for p in probs)
-            margin = sorted_probs[0] - sorted_probs[1]
+            best_prob = probs[ranked_experts[0]]
+            second_prob = probs[ranked_experts[1]] if experts > 1 else 0.0
+            margin = best_prob - second_prob
 
-            token_experts = sorted(range(self.cfg.experts), key=lambda i: probs[i], reverse=True)[
-                : self.cfg.top_k
-            ]
+            token_experts = ranked_experts[:top_k]
             for e in token_experts:
                 expert_hist[e] += 1
 
@@ -533,8 +590,9 @@ class CheapEvalStack:
                 roll *= 0.5  # optimized routing should hit capacity limits less often
             drop_event = roll < adjusted_drop
 
-            entropy_samples.append(entropy)
-            margin_samples.append(margin)
+            entropy_total += entropy
+            margin_total += margin
+            router_sample_count += 1
             total_tokens += 1
             dropped_tokens += 1 if drop_event else 0
 
@@ -560,23 +618,29 @@ class CheapEvalStack:
         summary = {
             "token_drop_rate": drop_rate,
             "imbalance_cv": _imbalance_cv(expert_hist),
-            "entropy": mean(entropy_samples) if entropy_samples else 0.0,
-            "gate_margin": mean(margin_samples) if margin_samples else 0.0,
+            "entropy": entropy_total / router_sample_count if router_sample_count else 0.0,
+            "gate_margin": margin_total / router_sample_count if router_sample_count else 0.0,
         }
         return router_rows, traffic_rows, summary
 
     # -------------------------------------------------------------- Throughput
     def _compute_throughput(self, latency_rows: List[Dict], drop_rate: float) -> Dict[str, float]:
-        total_tokens = sum(r["output_tokens"] for r in latency_rows)
-        total_time_s = sum((r["ttft_ms"] + r["decode_ms"]) for r in latency_rows) / 1000.0
+        total_tokens = 0
+        total_latency_ms = 0.0
+        good_tokens = 0
+        slo_hit_count = 0
+        for row in latency_rows:
+            output_tokens = row["output_tokens"]
+            ttft_ms = row["ttft_ms"]
+            decode_ms = row["decode_ms"]
+            total_tokens += output_tokens
+            total_latency_ms += ttft_ms + decode_ms
+            if ttft_ms <= self.cfg.ttft_slo_ms and decode_ms <= self.cfg.latency_slo_ms:
+                slo_hit_count += 1
+                good_tokens += output_tokens
+        total_time_s = total_latency_ms / 1000.0
         throughput = total_tokens / total_time_s if total_time_s > 0 else 0.0
 
-        good_rows = [
-            r
-            for r in latency_rows
-            if r["ttft_ms"] <= self.cfg.ttft_slo_ms and r["decode_ms"] <= self.cfg.latency_slo_ms
-        ]
-        good_tokens = sum(r["output_tokens"] for r in good_rows)
         goodput = good_tokens / total_time_s if total_time_s > 0 else 0.0
         # Penalize goodput when drop rate is high to reflect MoE instability.
         goodput *= max(0.0, 1.0 - drop_rate * 5.0)
@@ -584,7 +648,7 @@ class CheapEvalStack:
         return {
             "throughput_tps": throughput,
             "goodput": goodput,
-            "slo_hit_rate": (len(good_rows) / len(latency_rows)) if latency_rows else 0.0,
+            "slo_hit_rate": (slo_hit_count / len(latency_rows)) if latency_rows else 0.0,
             "drop_rate": drop_rate,
         }
 
@@ -597,19 +661,27 @@ class CheapEvalStack:
         moe_summary: Dict,
         throughput_summary: Dict,
     ) -> Dict[str, Dict]:
-        ttft_vals = [r["ttft_ms"] for r in latency_rows]
-        decode_vals = [r["decode_ms"] for r in latency_rows]
-        warm_rows = [r for r in latency_rows if r["case"] == "warm"]
-        cold_rows = [r for r in latency_rows if r["case"] == "cold"]
-
-        def _decode_bucket(target: int) -> Dict[str, float]:
-            bucket = [r["decode_ms"] for r in latency_rows if r["output_tokens"] == target]
-            return _percentiles(bucket) if bucket else {"p50": 0.0, "p95": 0.0}
+        ttft_vals: List[float] = []
+        decode_vals: List[float] = []
+        warm_ttft_vals: List[float] = []
+        cold_ttft_vals: List[float] = []
+        decode_by_token_vals: Dict[int, List[float]] = {128: [], 512: [], 2048: []}
+        for row in latency_rows:
+            ttft_ms = row["ttft_ms"]
+            decode_ms = row["decode_ms"]
+            ttft_vals.append(ttft_ms)
+            decode_vals.append(decode_ms)
+            if row["case"] == "warm":
+                warm_ttft_vals.append(ttft_ms)
+            elif row["case"] == "cold":
+                cold_ttft_vals.append(ttft_ms)
+            token_bucket = decode_by_token_vals.get(row["output_tokens"])
+            if token_bucket is not None:
+                token_bucket.append(decode_ms)
 
         decode_by_len = {
-            "128": _decode_bucket(128),
-            "512": _decode_bucket(512),
-            "2048": _decode_bucket(2048),
+            str(target): _percentiles(bucket) if bucket else {"p50": 0.0, "p95": 0.0}
+            for target, bucket in decode_by_token_vals.items()
         }
 
         return {
@@ -620,8 +692,8 @@ class CheapEvalStack:
             },
             "latency": {
                 "ttft": _percentiles(ttft_vals),
-                "ttft_warm": _percentiles([r["ttft_ms"] for r in warm_rows]),
-                "ttft_cold": _percentiles([r["ttft_ms"] for r in cold_rows]),
+                "ttft_warm": _percentiles(warm_ttft_vals),
+                "ttft_cold": _percentiles(cold_ttft_vals),
                 "decode": _percentiles(decode_vals),
                 "decode_by_tokens": decode_by_len,
                 "slo_ms": {"ttft": self.cfg.ttft_slo_ms, "latency": self.cfg.latency_slo_ms},

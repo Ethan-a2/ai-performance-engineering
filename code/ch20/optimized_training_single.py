@@ -25,7 +25,7 @@ class SimpleModel(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim, hidden_dim * 2)
         self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.relu(self.fc1(x))
@@ -48,11 +48,13 @@ class OptimizedTrainingSingleBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.batch_size = 32
         self.hidden_dim = 8192
         self.train_steps = 6
+        self._train_step_range = range(self.train_steps)
         tokens = self.batch_size * self.hidden_dim
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
             tokens_per_iteration=float(tokens),
         )
+        self._payload_parameter_count = 0
     
     def setup(self) -> None:
         torch.manual_seed(42)
@@ -65,6 +67,7 @@ class OptimizedTrainingSingleBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.backends.cudnn.allow_tf32 = True
 
         self.model = SimpleModel(hidden_dim=self.hidden_dim).to(self.device).float().train()
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         
         self.inputs = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float32)
         self.targets = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float32)
@@ -73,13 +76,14 @@ class OptimizedTrainingSingleBenchmark(VerificationPayloadMixin, BaseBenchmark):
         except TypeError:
             self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.01)
         self.criterion = nn.MSELoss()
+        self._train_step_range = range(self.train_steps)
         self._synchronize()
     
     def benchmark_fn(self) -> None:
         assert self.model is not None and self.inputs is not None and self.targets is not None
         assert self.optimizer is not None and self.criterion is not None
         with self._nvtx_range("training_optimized"):
-            for _ in range(self.train_steps):
+            for _ in self._train_step_range:
                 self.optimizer.zero_grad(set_to_none=True)
                 outputs = self.model(self.inputs)
                 loss = self.criterion(outputs, self.targets)
@@ -94,7 +98,7 @@ class OptimizedTrainingSingleBenchmark(VerificationPayloadMixin, BaseBenchmark):
             inputs={"inputs": self.inputs, "targets": self.targets},
             output=output,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(1e-2, 1e-2),
         )
     

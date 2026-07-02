@@ -8,8 +8,6 @@ Implements BaseBenchmark for harness integration.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import torch
 
 
@@ -31,6 +29,7 @@ class BaselineArithmeticIntensityBenchmark(VerificationPayloadMixin, BaseBenchma
         self.A: torch.Tensor | None = None
         self.B: torch.Tensor | None = None
         self.C: torch.Tensor | None = None
+        self._verify_output_buffer: torch.Tensor | None = None
         self.M = 2048
         self.K = 2048
         self.N = 2048
@@ -50,7 +49,8 @@ class BaselineArithmeticIntensityBenchmark(VerificationPayloadMixin, BaseBenchma
         # Allocate matrices for chunked matmul accumulation.
         self.A = torch.randn(self.M, self.K, device=self.device, dtype=torch.float32)
         self.B = torch.randn(self.K, self.N, device=self.device, dtype=torch.float32)
-        self.C = torch.zeros(self.M, self.N, device=self.device, dtype=torch.float32)
+        self.C = torch.empty(self.M, self.N, device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty_like(self.C)
 
         # Warm up chunked kernel launches.
         self._chunked_matmul()
@@ -62,8 +62,9 @@ class BaselineArithmeticIntensityBenchmark(VerificationPayloadMixin, BaseBenchma
     def _chunked_matmul(self) -> None:
         """Compute C = A @ B using small K-tiles."""
         assert self.A is not None and self.B is not None and self.C is not None
-        self.C.zero_()
-        for k in range(0, self.K, self.block_k):
+        first_end = min(self.block_k, self.K)
+        torch.mm(self.A[:, :first_end], self.B[:first_end, :], out=self.C)
+        for k in range(first_end, self.K, self.block_k):
             k_end = min(k + self.block_k, self.K)
             a_slice = self.A[:, k:k_end]
             b_slice = self.B[k:k_end, :]
@@ -72,7 +73,7 @@ class BaselineArithmeticIntensityBenchmark(VerificationPayloadMixin, BaseBenchma
     
     def benchmark_fn(self) -> None:
         """Function to benchmark - low arithmetic intensity (memory-bound)."""
-        with self._nvtx_range("baseline_arithmetic_intensity"):
+        with torch.inference_mode(), self._nvtx_range("baseline_arithmetic_intensity"):
             if self.A is None or self.B is None or self.C is None:
                 raise RuntimeError("Benchmark not initialized")
             self._chunked_matmul()
@@ -80,9 +81,12 @@ class BaselineArithmeticIntensityBenchmark(VerificationPayloadMixin, BaseBenchma
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.C is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.C)
         self._set_verification_payload(
             inputs={"A": self.A, "B": self.B},
-            output=self.C.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.M,
             precision_flags={
                 "fp16": False,
@@ -99,6 +103,7 @@ class BaselineArithmeticIntensityBenchmark(VerificationPayloadMixin, BaseBenchma
         self.A = None
         self.B = None
         self.C = None
+        self._verify_output_buffer = None
         super().teardown()
     
     def get_config(self) -> BenchmarkConfig:
@@ -129,4 +134,3 @@ class BaselineArithmeticIntensityBenchmark(VerificationPayloadMixin, BaseBenchma
 def get_benchmark() -> BaseBenchmark:
     """Factory function for benchmark discovery."""
     return BaselineArithmeticIntensityBenchmark()
-

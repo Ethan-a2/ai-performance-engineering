@@ -16,8 +16,6 @@ FlashAttention-3 Key Innovations (not used in baseline):
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,6 +61,19 @@ class BaselineFlashAttention3(nn.Module):
         self.k_proj = nn.Linear(hidden_dim, num_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(hidden_dim, num_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(num_heads * self.head_dim, hidden_dim, bias=False)
+        self.register_buffer(
+            "_causal_mask",
+            torch.empty(0, 0, dtype=torch.bool),
+            persistent=False,
+        )
+
+    def _causal_mask_for(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        mask = self._causal_mask
+        if mask.device != device or mask.size(0) < seq_len:
+            pos = torch.arange(seq_len, device=device)
+            self._causal_mask = pos.unsqueeze(0) > pos.unsqueeze(1)
+            mask = self._causal_mask
+        return mask[:seq_len, :seq_len]
         
     def forward(
         self,
@@ -96,8 +107,8 @@ class BaselineFlashAttention3(nn.Module):
         
         # Apply causal mask if needed
         if is_causal:
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
-            scores = scores.masked_fill(mask, float('-inf'))
+            mask = self._causal_mask_for(seq_len, x.device)
+            scores.masked_fill_(mask, float('-inf'))
         
         # Softmax (full matrix in memory)
         attn_weights = F.softmax(scores, dim=-1)
@@ -134,6 +145,7 @@ class BaselineFlashAttention3Benchmark(VerificationPayloadMixin, BaseBenchmark):
         
         self.input: Optional[torch.Tensor] = None
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         
         tokens = self.batch_size * self.seq_len
@@ -170,27 +182,28 @@ class BaselineFlashAttention3Benchmark(VerificationPayloadMixin, BaseBenchmark):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
 
-        with torch.no_grad():
-            weight_scale = 0.02
-            q_weight = torch.randn(self.hidden_dim, self.hidden_dim, device=self.device, dtype=dtype) * weight_scale
-            k_weight = torch.randn(self.hidden_dim, self.hidden_dim, device=self.device, dtype=dtype) * weight_scale
-            v_weight = torch.randn(self.hidden_dim, self.hidden_dim, device=self.device, dtype=dtype) * weight_scale
-            out_weight = torch.randn(self.hidden_dim, self.hidden_dim, device=self.device, dtype=dtype) * weight_scale
+        weight_scale = 0.02
+        q_weight = torch.randn(self.hidden_dim, self.hidden_dim, device=self.device, dtype=dtype) * weight_scale
+        k_weight = torch.randn(self.hidden_dim, self.hidden_dim, device=self.device, dtype=dtype) * weight_scale
+        v_weight = torch.randn(self.hidden_dim, self.hidden_dim, device=self.device, dtype=dtype) * weight_scale
+        out_weight = torch.randn(self.hidden_dim, self.hidden_dim, device=self.device, dtype=dtype) * weight_scale
 
+        with torch.inference_mode():
             self.model.q_proj.weight.copy_(q_weight)
             self.model.k_proj.weight.copy_(k_weight)
             self.model.v_proj.weight.copy_(v_weight)
             self.model.out_proj.weight.copy_(out_weight)
 
-            self.input = torch.randn(
-                self.batch_size, self.seq_len, self.hidden_dim,
-                device=self.device, dtype=dtype
-            )
+        self.input = torch.randn(
+            self.batch_size, self.seq_len, self.hidden_dim,
+            device=self.device, dtype=dtype
+        )
 
-        self._verify_input = self.input.detach().clone()
+        self._verify_input = self.input.detach()
+        self._verify_output_buffer = torch.empty_like(self.input)
         
         # Warmup
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(3):
                 _ = self.model(self.input, is_causal=self.use_causal)
         
@@ -198,18 +211,21 @@ class BaselineFlashAttention3Benchmark(VerificationPayloadMixin, BaseBenchmark):
     def benchmark_fn(self) -> None:
         """Benchmark baseline attention."""
         with self._nvtx_range("baseline_fa3_attention"):
-            with torch.no_grad():
-                self.output = self.model(self.input, is_causal=self.use_causal).detach()
+            with torch.inference_mode():
+                self.output = self.model(self.input, is_causal=self.use_causal)
         if self._verify_input is None:
             raise RuntimeError("Verification input not initialized")
         dtype = self._verify_input.dtype
         self._payload_dtype = dtype
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output before verification")
+        self._verify_output_buffer.copy_(self.output)
         dtype = self._payload_dtype
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -225,6 +241,9 @@ class BaselineFlashAttention3Benchmark(VerificationPayloadMixin, BaseBenchmark):
         """Clean up."""
         self.model = None
         self.input = None
+        self._verify_input = None
+        self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:
@@ -257,7 +276,7 @@ class BaselineFlashAttention3Benchmark(VerificationPayloadMixin, BaseBenchmark):
         if self.input is None:
             return "Input not initialized"
         
-        with torch.no_grad():
+        with torch.inference_mode():
             output = self.model(self.input[:1, :128], is_causal=False)
             if torch.isnan(output).any():
                 return "NaN in attention output"
@@ -268,5 +287,3 @@ class BaselineFlashAttention3Benchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> BaseBenchmark:
     """Factory function for harness discovery."""
     return BaselineFlashAttention3Benchmark()
-
-

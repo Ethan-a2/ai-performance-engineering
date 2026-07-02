@@ -25,6 +25,8 @@ class BaselineBatchBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.input_flat: torch.Tensor | None = None
         self.inputs_chunked: torch.Tensor | None = None
         self._output_buffer: torch.Tensor | None = None
+        self._verify_output_buffer: torch.Tensor | None = None
+        self._microbatch_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
         self.output: torch.Tensor | None = None
         self.workload = WORKLOAD
         self.micro_batch_size = self.workload.baseline_micro_batch_size
@@ -47,7 +49,7 @@ class BaselineBatchBenchmark(VerificationPayloadMixin, BaseBenchmark):
         # Harness provides seeding - model and input creation order must match optimized
         self.model = nn.Sequential(
             nn.Linear(self.hidden_dim, self.ffn_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(self.ffn_dim, self.hidden_dim),
         ).to(self.device).eval()
         
@@ -65,28 +67,40 @@ class BaselineBatchBenchmark(VerificationPayloadMixin, BaseBenchmark):
         )
         # Pre-allocate output buffer (output itself is set during benchmark_fn for harness validity)
         self._output_buffer = torch.empty(self.total_batch_size, self.hidden_dim, device=self.device)
+        self._verify_output_buffer = torch.empty_like(self._output_buffer)
+        output_chunked = self._output_buffer.view(
+            self.micro_batches,
+            self.micro_batch_size,
+            self.hidden_dim,
+        )
+        self._microbatch_pairs = list(
+            zip(self.inputs_chunked.unbind(0), output_chunked.unbind(0), strict=True)
+        )
         self._synchronize()
     
     def benchmark_fn(self) -> None:
         """Benchmark: Operations with small batch size (multiple kernel launches)."""
         if self.model is None or self.inputs_chunked is None or self._output_buffer is None:
             raise RuntimeError("Benchmark not configured")
+        if not self._microbatch_pairs:
+            raise RuntimeError("setup() must initialize microbatch views")
         output = self._output_buffer
         with self._nvtx_range("batch_baseline"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Process each micro-batch separately (many small kernel launches)
-                for idx in range(self.micro_batches):
-                    start = idx * self.micro_batch_size
-                    end = start + self.micro_batch_size
-                    output[start:end] = self.model(self.inputs_chunked[idx])
+                for input_chunk, output_chunk in self._microbatch_pairs:
+                    output_chunk.copy_(self.model(input_chunk))
         self.output = output
         if self.output is None or self.input_flat is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self.input_flat},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.total_batch_size,
             parameter_count=0,
             precision_flags={
@@ -104,6 +118,8 @@ class BaselineBatchBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.input_flat = None
         self.inputs_chunked = None
         self._output_buffer = None
+        self._verify_output_buffer = None
+        self._microbatch_pairs = []
         self.output = None
         super().teardown()
     

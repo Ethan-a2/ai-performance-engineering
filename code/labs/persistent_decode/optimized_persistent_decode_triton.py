@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -76,67 +78,72 @@ class OptimizedPersistentDecodeTritonBenchmark(VerificationPayloadMixin, BaseBen
         self.num_programs = self.profile.num_programs
         self.register_workload_metadata(tokens_per_iteration=tokens_per_iteration())
         self.output: Optional[torch.Tensor] = None
+        self._output_view: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._num_items = min(self.batch, self.num_programs)
+        self._launch_grid = (max(1, self._num_items),)
+        self._block_k_const = self.block_k
 
     def setup(self) -> None:
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
         self.inputs = build_inputs(self.device)
+        self._output_view = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])]
+        self._verify_output_buffer = torch.empty_like(self._output_view, dtype=torch.float32)
         self._synchronize()
 
         # Precompile the Triton kernel to keep measurement under benchmark timeouts.
-        grid = (max(1, min(self.batch, self.num_programs)),)
-        BLOCK_K = self.block_k
-        persistent_decode_kernel[grid](
+        persistent_decode_kernel[self._launch_grid](
             self.inputs.q,
             self.inputs.k,
             self.inputs.v,
             self.inputs.out,
             self.inputs.work_seq_ids,
             self.inputs.work_steps,
-            self.batch,
+            self._num_items,
             head_dim=self.head_dim,
             max_steps=self.seq_len,
-            BLOCK_K=BLOCK_K,
+            BLOCK_K=self._block_k_const,
             num_warps=2,
             num_stages=1,
         )
         self._synchronize()
 
     def benchmark_fn(self) -> None:
-        if self.inputs is None:
+        if self.inputs is None or self._output_view is None:
             raise RuntimeError("Inputs not initialized")
 
-        num_items = min(self.batch, self.num_programs)
-        grid = (max(1, num_items),)
-        BLOCK_K = self.block_k
-        with self._nvtx_range("persistent_decode_triton"):
-            persistent_decode_kernel[grid](
+        with torch.inference_mode(), self._nvtx_range("persistent_decode_triton"):
+            persistent_decode_kernel[self._launch_grid](
                 self.inputs.q,
                 self.inputs.k,
                 self.inputs.v,
                 self.inputs.out,
                 self.inputs.work_seq_ids,
                 self.inputs.work_steps,
-                num_items,
+                self._num_items,
                 head_dim=self.head_dim,
                 max_steps=self.seq_len,
-                BLOCK_K=BLOCK_K,
+                BLOCK_K=self._block_k_const,
                 num_warps=2,
                 num_stages=1,
             )
-        self.output = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])].detach()
+        self.output = self._output_view
         if self.inputs is None or self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
+        if self.inputs is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "q": self.inputs.q.detach(),
                 "k": self.inputs.k.detach(),
                 "v": self.inputs.v.detach(),
             },
-            output=self.output.float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch,
             parameter_count=0,
             precision_flags={
@@ -151,6 +158,8 @@ class OptimizedPersistentDecodeTritonBenchmark(VerificationPayloadMixin, BaseBen
         torch.cuda.empty_cache()
         self.inputs = None
         self.output = None
+        self._output_view = None
+        self._verify_output_buffer = None
 
     def get_config(self) -> BenchmarkConfig:
         return BenchmarkConfig(

@@ -40,6 +40,11 @@ class DenseAttentionFlashBlackwellVariantBenchmark(VerificationPayloadMixin, Bas
         self.qkv_proj: Optional[nn.Linear] = None
         self.out_proj: Optional[nn.Linear] = None
         self.inputs: Optional[torch.Tensor] = None
+        self._qkv_buffer: Optional[torch.Tensor] = None
+        self._attn_merge_buffer: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._qkv_weight_t: Optional[torch.Tensor] = None
+        self._out_proj_weight_t: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self.batch_size = 4
         self.seq_length = 4096
@@ -49,6 +54,9 @@ class DenseAttentionFlashBlackwellVariantBenchmark(VerificationPayloadMixin, Bas
         self.head_dim = self.hidden_dim // self.num_heads
         self.dtype = torch.float16
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
         self.register_workload_metadata(
             requests_per_iteration=float(self.batch_size),
             tokens_per_iteration=float(self.batch_size * self.seq_length),
@@ -62,6 +70,8 @@ class DenseAttentionFlashBlackwellVariantBenchmark(VerificationPayloadMixin, Bas
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         
         device = torch.device("cuda")
         
@@ -79,6 +89,8 @@ class DenseAttentionFlashBlackwellVariantBenchmark(VerificationPayloadMixin, Bas
             device=device,
             dtype=self.dtype,
         )
+        self._qkv_weight_t = self.qkv_proj.weight.t()
+        self._out_proj_weight_t = self.out_proj.weight.t()
         self.inputs = torch.randn(
             self.batch_size,
             self.seq_length,
@@ -87,15 +99,58 @@ class DenseAttentionFlashBlackwellVariantBenchmark(VerificationPayloadMixin, Bas
             dtype=self.dtype,
         )
         self._verify_input = self.inputs.detach().clone()
+        self._qkv_buffer = torch.empty(
+            self.batch_size,
+            self.seq_length,
+            self.hidden_dim * 3,
+            device=device,
+            dtype=self.dtype,
+        )
+        self._attn_merge_buffer = torch.empty(
+            self.batch_size,
+            self.seq_length,
+            self.hidden_dim,
+            device=device,
+            dtype=self.dtype,
+        )
+        self._output_buffer = torch.empty(
+            self.batch_size,
+            self.seq_length,
+            self.hidden_dim,
+            device=device,
+            dtype=self.dtype,
+        )
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            self.seq_length,
+            self.hidden_dim,
+            device=device,
+            dtype=self.dtype,
+        )
+        self._payload_parameter_count = sum(p.numel() for p in self.qkv_proj.parameters()) + sum(
+            p.numel() for p in self.out_proj.parameters()
+        )
         
         # Proper warmup
         for _ in range(5):
-            with torch.no_grad():
+            with torch.inference_mode():
                 self._forward_flash()
     
     def _forward_flash(self):
         """Flash Attention via SDPA."""
-        qkv = self.qkv_proj(self.inputs)
+        if (
+            self.inputs is None
+            or self.qkv_proj is None
+            or self.out_proj is None
+            or self._qkv_buffer is None
+            or self._attn_merge_buffer is None
+            or self._output_buffer is None
+            or self._qkv_weight_t is None
+            or self._out_proj_weight_t is None
+        ):
+            raise RuntimeError("Benchmark not configured")
+
+        qkv = torch.matmul(self.inputs, self._qkv_weight_t, out=self._qkv_buffer)
         q, k, v = torch.chunk(qkv, 3, dim=-1)
         
         B, S, _ = q.shape
@@ -110,32 +165,26 @@ class DenseAttentionFlashBlackwellVariantBenchmark(VerificationPayloadMixin, Bas
             dropout_p=0.0,
         )
         
-        output = output.transpose(1, 2).contiguous().view(B, S, self.hidden_dim)
-        return self.out_proj(output)
+        self._attn_merge_buffer.copy_(output.transpose(1, 2))
+        return torch.matmul(self._attn_merge_buffer, self._out_proj_weight_t, out=self._output_buffer)
     
     def benchmark_fn(self) -> None:
         """Benchmark the Flash SDPA forward path for the Blackwell variant."""
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        with nvtx_range("optimized_dense_attention_flash_blackwell_variant", enable=enable_nvtx):
-            with torch.no_grad():
+        with nvtx_range("optimized_dense_attention_flash_blackwell_variant", enable=self._enable_nvtx):
+            with torch.inference_mode():
                 self.output = self._forward_flash()
         if self._verify_input is None:
             raise RuntimeError("Verification input missing")
-        parameter_count = 0
-        if self.qkv_proj is not None:
-            parameter_count += sum(p.numel() for p in self.qkv_proj.parameters())
-        if self.out_proj is not None:
-            parameter_count += sum(p.numel() for p in self.out_proj.parameters())
-        self._payload_parameter_count = parameter_count
 
     def capture_verification_payload(self) -> None:
-        parameter_count = self._payload_parameter_count
+        if self.output is None or self._verify_input is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
-            parameter_count=parameter_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": True,
                 "bf16": False,
@@ -150,6 +199,12 @@ class DenseAttentionFlashBlackwellVariantBenchmark(VerificationPayloadMixin, Bas
         self.qkv_proj = None
         self.out_proj = None
         self.inputs = None
+        self._qkv_buffer = None
+        self._attn_merge_buffer = None
+        self._output_buffer = None
+        self._qkv_weight_t = None
+        self._out_proj_weight_t = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_custom_metrics(self) -> Optional[dict]:

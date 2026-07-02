@@ -35,6 +35,7 @@ class OptimizedCublasBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.A: Optional[torch.Tensor] = None
         self.B: Optional[torch.Tensor] = None
         self.C: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self._last_elapsed_ms: Optional[float] = None
         self._workload = WorkloadMetadata(
             requests_per_iteration=1.0,
@@ -51,7 +52,8 @@ class OptimizedCublasBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         self.A = torch.randn(self.m, self.k, device=self.device, dtype=torch.float32)
         self.B = torch.randn(self.k, self.n, device=self.device, dtype=torch.float32)
-        self.C = None
+        self.C = torch.empty(self.m, self.n, device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty_like(self.C)
 
         # Warmup a handful of GEMMs so cuBLAS Lt heuristics settle before measurement.
         for _ in range(10):
@@ -59,17 +61,25 @@ class OptimizedCublasBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def benchmark_fn(self) -> None:
         """cuBLAS TF32 GEMM."""
-        assert self.A is not None and self.B is not None
-        with self._nvtx_range("optimized_cublas_tf32"):
-            self.C = torch.matmul(self.A, self.B)
+        assert self.A is not None and self.B is not None and self.C is not None
+        with torch.inference_mode(), self._nvtx_range("optimized_cublas_tf32"):
+            torch.mm(self.A, self.B, out=self.C)
 
         if self.C is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if (
+            self.A is None
+            or self.B is None
+            or self.C is None
+            or self._verify_output_buffer is None
+        ):
+            raise RuntimeError("benchmark_fn() must be called before verification")
+        self._verify_output_buffer.copy_(self.C)
         self._set_verification_payload(
             inputs={"A": self.A, "B": self.B},
-            output=self.C.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.A.shape[0],
             parameter_count=0,
             precision_flags={
@@ -87,6 +97,7 @@ class OptimizedCublasBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.A = None
         self.B = None
         self.C = None
+        self._verify_output_buffer = None
         self._last_elapsed_ms = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

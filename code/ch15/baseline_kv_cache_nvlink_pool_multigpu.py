@@ -42,6 +42,23 @@ class BaselineKVCacheLocalOnlyBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self._query_steps: Optional[torch.Tensor] = None
         self._key_steps: Optional[torch.Tensor] = None
         self._value_steps: Optional[torch.Tensor] = None
+        self._decode_step_inputs: List[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._k_gather_buffer: Optional[torch.Tensor] = None
+        self._v_gather_buffer: Optional[torch.Tensor] = None
+        self._k_gather_step_views: List[torch.Tensor] = []
+        self._v_gather_step_views: List[torch.Tensor] = []
+        self._k_gather_prefix_views: List[torch.Tensor] = []
+        self._v_gather_prefix_views: List[torch.Tensor] = []
+        self._peer_host_k_stage: Optional[torch.Tensor] = None
+        self._peer_host_v_stage: Optional[torch.Tensor] = None
+        self._cache_key_slots: List[torch.Tensor] = []
+        self._cache_value_slots: List[torch.Tensor] = []
+        self._tier_slots: List[str] = []
+        self._peer_target_slots: List[Optional[torch.device]] = []
+        self._slot_counts: Tuple[int, ...] = ()
+        self._expected_slot_counts: Tuple[int, ...] = ()
+        self._cache_gather_ranges: List[range] = []
+        self._payload_parameter_count = 0
 
     def setup(self) -> None:
         torch.manual_seed(42)
@@ -51,9 +68,76 @@ class BaselineKVCacheLocalOnlyBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.device_ids = list(range(torch.cuda.device_count()))
         self.peer_devices = [torch.device(f"cuda:{idx}") for idx in self.device_ids[1:]]
         self.model = nn.MultiheadAttention(self.hidden, self.heads, batch_first=True).to(self.device).eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         self._query_steps = torch.randn(self.seq_len, self.batch, 1, self.hidden, device=self.device)
         self._key_steps = torch.randn(self.seq_len, self.batch, 1, self.hidden, device=self.device)
         self._value_steps = torch.randn(self.seq_len, self.batch, 1, self.hidden, device=self.device)
+        self._decode_step_inputs = list(
+            zip(range(self.seq_len), self._query_steps, self._key_steps, self._value_steps, strict=True)
+        )
+        self._k_gather_buffer = torch.empty(self.batch, self.seq_len, self.hidden, device=self.device)
+        self._v_gather_buffer = torch.empty_like(self._k_gather_buffer)
+        self._k_gather_step_views = [
+            self._k_gather_buffer[:, idx : idx + 1, :] for idx in range(self.seq_len)
+        ]
+        self._v_gather_step_views = [
+            self._v_gather_buffer[:, idx : idx + 1, :] for idx in range(self.seq_len)
+        ]
+        self._k_gather_prefix_views = [
+            self._k_gather_buffer[:, : idx + 1, :] for idx in range(self.seq_len)
+        ]
+        self._v_gather_prefix_views = [
+            self._v_gather_buffer[:, : idx + 1, :] for idx in range(self.seq_len)
+        ]
+        self._peer_host_k_stage = torch.empty(
+            self.batch,
+            1,
+            self.hidden,
+            dtype=self._key_steps.dtype,
+            pin_memory=True,
+        )
+        self._peer_host_v_stage = torch.empty(
+            self.batch,
+            1,
+            self.hidden,
+            dtype=self._value_steps.dtype,
+            pin_memory=True,
+        )
+        self._cache_key_slots = [
+            torch.empty(0, device=self.device)
+            for _ in range(self.seq_len)
+        ]
+        self._cache_value_slots = [
+            torch.empty(0, device=self.device)
+            for _ in range(self.seq_len)
+        ]
+        self._tier_slots = [""] * self.seq_len
+        self._peer_target_slots = [None] * self.seq_len
+        self._cache_gather_ranges = [range(step + 1) for step in range(self.seq_len)]
+        self._slot_counts = (
+            len(self._cache_key_slots),
+            len(self._cache_value_slots),
+            len(self._tier_slots),
+            len(self._peer_target_slots),
+            len(self._decode_step_inputs),
+            len(self._k_gather_step_views),
+            len(self._v_gather_step_views),
+            len(self._k_gather_prefix_views),
+            len(self._v_gather_prefix_views),
+            len(self._cache_gather_ranges),
+        )
+        self._expected_slot_counts = (
+            self.seq_len,
+            self.seq_len,
+            self.seq_len,
+            self.seq_len,
+            self.seq_len,
+            self.seq_len,
+            self.seq_len,
+            self.seq_len,
+            self.seq_len,
+            self.seq_len,
+        )
         self._verify_q = self._query_steps[0, :1].detach().clone()
         self._synchronize()
 
@@ -68,38 +152,49 @@ class BaselineKVCacheLocalOnlyBenchmark(VerificationPayloadMixin, BaseBenchmark)
     def benchmark_fn(self) -> None:
         assert self.model is not None
         assert self._query_steps is not None and self._key_steps is not None and self._value_steps is not None
-        with self._nvtx_range("baseline_kv_cache_local_only"):
-            cache_k: list[torch.Tensor] = []
-            cache_v: list[torch.Tensor] = []
-            tiers: list[str] = []
-            peer_targets: list[Optional[torch.device]] = []
-            for step in range(self.seq_len):
-                q = self._query_steps[step]
-                k = self._key_steps[step]
-                v = self._value_steps[step]
+        assert self._k_gather_buffer is not None and self._v_gather_buffer is not None
+        with torch.inference_mode(), self._nvtx_range("baseline_kv_cache_local_only"):
+            if self._slot_counts != self._expected_slot_counts:
+                raise RuntimeError("KV cache slots not initialized")
+            cache_k = self._cache_key_slots
+            cache_v = self._cache_value_slots
+            tiers = self._tier_slots
+            peer_targets = self._peer_target_slots
+            k_gather_steps = self._k_gather_step_views
+            v_gather_steps = self._v_gather_step_views
+            k_gather_prefixes = self._k_gather_prefix_views
+            v_gather_prefixes = self._v_gather_prefix_views
+            cache_gather_ranges = self._cache_gather_ranges
+            for step, q, k, v in self._decode_step_inputs:
                 placed_k, placed_v, tier, peer = self._place_kv(k, v, step)
-                cache_k.append(placed_k)
-                cache_v.append(placed_v)
-                tiers.append(tier)
-                peer_targets.append(peer)
+                cache_k[step] = placed_k
+                cache_v[step] = placed_v
+                tiers[step] = tier
+                peer_targets[step] = peer
 
-                gathered_k = []
-                gathered_v = []
-                for tk, tv, t, peer_dev in zip(cache_k, cache_v, tiers, peer_targets):
+                gather_idx = 0
+                for cache_idx in cache_gather_ranges[step]:
+                    tk = cache_k[cache_idx]
+                    tv = cache_v[cache_idx]
+                    t = tiers[cache_idx]
+                    peer_dev = peer_targets[cache_idx]
                     if t == "local":
-                        gathered_k.append(tk)
-                        gathered_v.append(tv)
+                        k_gather_steps[gather_idx].copy_(tk)
+                        v_gather_steps[gather_idx].copy_(tv)
                     elif t == "peer" and peer_dev is not None:
-                        host_k = tk.cpu()
-                        host_v = tv.cpu()
-                        gathered_k.append(host_k.to(self.device, non_blocking=False))
-                        gathered_v.append(host_v.to(self.device, non_blocking=False))
+                        if self._peer_host_k_stage is None or self._peer_host_v_stage is None:
+                            raise RuntimeError("Peer host staging buffers not initialized")
+                        self._peer_host_k_stage.copy_(tk, non_blocking=False)
+                        self._peer_host_v_stage.copy_(tv, non_blocking=False)
+                        k_gather_steps[gather_idx].copy_(self._peer_host_k_stage)
+                        v_gather_steps[gather_idx].copy_(self._peer_host_v_stage)
                     else:
-                        gathered_k.append(tk.to(self.device, non_blocking=False))
-                        gathered_v.append(tv.to(self.device, non_blocking=False))
+                        k_gather_steps[gather_idx].copy_(tk)
+                        v_gather_steps[gather_idx].copy_(tv)
+                    gather_idx += 1
 
-                k_all = torch.cat(gathered_k, dim=1)
-                v_all = torch.cat(gathered_v, dim=1)
+                k_all = k_gather_prefixes[gather_idx - 1]
+                v_all = v_gather_prefixes[gather_idx - 1]
                 out, _ = self.model(q, k_all, v_all)
                 self.output = out
 
@@ -111,7 +206,7 @@ class BaselineKVCacheLocalOnlyBenchmark(VerificationPayloadMixin, BaseBenchmark)
             inputs={"q": self._verify_q},
             output=self.output,
             batch_size=int(self.batch),
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -126,6 +221,22 @@ class BaselineKVCacheLocalOnlyBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self._query_steps = None
         self._key_steps = None
         self._value_steps = None
+        self._decode_step_inputs = []
+        self._k_gather_buffer = None
+        self._v_gather_buffer = None
+        self._k_gather_step_views = []
+        self._v_gather_step_views = []
+        self._k_gather_prefix_views = []
+        self._v_gather_prefix_views = []
+        self._peer_host_k_stage = None
+        self._peer_host_v_stage = None
+        self._cache_key_slots = []
+        self._cache_value_slots = []
+        self._tier_slots = []
+        self._peer_target_slots = []
+        self._slot_counts = ()
+        self._expected_slot_counts = ()
+        self._cache_gather_ranges = []
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -153,5 +264,3 @@ class BaselineKVCacheLocalOnlyBenchmark(VerificationPayloadMixin, BaseBenchmark)
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineKVCacheLocalOnlyBenchmark()
-
-

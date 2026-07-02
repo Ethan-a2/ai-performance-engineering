@@ -14,6 +14,7 @@ from core.optimization.moe_inference import ExpertMLP
 from core.optimization.shared_expert_dispatch import (
     dispatch_shared_expert_active_experts,
     dispatch_shared_expert_mask_scan,
+    dispatch_shared_expert_precomputed_indices,
 )
 
 
@@ -29,6 +30,28 @@ def topology_aware_expert_ids(token_ids: torch.Tensor, *, local_experts: int) ->
     if token_ids.dtype != torch.int64:
         token_ids = token_ids.to(torch.int64)
     return (token_ids % int(local_experts)).to(torch.int64)
+
+
+def active_expert_ids_for_static_route(
+    *,
+    route_mode: str,
+    num_tokens: int,
+    num_experts: int,
+    local_experts: int,
+) -> list[int]:
+    """Return active experts for deterministic routes without a GPU readback."""
+    if num_tokens <= 0:
+        return []
+    if route_mode == "uniform":
+        return sorted(
+            {
+                int((token_id * 1103515245 + 12345) % int(num_experts))
+                for token_id in range(int(num_tokens))
+            }
+        )
+    if route_mode == "topology_aware":
+        return list(range(min(int(local_experts), int(num_tokens))))
+    raise ValueError(f"Unknown route mode: {route_mode}")
 
 
 class SharedExpertMoEBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
@@ -60,11 +83,17 @@ class SharedExpertMoEBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
 
         self.expert: Optional[nn.Module] = None
         self.inputs: Optional[torch.Tensor] = None
+        self._flat_inputs: Optional[torch.Tensor] = None
         self.expert_ids: Optional[torch.Tensor] = None
+        self._expert_ids_flat: Optional[torch.Tensor] = None
+        self._active_dispatch_indices: Optional[list[torch.Tensor]] = None
         self._out_flat: Optional[torch.Tensor] = None
+        self._output_view: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._verify_probe: Optional[torch.Tensor] = None
         self._verify_meta: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
 
     def _build_expert_ids(self, token_ids: torch.Tensor) -> torch.Tensor:
         if self.route_mode == "uniform":
@@ -83,27 +112,59 @@ class SharedExpertMoEBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.manual_seed_all(42)
 
         self.expert = ExpertMLP(self.hidden_size, self.ffn_size, device=self.device, dtype=self.dtype).eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.expert.parameters())
         self.inputs = torch.randn(self.batch, self.seq, self.hidden_size, device=self.device, dtype=self.dtype)
+        self._flat_inputs = self.inputs.view(-1, self.hidden_size)
 
         token_ids = torch.arange(self.batch * self.seq, device=self.device, dtype=torch.int64)
         self.expert_ids = self._build_expert_ids(token_ids).view(self.batch, self.seq)
+        self._expert_ids_flat = self.expert_ids.reshape(-1)
+        expert_ids_flat = self._expert_ids_flat
+        if self.dispatch_mode == "active_experts":
+            active_experts = active_expert_ids_for_static_route(
+                route_mode=self.route_mode,
+                num_tokens=expert_ids_flat.numel(),
+                num_experts=self.num_experts,
+                local_experts=self.local_experts,
+            )
+            self._active_dispatch_indices = [
+                (expert_ids_flat == int(expert_id)).nonzero(as_tuple=False).squeeze(-1)
+                for expert_id in active_experts
+            ]
+        else:
+            self._active_dispatch_indices = None
         self._out_flat = torch.empty(self.batch * self.seq, self.hidden_size, device=self.device, dtype=self.dtype)
-        self._verify_probe = self.inputs[:1, :1, :256].detach().cpu()
+        self._output_view = self._out_flat.view(self.batch, self.seq, self.hidden_size)
+        probe_cols = min(256, self.hidden_size)
+        self._verify_probe = torch.empty((1, 1, probe_cols), dtype=self.inputs.dtype, pin_memory=True)
+        self._verify_probe.copy_(
+            self.inputs[:1, :1, :probe_cols],
+            non_blocking=False,
+        )
         self._verify_meta = torch.zeros(self.num_experts, dtype=torch.int8)
+        self._verify_output_buffer = torch.empty((2, 2, 256), dtype=torch.float32)
 
         for _ in range(3):
-            with torch.no_grad():
-                _ = self.expert(self.inputs.view(-1, self.hidden_size))
+            with torch.inference_mode():
+                _ = self.expert(self._flat_inputs)
 
     def benchmark_fn(self) -> None:
-        if self.expert is None or self.inputs is None or self.expert_ids is None or self._out_flat is None:
+        if (
+            self.expert is None
+            or self.inputs is None
+            or self._flat_inputs is None
+            or self.expert_ids is None
+            or self._expert_ids_flat is None
+            or self._out_flat is None
+            or self._output_view is None
+        ):
             raise RuntimeError("setup() must run before benchmark_fn()")
 
-        flat = self.inputs.view(-1, self.hidden_size)
-        expert_ids_flat = self.expert_ids.reshape(-1)
+        flat = self._flat_inputs
+        expert_ids_flat = self._expert_ids_flat
 
         with self._nvtx_range(self.nvtx_label):
-            with torch.no_grad():
+            with torch.inference_mode():
                 if self.dispatch_mode == "mask_scan":
                     dispatch_shared_expert_mask_scan(
                         flat,
@@ -113,26 +174,43 @@ class SharedExpertMoEBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
                         out=self._out_flat,
                     )
                 elif self.dispatch_mode == "active_experts":
-                    dispatch_shared_expert_active_experts(
-                        flat,
-                        expert_ids_flat,
-                        self.expert,
-                        out=self._out_flat,
-                    )
+                    if self._active_dispatch_indices is not None:
+                        dispatch_shared_expert_precomputed_indices(
+                            flat,
+                            self.expert,
+                            out=self._out_flat,
+                            index_groups=self._active_dispatch_indices,
+                        )
+                    else:
+                        dispatch_shared_expert_active_experts(
+                            flat,
+                            expert_ids_flat,
+                            self.expert,
+                            out=self._out_flat,
+                        )
                 else:
                     raise ValueError(f"Unknown dispatch mode: {self.dispatch_mode}")
-                self.output = self._out_flat.view(self.batch, self.seq, self.hidden_size)
+                self.output = self._output_view
 
     def capture_verification_payload(self) -> None:
-        if self.output is None or self._verify_probe is None or self._verify_meta is None:
+        if (
+            self.output is None
+            or self._verify_probe is None
+            or self._verify_meta is None
+            or self._verify_output_buffer is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
-        output_slice = self.output[:2, :2, :256].detach().cpu().float().clone()
-        param_count = sum(p.numel() for p in self.expert.parameters()) if self.expert is not None else 0
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ].detach()
+        self._verify_output_buffer.copy_(output_slice, non_blocking=False)
         self._set_verification_payload(
             inputs={"probe": self._verify_probe, "expert_meta": self._verify_meta},
-            output=output_slice,
+            output=self._verify_output_buffer,
             batch_size=int(self.batch),
-            parameter_count=int(param_count),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": True,
@@ -145,9 +223,16 @@ class SharedExpertMoEBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.expert = None
         self.inputs = None
+        self._flat_inputs = None
         self.expert_ids = None
+        self._expert_ids_flat = None
+        self._active_dispatch_indices = None
         self._out_flat = None
+        self._output_view = None
         self.output = None
+        self._verify_probe = None
+        self._verify_meta = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

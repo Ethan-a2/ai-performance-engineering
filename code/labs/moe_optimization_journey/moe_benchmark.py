@@ -7,7 +7,6 @@ Optimizations are applied cumulatively based on level.
 
 from __future__ import annotations
 
-import time
 from typing import Any, Dict, Optional
 
 import torch
@@ -19,8 +18,8 @@ from core.harness.benchmark_harness import (
     BenchmarkConfig,
     WorkloadMetadata,
 )
+from core.utils.compile_utils import get_optimal_compile_mode
 from labs.moe_optimization_journey.moe_model import (
-    ConfigurableMoEModel,
     MoEOptimizations,
     create_model,
 )
@@ -70,6 +69,7 @@ class MoEJourneyBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.last_latency_ms: float = 0.0
         self.last_tokens_per_sec: float = 0.0
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         
         total_tokens = self.BATCH_SIZE * self.SEQ_LEN
@@ -152,10 +152,14 @@ class MoEJourneyBenchmark(VerificationPayloadMixin, BaseBenchmark):
         print(f"  Parameters: {self.parameter_count / 1e6:.1f}M")
         print(f"  Batch: {self.BATCH_SIZE} x {self.SEQ_LEN} = {self.BATCH_SIZE * self.SEQ_LEN} tokens")
         
-        # Apply torch.compile if enabled (Level 7)
+        # Apply torch.compile if enabled (Level 7). get_optimal_compile_mode keeps
+        # max-autotune on the pinned toolchain but falls back to "default" on
+        # sm_103 + Triton >= 3.6, where max-autotune emits an unloadable tcgen05
+        # kernel (LLVM ERROR: Cannot select intrinsic %llvm.nvvm.tcgen05.wait.st).
         if self.opts.use_compile:
-            print(f"\n  Compiling with mode='max-autotune'...")
-            self.compiled_model = torch.compile(self.model, mode="max-autotune")
+            _compile_mode = get_optimal_compile_mode("max-autotune")
+            print(f"\n  Compiling with mode='{_compile_mode}'...")
+            self.compiled_model = torch.compile(self.model, mode=_compile_mode)
         else:
             self.compiled_model = self.model
         
@@ -164,11 +168,16 @@ class MoEJourneyBenchmark(VerificationPayloadMixin, BaseBenchmark):
             0, self.VOCAB_SIZE,
             (self.BATCH_SIZE, self.SEQ_LEN),
         ).to(self.device)
+        self._verify_output_buffer = torch.empty(
+            (self.BATCH_SIZE, 1, min(8, self.VOCAB_SIZE)),
+            device=self.device,
+            dtype=torch.float32,
+        )
         
         # Warmup
         print(f"\n  Warmup ({self.WARMUP + 2} iterations)...")
         for i in range(self.WARMUP + 2):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.compiled_model(self.input_ids)
             if i == 0 and self.opts.use_compile:
                 print("    First run (compile): done")
@@ -177,16 +186,24 @@ class MoEJourneyBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def benchmark_fn(self) -> None:
         with self._nvtx_range(f"level{self.LEVEL}"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits = self.compiled_model(self.input_ids)
-        self.output = logits[:, :1, : min(8, logits.shape[-1])]
+        self.output = logits
         if self.input_ids is None or self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
+        if self.input_ids is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input_ids": self.input_ids.detach()},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.BATCH_SIZE,
             parameter_count=self.parameter_count,
             precision_flags={"bf16": True, "tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -200,6 +217,7 @@ class MoEJourneyBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model = None
         self.input_ids = None
         self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
         super().teardown()
     
@@ -259,18 +277,22 @@ def run_level(level: int) -> None:
     benchmark = LevelBenchmark()
     benchmark.setup()
     
-    times = []
+    total_ms = 0.0
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
     for i in range(5):
-        start = time.perf_counter()
+        start_event.record(current_stream)
         benchmark.benchmark_fn()
-        torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        times.append(elapsed_ms)
+        end_event.record(current_stream)
+        end_event.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event)
+        total_ms += elapsed_ms
         total_tokens = benchmark.BATCH_SIZE * benchmark.SEQ_LEN
         tok_s = total_tokens / (elapsed_ms / 1000)
         print(f"  Run {i+1}: {elapsed_ms:.1f} ms ({tok_s:,.0f} tok/s)")
     
-    avg = sum(times) / len(times)
+    avg = total_ms / 5
     print(f"\nMean: {avg:.1f} ms")
     benchmark.teardown()
     return avg

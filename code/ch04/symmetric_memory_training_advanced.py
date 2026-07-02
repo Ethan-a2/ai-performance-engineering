@@ -72,7 +72,7 @@ from ch04.distributed_helper import run_main_with_skip_status, setup_single_gpu_
 import argparse
 import datetime
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -85,7 +85,6 @@ from core.optimization.symmetric_memory_patch import (
 )
 from core.benchmark.gpu_requirements import require_min_gpus
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
 
 
@@ -126,6 +125,26 @@ def init_distributed(allow_single_gpu: bool = False) -> Tuple[int, int, int]:
         )
         
     return dist.get_rank(), dist.get_world_size(), torch.cuda.current_device()
+
+
+def _flatten_gradients_into(
+    parameters: List[nn.Parameter],
+    out: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """Flatten available parameter gradients into a reusable buffer."""
+
+    offset = 0
+    for param in parameters:
+        grad = param.grad
+        if grad is None:
+            continue
+        grad_flat = grad.reshape(-1)
+        next_offset = offset + grad_flat.numel()
+        out[offset:next_offset].copy_(grad_flat)
+        offset = next_offset
+    if offset == 0:
+        return None
+    return out[:offset]
 
 
 # ============================================================================
@@ -288,15 +307,17 @@ class AsyncGradientServer:
         
         self.parameters = parameters
         self.step_count = 0
+        self._flat_grad_buffer = torch.empty(
+            self.param_numel,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
     def submit_gradients(self, rank: int) -> None:
         """Submit current gradients for async aggregation."""
-        # Collect all gradients into flat tensor
-        grad_tensors = [p.grad.flatten() for p in self.parameters if p.grad is not None]
-        if not grad_tensors:
+        all_grads = _flatten_gradients_into(self.parameters, self._flat_grad_buffer)
+        if all_grads is None:
             return
-        
-        all_grads = torch.cat(grad_tensors)
         
         # Write to appropriate buffer (double-buffering)
         if self.step_count % 2 == 0:
@@ -527,10 +548,12 @@ def demo_lockfree_accumulation(*, allow_single_gpu: bool = False) -> None:
     
     # Create model
     model = nn.Linear(8192, 8192, device=device)
-    param_numel = sum(p.numel() for p in model.parameters())
+    parameters = list(model.parameters())
+    param_numel = sum(p.numel() for p in parameters)
     
     # Initialize lock-free accumulator
     accumulator = LockFreeGradientAccumulator(param_numel, world_size, device)
+    flat_grad_buffer = torch.empty(param_numel, device=device, dtype=torch.float32)
     
     # Simulate gradient accumulation over multiple microbatches
     num_microbatches = 8
@@ -542,9 +565,10 @@ def demo_lockfree_accumulation(*, allow_single_gpu: bool = False) -> None:
         loss = outputs.sum()
         loss.backward()
         
-        # Collect gradients
-        grad_tensors = [p.grad.flatten() for p in model.parameters() if p.grad is not None]
-        all_grads = torch.cat(grad_tensors)
+        all_grads = _flatten_gradients_into(parameters, flat_grad_buffer)
+        if all_grads is None:
+            model.zero_grad()
+            continue
         
         # Accumulate (lock-free)
         accumulator.accumulate(rank, all_grads)
@@ -662,7 +686,7 @@ def demo_custom_optimizer(
     layers = []
     for _ in range(depth):
         layers.append(nn.Linear(hidden_dim, hidden_dim))
-        layers.append(nn.ReLU())
+        layers.append(nn.ReLU(inplace=True))
     layers.append(nn.Linear(hidden_dim, output_dim))
     model = nn.Sequential(*layers).to(device)
     
@@ -784,9 +808,9 @@ def demo_zero_style_sharding(*, allow_single_gpu: bool = False) -> None:
     # Create model
     model = nn.Sequential(
         nn.Linear(4096, 4096),
-        nn.ReLU(),
+        nn.ReLU(inplace=True),
         nn.Linear(4096, 4096),
-        nn.ReLU(),
+        nn.ReLU(inplace=True),
         nn.Linear(4096, 1000),
     ).to(device)
     
@@ -795,13 +819,16 @@ def demo_zero_style_sharding(*, allow_single_gpu: bool = False) -> None:
     
     # Training loop
     num_steps = 5
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
     
     for step in range(num_steps):
         batch = torch.randn(32, 4096, device=device)
         loss = trainer.training_step(batch)
         
         if rank == 0:
-            print(f"[zero] Step {step}, loss: {loss.item():.4f}")
+            loss_value_buffer[0].copy_(loss.detach())
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
+            print(f"[zero] Step {step}, loss: {loss_value:.4f}")
     
     if rank == 0:
         print(f"[zero] Completed ZeRO-style training with symmetric memory")

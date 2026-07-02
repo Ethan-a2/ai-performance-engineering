@@ -18,7 +18,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import torch.nn as nn
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
@@ -41,6 +40,7 @@ class OptimizedAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.num_heads = 16
         self.head_dim = self.hidden_dim // self.num_heads
         self.output = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
     def setup(self) -> None:
         torch.manual_seed(42)
@@ -61,6 +61,7 @@ class OptimizedAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             self.batch_size, self.num_heads, self.seq_len, self.head_dim,
             device=self.device, dtype=torch.float16
         )
+        self._verify_output_buffer = torch.empty_like(self.query, dtype=torch.float32)
         
         self._synchronize()
         tokens = float(self.batch_size * self.seq_len)
@@ -80,7 +81,7 @@ class OptimizedAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         5. Optimized for modern GPU memory hierarchy
         """
         with self._nvtx_range("optimized_attention_flash"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 # scaled_dot_product_attention automatically selects:
                 # - Flash Attention V2 when available
                 # - Memory-efficient attention as fallback
@@ -93,13 +94,16 @@ class OptimizedAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "query": self.query,
                 "key": self.key,
                 "value": self.value,
             },
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             parameter_count=0,
             precision_flags={
@@ -115,6 +119,8 @@ class OptimizedAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.query = None
         self.key = None
         self.value = None
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

@@ -29,10 +29,14 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
         self.device_batches: List[torch.Tensor] = []
         self.device_targets: List[torch.Tensor] = []
         self.copy_stream = torch.cuda.Stream()
+        self.copy_events: List[torch.cuda.Event] = []
         self.cur_slot = 0
         self.next_slot = 1
         self.batch_idx = 0
+        self._batch_count = 0
         self.output: Optional[torch.Tensor] = None
+        self._model_parameters: tuple[nn.Parameter, ...] = ()
+        self._payload_parameter_count = 0
         # Training benchmarks don't support jitter check - outputs change due to weight updates
         
         elements = 2 * 512 * 1024
@@ -43,14 +47,19 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
             bytes_per_iteration=float(elements * 4),
         )
 
-    def _prefetch_slot(self, slot: int) -> None:
+    def _prefetch_slot(
+        self,
+        slot: int,
+        wait_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         """Async copy to device buffer on copy stream."""
-        batch_idx = (self.batch_idx + 1) % len(self.host_batches)
-        compute_stream = torch.cuda.current_stream()
+        batch_idx = (self.batch_idx + 1) % self._batch_count
+        producer_stream = wait_stream or torch.cuda.current_stream()
         with torch.cuda.stream(self.copy_stream):
-            self.copy_stream.wait_stream(compute_stream)
+            self.copy_stream.wait_stream(producer_stream)
             self.device_batches[slot].copy_(self.host_batches[batch_idx], non_blocking=True)
             self.device_targets[slot].copy_(self.target_batches[batch_idx], non_blocking=True)
+            self.copy_events[slot].record(self.copy_stream)
 
     def setup(self) -> None:
         torch.manual_seed(42)
@@ -58,15 +67,18 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
         # Same model as baseline for fair comparison
         self.model = nn.Sequential(
             nn.Linear(1024, 1024),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(1024, 1024),
         ).to(self.device)
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
+        self._model_parameters = tuple(self.model.parameters())
         
         # Pre-allocate host batches with pinned memory (the optimization)
         num_batches = 4
         for _ in range(num_batches):
             self.host_batches.append(torch.randn(512, 1024, dtype=torch.float32, pin_memory=True))
             self.target_batches.append(torch.randn(512, 1024, dtype=torch.float32, pin_memory=True))
+        self._batch_count = num_batches
         
         # Device double-buffers for prefetching
         self.device_batches = [
@@ -77,6 +89,7 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
             torch.empty(512, 1024, device=self.device, dtype=torch.float32),
             torch.empty(512, 1024, device=self.device, dtype=torch.float32),
         ]
+        self.copy_events = [torch.cuda.Event() for _ in self.device_batches]
         
         self.batch_idx = 0
         self.cur_slot = 0
@@ -86,10 +99,12 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
         with torch.cuda.stream(self.copy_stream):
             self.device_batches[self.cur_slot].copy_(self.host_batches[0], non_blocking=True)
             self.device_targets[self.cur_slot].copy_(self.target_batches[0], non_blocking=True)
-        torch.cuda.current_stream().wait_stream(self.copy_stream)
+            self.copy_events[self.cur_slot].record(self.copy_stream)
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_event(self.copy_events[self.cur_slot])
 
         # Start prefetching the *next* batch into slot 1 (batch 1).
-        self._prefetch_slot(self.next_slot)
+        self._prefetch_slot(self.next_slot, wait_stream=current_stream)
         self._synchronize()
 
     def benchmark_fn(self) -> None:
@@ -97,7 +112,8 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
         assert self.model is not None
         
         # Wait for current batch to be ready
-        torch.cuda.current_stream().wait_stream(self.copy_stream)
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_event(self.copy_events[self.cur_slot])
         data = self.device_batches[self.cur_slot]
         target = self.device_targets[self.cur_slot]
         
@@ -108,15 +124,15 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
             loss.backward()
             
             # Clear gradients (simulate optimizer step)
-            for p in self.model.parameters():
+            for p in self._model_parameters:
                 p.grad = None
         
-        self.output = out.detach()
+        self.output = out.detach_()
         
         # Swap slots and start next prefetch
         self.cur_slot, self.next_slot = self.next_slot, self.cur_slot
         self.batch_idx += 1
-        self._prefetch_slot(self.next_slot)
+        self._prefetch_slot(self.next_slot, wait_stream=current_stream)
         self._payload_data = data
         self._payload_target = target
 
@@ -127,7 +143,7 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
             inputs={"data": data, "target": target},
             output=self.output,
             batch_size=data.shape[0],
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -143,7 +159,10 @@ class OptimizedDoubleBufferedBatchProvisioningBenchmark(VerificationPayloadMixin
         self.target_batches = []
         self.device_batches = []
         self.device_targets = []
+        self.copy_events = []
+        self._batch_count = 0
         self.output = None
+        self._model_parameters = ()
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

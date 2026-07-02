@@ -1,15 +1,9 @@
 """Chapter 19: Token precision switching and cache quantization helpers."""
 from __future__ import annotations
 
-import os
-
-
-
-import logging
-import math
-import time
-from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Tuple
@@ -57,20 +51,80 @@ class TokenPrecisionController:
         self.threshold_low = 0.6
         self.switch_count = 0
         self.history: List[PrecisionLevel] = []
+        self._next_token_buffer = None
+        self._next_token_host_buffer = None
+        self._token_buffer = None
+        self._confidence_top2_values = None
+        self._confidence_top2_indices = None
+        self._confidence_metrics_buffer = None
+        self._confidence_metrics_host_buffer = None
 
-    @staticmethod
-    def _confidence(logits: torch.Tensor, temperature: float = 1.0) -> ConfidenceMetrics:
+    def _next_token_buffers(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._next_token_buffer is None or self._next_token_buffer.device != device:
+            self._next_token_buffer = torch.empty(1, dtype=torch.long, device=device)
+            self._next_token_host_buffer = torch.empty(
+                1,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=device.type == "cuda",
+            )
+        return self._next_token_buffer, self._next_token_host_buffer
+
+    def _generation_token_buffer(self, input_ids: torch.Tensor, total_len: int) -> torch.Tensor:
+        batch_size = input_ids.size(0)
+        if (
+            self._token_buffer is None
+            or self._token_buffer.device != input_ids.device
+            or self._token_buffer.dtype != input_ids.dtype
+            or self._token_buffer.size(0) < batch_size
+            or self._token_buffer.size(1) < total_len
+        ):
+            self._token_buffer = torch.empty(
+                (batch_size, total_len),
+                device=input_ids.device,
+                dtype=input_ids.dtype,
+            )
+        return self._token_buffer[:batch_size, :total_len]
+
+    def _confidence(self, logits: torch.Tensor, temperature: float = 1.0) -> ConfidenceMetrics:
         scaled = logits / temperature
-        probs = F.softmax(scaled, dim=-1)
-        max_prob = float(probs.max())
         log_probs = F.log_softmax(scaled, dim=-1)
-        entropy = float(-(probs * log_probs).sum())
-        top2 = torch.topk(scaled, k=2).values
-        diff = float(top2[0] - top2[1]) if top2.numel() == 2 else 0.0
-        return ConfidenceMetrics(max_prob, entropy, diff)
+        probs = log_probs.exp()
+        if (
+            self._confidence_top2_values is None
+            or self._confidence_top2_values.device != scaled.device
+            or self._confidence_top2_values.dtype != scaled.dtype
+        ):
+            self._confidence_top2_values = torch.empty(2, device=scaled.device, dtype=scaled.dtype)
+            self._confidence_top2_indices = torch.empty(2, device=scaled.device, dtype=torch.long)
+        assert self._confidence_top2_indices is not None
+        torch.topk(scaled, k=2, out=(self._confidence_top2_values, self._confidence_top2_indices))
 
-    def _choose_precision(self, metrics: ConfidenceMetrics) -> PrecisionLevel:
-        score = metrics.confidence_score
+        if self._confidence_metrics_buffer is None or self._confidence_metrics_buffer.device != scaled.device:
+            self._confidence_metrics_buffer = torch.empty(3, device=scaled.device, dtype=torch.float32)
+        metrics = self._confidence_metrics_buffer
+        metrics[0].copy_(probs.max())
+        metrics[1].copy_((-(probs * log_probs).sum()))
+        metrics[2].copy_(self._confidence_top2_values[0] - self._confidence_top2_values[1])
+
+        if metrics.device.type == "cuda":
+            if (
+                self._confidence_metrics_host_buffer is None
+                or not self._confidence_metrics_host_buffer.is_pinned()
+            ):
+                self._confidence_metrics_host_buffer = torch.empty(
+                    3,
+                    dtype=torch.float32,
+                    device="cpu",
+                    pin_memory=True,
+                )
+            metrics_host = self._confidence_metrics_host_buffer
+            metrics_host.copy_(metrics, non_blocking=False)
+        else:
+            metrics_host = metrics
+        return ConfidenceMetrics(float(metrics_host[0]), float(metrics_host[1]), float(metrics_host[2]))
+
+    def _choose_precision(self, score: float) -> PrecisionLevel:
         if score > self.threshold_high and self.current_precision == PrecisionLevel.FP16:
             return PrecisionLevel.INT8
         if score < self.threshold_low and self.current_precision == PrecisionLevel.INT8:
@@ -94,25 +148,33 @@ class TokenPrecisionController:
             return quant * scale
         return logits
 
+    @torch.inference_mode()
     def generate(self, input_ids: torch.Tensor, max_length: int = 20, temperature: float = 1.0) -> Tuple[torch.Tensor, List[Dict[str, float]]]:
-        tokens = input_ids.clone()
+        batch_size, prompt_len = input_ids.shape
+        tokens = self._generation_token_buffer(input_ids, prompt_len + max_length)
+        tokens[:, :prompt_len].copy_(input_ids)
+        current_len = prompt_len
         stats: List[Dict[str, float]] = []
-        for step in range(max_length):
-            with torch.no_grad():
-                logits = self.model(tokens).logits[0, -1, :]
-                logits = self._cast_logits(logits, self.current_precision)
-                metrics = self._confidence(logits, temperature)
-                next_precision = self._choose_precision(metrics)
-                if next_precision != self.current_precision:
-                    self.switch_count += 1
-                self.current_precision = next_precision
-                probs = F.softmax(logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-                tokens = torch.cat([tokens, next_token.unsqueeze(0)], dim=1)
-                stats.append({"confidence": metrics.confidence_score, "precision": self.current_precision.value})
-                if next_token.item() == 0:
-                    break
-        return tokens, stats
+        for _step in range(max_length):
+            active_tokens = tokens[:, :current_len]
+            logits = self.model(active_tokens).logits[0, -1, :]
+            logits = self._cast_logits(logits, self.current_precision)
+            metrics = self._confidence(logits, temperature)
+            confidence_score = metrics.confidence_score
+            next_precision = self._choose_precision(confidence_score)
+            if next_precision != self.current_precision:
+                self.switch_count += 1
+            self.current_precision = next_precision
+            probs = F.softmax(logits / temperature, dim=-1)
+            next_token, next_token_host = self._next_token_buffers(probs.device)
+            torch.multinomial(probs, num_samples=1, out=next_token)
+            tokens[:, current_len : current_len + 1].copy_(next_token.view(1, 1))
+            current_len += 1
+            stats.append({"confidence": confidence_score, "precision": self.current_precision.value})
+            next_token_host.copy_(next_token)
+            if int(next_token_host[0]) == 0:
+                break
+        return tokens[:, :current_len].clone(memory_format=torch.contiguous_format), stats
 
 
 #
@@ -122,6 +184,7 @@ class TokenPrecisionController:
 # ----------------------------
 # NEW PyTorch 2.10 API (no warnings!)
 enable_tf32()
+_ARCH_PREFER_BFLOAT16 = bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
 # If you compile models elsewhere, keep it outside this loop; don't pay compile cost per-step.
 
 # ----------------------------
@@ -160,7 +223,7 @@ def _precision_context(device: torch.device, use_fp8: bool, prefer_bfloat16: boo
 # ----------------------------
 # Main decode loop with smoothed, hysteretic precision switching
 # ----------------------------
-@torch.no_grad()
+@torch.inference_mode()
 def decode_with_dynamic_precision(
     model,
     tokens: torch.Tensor,
@@ -184,48 +247,102 @@ def decode_with_dynamic_precision(
     - Hysteresis: separate enter/exit thresholds to avoid precision flapping.
     """
     assert exit_fp8_threshold <= enter_fp8_threshold, "Hysteresis requires exit <= enter threshold"
+    if reeval_interval <= 0:
+        raise ValueError("reeval_interval must be positive")
 
     model.eval()
-    tokens = tokens.to(device, non_blocking=True)
+    prompt = tokens.to(device, non_blocking=True)
+    batch_size, prompt_len = prompt.shape
+    tokens = torch.empty(
+        (batch_size, prompt_len + max_steps),
+        device=device,
+        dtype=prompt.dtype,
+    )
+    tokens[:, :prompt_len].copy_(prompt)
+    current_len = prompt_len
+    next_token = torch.empty((batch_size, 1), device=device, dtype=prompt.dtype)
+    next_token_values: torch.Tensor | None = None
+    top2_values: torch.Tensor | None = None
+    top2_indices: torch.Tensor | None = None
+    margin_values: torch.Tensor | None = None
+    margin_mean: torch.Tensor | None = None
 
     # Internal state
     use_fp8: bool = False  # start in AMP; upgrade to FP8 when sustained confidence permits
     ema_conf: torch.Tensor | None = None  # stays on device; host consults only at intervals
     alpha = 0.2  # EMA smoothing factor for confidence
+    top2_shape_tuple: tuple[int, ...] | None = None
 
     # A tiny helper to update on-device EMA without host sync
     def _update_confidence_ema(logits: torch.Tensor) -> torch.Tensor:
+        nonlocal ema_conf, top2_values, top2_indices, top2_shape_tuple, margin_values, margin_mean
         # logits: [B, vocab] or [B, T, vocab]. Use the last time-step if 3D.
         last = logits if logits.dim() == 2 else logits[:, -1, :]
         # Compute top-2 margin on-device
-        top2 = torch.topk(last, k=2, dim=topk_dim).values  # [B, 2]
-        margin = (top2[:, 0] - top2[:, 1]).mean()          # scalar tensor on device
-        nonlocal ema_conf
-        ema_conf = (1 - alpha) * (ema_conf if ema_conf is not None else margin) + alpha * margin
+        if top2_shape_tuple is None:
+            top2_shape = list(last.shape)
+            top2_shape[topk_dim] = 2
+            top2_shape_tuple = tuple(top2_shape)
+        if (
+            top2_values is None
+            or top2_indices is None
+            or top2_values.device != last.device
+            or top2_values.dtype != last.dtype
+        ):
+            top2_values = torch.empty(top2_shape_tuple, dtype=last.dtype, device=last.device)
+            top2_indices = torch.empty(top2_shape_tuple, dtype=torch.long, device=last.device)
+            margin_values = torch.empty(last.shape[0], dtype=last.dtype, device=last.device)
+            margin_mean = torch.empty((), dtype=last.dtype, device=last.device)
+        torch.topk(last, k=2, dim=topk_dim, out=(top2_values, top2_indices))
+        if margin_values is None or margin_mean is None:
+            margin_values = torch.empty(last.shape[0], dtype=last.dtype, device=last.device)
+            margin_mean = torch.empty((), dtype=last.dtype, device=last.device)
+        torch.sub(top2_values[:, 0], top2_values[:, 1], out=margin_values)
+        torch.mean(margin_values, out=margin_mean)
+        if ema_conf is None:
+            ema_conf = torch.empty_like(margin_mean)
+            ema_conf.copy_(margin_mean)
+        else:
+            ema_conf.mul_(1 - alpha).add_(margin_mean, alpha=alpha)
         return ema_conf  # device scalar
 
     # Decode
     for step in range(max_steps):
+        active_tokens = tokens[:, :current_len]
         # 1) Precision context (exactly one). No nested contexts, no leakage across iterations.
         with _precision_context(device, use_fp8, prefer_bfloat16, enable_fp8):
             # Forward pass (HF-style or plain)
             try:
-                logits = model(input_ids=tokens)  # HF models often return logits tensor or a ModelOutput
+                logits = model(input_ids=active_tokens)  # HF models often return logits tensor or a ModelOutput
                 if hasattr(logits, "logits"):
                     logits = logits.logits
             except TypeError:
-                logits = model(tokens)
+                logits = model(active_tokens)
 
             # 2) Pick next token from the *last* position
             last_step_logits = logits if logits.dim() == 2 else logits[:, -1, :]
-            next_token = torch.argmax(last_step_logits, dim=-1, keepdim=True)  # [B, 1]
-            tokens = torch.cat([tokens, next_token], dim=1)
+            if (
+                next_token_values is None
+                or next_token_values.device != last_step_logits.device
+                or next_token_values.dtype != last_step_logits.dtype
+            ):
+                next_token_values = torch.empty(
+                    (batch_size, 1),
+                    device=last_step_logits.device,
+                    dtype=last_step_logits.dtype,
+                )
+            torch.max(last_step_logits, dim=-1, keepdim=True, out=(next_token_values, next_token))
+            tokens[:, current_len : current_len + 1].copy_(next_token)
+            current_len += 1
 
-        # 3) Update on-device EMA signal every step (no host sync yet)
-        conf_dev = _update_confidence_ema(logits)
+        # 3) Update on-device EMA only when the policy can consume it.
+        should_reevaluate = (step + 1) % reeval_interval == 0
+        conf_dev = _update_confidence_ema(logits) if (step == 0 or should_reevaluate) else ema_conf
 
         # 4) Periodically re-evaluate precision choice on host to avoid per-step sync
-        if (step + 1) % reeval_interval == 0:
+        if should_reevaluate:
+            if conf_dev is None:
+                conf_dev = _update_confidence_ema(logits)
             conf_value = float(conf_dev)  # exactly one tiny sync every N steps
             if not use_fp8 and enable_fp8 and _TE_AVAILABLE and (conf_value > enter_fp8_threshold):
                 use_fp8 = True
@@ -235,10 +352,10 @@ def decode_with_dynamic_precision(
 
         # 5) EOS handling
         if eos_id is not None:
-            if (tokens[:, -1] == eos_id).all():
+            if (tokens[:, current_len - 1] == eos_id).all():
                 break
 
-    return tokens
+    return tokens[:, :current_len].contiguous()
 # ===== END dynamic_precision_inference =====
 
 

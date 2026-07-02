@@ -4,8 +4,6 @@
 Quick GPT-style model test - NO HEAVY COMPILATION
 Shows realistic torch.compile speedup on B200
 """
-import time
-from tqdm import tqdm
 
 from core.utils.compile_utils import enable_tf32
 from core.utils.warning_filters import suppress_benchmark_import_warnings
@@ -27,28 +25,35 @@ class SimpleGPTBlock(nn.Module):
         self.ln2 = nn.LayerNorm(d_model)
     
     def forward(self, x):
-        x = x + self.attn(self.ln1(x), self.ln1(x), self.ln1(x))[0]
+        attn_input = self.ln1(x)
+        x = x + self.attn(attn_input, attn_input, attn_input)[0]
         x = x + self.mlp(self.ln2(x))
         return x
 
 def benchmark_quick(model, x, name, num_iters=20):
     """Quick benchmark"""
     # Warmup
-    for _ in range(5):
-        with torch.no_grad():
+    with torch.inference_mode():
+        for _ in range(5):
             _ = model(x)
     torch.cuda.synchronize()
     
     # Benchmark
-    start = time.perf_counter()
-    for _ in range(num_iters):
-        with torch.no_grad():
+    count = max(num_iters, 1)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream(x.device)
+    with torch.inference_mode():
+        start.record(current_stream)
+        for _ in range(count):
             _ = model(x)
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+        end.record(current_stream)
+    end.synchronize()
+    elapsed_ms = start.elapsed_time(end)
+    elapsed = elapsed_ms / 1000.0
     
-    avg_ms = (elapsed / num_iters) * 1000
-    tokens_per_sec = (x.shape[0] * x.shape[1] * num_iters) / elapsed
+    avg_ms = elapsed_ms / count
+    tokens_per_sec = (x.shape[0] * x.shape[1] * count) / elapsed
     
     print(f"\n{name}:")
     print(f"  Time: {avg_ms:.2f} ms")
@@ -91,7 +96,7 @@ def main():
         
         # Input
         x = torch.randn(batch, seq_len, d_model, device='cuda', dtype=run_dtype)
-        bytes_per_elem = torch.tensor([], dtype=run_dtype).element_size()
+        bytes_per_elem = torch.finfo(run_dtype).bits // 8
         mem = x.numel() * bytes_per_elem / 1e9
         print(f"Input size: {mem:.2f} GB")
         

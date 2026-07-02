@@ -27,6 +27,9 @@ class BaselineGb200LocalityBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.host_buf: Optional[torch.Tensor] = None
         self.device_buf: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_probe: Optional[torch.Tensor] = None
+        self._output_view: Optional[torch.Tensor] = None
+        self._materialization_buffer: Optional[torch.Tensor] = None
         # Memory copy benchmark - jitter check not applicable
         tokens = float(self.numel)
         self._workload = WorkloadMetadata(tokens_per_iteration=tokens, requests_per_iteration=1.0)
@@ -38,22 +41,27 @@ class BaselineGb200LocalityBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.host_buf = torch.ones(self.numel, dtype=torch.float32, pin_memory=True)
         # Destination buffer on device.
         self.device_buf = torch.empty_like(self.host_buf, device=self.device, pin_memory=False)
+        self._verify_probe = self.host_buf[: 256 * 256].view(256, 256)
+        self._output_view = self.device_buf[: 256 * 256].view(256, 256)
+        self._materialization_buffer = torch.empty((), device=self.device, dtype=torch.float32)
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
         assert self.host_buf is not None and self.device_buf is not None
-        with self._nvtx_range("host_to_device+compute"):
-            self.device_buf.copy_(self.host_buf, non_blocking=True)
-            self.device_buf.add_(1.0)
-        # Keep the reduction in the workload, but verify via a representative slice.
-        _ = self.device_buf.sum()
-        self.output = self.device_buf[: 256 * 256].detach()
+        assert self._output_view is not None and self._materialization_buffer is not None
+        with torch.inference_mode():
+            with self._nvtx_range("host_to_device+compute"):
+                self.device_buf.copy_(self.host_buf, non_blocking=True)
+                self.device_buf.add_(1.0)
+            # Keep the reduction in the workload, but verify via a representative slice.
+            torch.sum(self.device_buf, dim=0, out=self._materialization_buffer)
+            self.output = self._output_view
 
     def capture_verification_payload(self) -> None:
-        if self.host_buf is None or self.output is None:
+        if self._verify_probe is None or self.output is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        probe = self.host_buf[: 256 * 256].view(256, 256)
-        output = self.output.view(256, 256)
+        probe = self._verify_probe
+        output = self.output
         self._set_verification_payload(
             inputs={"buf": probe},
             output=output,
@@ -71,6 +79,10 @@ class BaselineGb200LocalityBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.host_buf = None
         self.device_buf = None
+        self.output = None
+        self._verify_probe = None
+        self._output_view = None
+        self._materialization_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

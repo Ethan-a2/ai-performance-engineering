@@ -16,7 +16,7 @@ import inspect
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -63,6 +63,15 @@ class _LocalPair:
     prefill_model: SimpleMoEGPT
     decode_model: SimpleMoEGPT
     prompts: torch.Tensor
+    decode_kv_cache: torch.Tensor
+    decode_outputs: List[torch.Tensor]
+    prefill_kv_chunks: List[torch.Tensor]
+    prefill_seed_chunks: List[torch.Tensor]
+    transfer_kv_chunks: List[torch.Tensor]
+    transfer_seed_chunks: List[torch.Tensor]
+    transfer_slots: Tuple[Tuple[int, torch.Tensor, torch.Tensor], ...]
+    transfer_slot_counts: Tuple[int, int, int]
+    expected_transfer_slot_counts: Tuple[int, int, int]
 
 
 def _build_moe_config(cfg: DisaggConfig) -> MoeInferenceConfig:
@@ -127,16 +136,35 @@ def _run_prefill(
     cfg: DisaggConfig,
     model: SimpleMoEGPT,
     prompts: torch.Tensor,
+    kv_chunks: Optional[List[torch.Tensor]] = None,
+    seed_chunks: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-    kv_chunks: List[torch.Tensor] = []
-    seed_chunks: List[torch.Tensor] = []
-    with torch.no_grad():
+    reuse_kv_chunks = kv_chunks is not None and len(kv_chunks) == cfg.requests_per_rank
+    reuse_seed_chunks = seed_chunks is not None and len(seed_chunks) == cfg.requests_per_rank
+    if not reuse_kv_chunks:
+        kv_chunks = [torch.empty(0) for _ in range(cfg.requests_per_rank)]
+    if not reuse_seed_chunks:
+        seed_chunks = [torch.empty(0) for _ in range(cfg.requests_per_rank)]
+    assert kv_chunks is not None and seed_chunks is not None
+    with torch.inference_mode():
         for req_idx in range(cfg.requests_per_rank):
             request_prompt = prompts[req_idx]
             hidden, logits = model.prefill(request_prompt)
             seed_tokens = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-            kv_chunks.append(hidden.contiguous())
-            seed_chunks.append(seed_tokens.contiguous())
+            kv_out = kv_chunks[req_idx]
+            seed_out = seed_chunks[req_idx]
+            if kv_out.shape == hidden.shape and kv_out.device == hidden.device and kv_out.dtype == hidden.dtype:
+                kv_out.copy_(hidden)
+            else:
+                kv_chunks[req_idx] = hidden.contiguous()
+            if (
+                seed_out.shape == seed_tokens.shape
+                and seed_out.device == seed_tokens.device
+                and seed_out.dtype == seed_tokens.dtype
+            ):
+                seed_out.copy_(seed_tokens)
+            else:
+                seed_chunks[req_idx] = seed_tokens.contiguous()
     return kv_chunks, seed_chunks
 
 
@@ -146,27 +174,33 @@ def _run_decode(
     kv_chunks: List[torch.Tensor],
     seed_chunks: List[torch.Tensor],
     device: torch.device,
+    *,
+    kv_cache: Optional[torch.Tensor] = None,
+    outputs: Optional[List[torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
-    outputs: List[torch.Tensor] = []
-    with torch.no_grad():
-        for kv_prompt, seed_tokens in zip(kv_chunks, seed_chunks):
-            kv_cache = allocate_kv_cache(
-                cfg.batch_size,
-                cfg.tokens_per_request,
-                cfg.hidden_size,
-                cfg.dtype,
-                device,
-            )
-            kv_cache[:, : cfg.context_window] = kv_prompt
+    if outputs is None or len(outputs) != len(kv_chunks):
+        outputs = [torch.empty(0) for _ in range(len(kv_chunks))]
+    with torch.inference_mode():
+        for output_idx, (kv_prompt, seed_tokens) in enumerate(zip(kv_chunks, seed_chunks)):
+            request_kv_cache = kv_cache
+            if request_kv_cache is None:
+                request_kv_cache = allocate_kv_cache(
+                    cfg.batch_size,
+                    cfg.tokens_per_request,
+                    cfg.hidden_size,
+                    cfg.dtype,
+                    device,
+                )
+            request_kv_cache[:, : cfg.context_window].copy_(kv_prompt)
             tokens = seed_tokens
             for step in range(cfg.decode_tokens):
                 _, decode_logits = model.decode(
                     tokens,
-                    kv_cache=kv_cache,
+                    kv_cache=request_kv_cache,
                     position=cfg.context_window + step,
                 )
                 tokens = torch.argmax(decode_logits[:, -1, :], dim=-1, keepdim=True)
-            outputs.append(tokens)
+            outputs[output_idx] = tokens
     return outputs
 
 
@@ -244,6 +278,8 @@ def _run_torchrun_worker(
     model = SimpleMoEGPT(moe_cfg, device=device).eval()
 
     prompts: Optional[torch.Tensor] = None
+    send_kv_bufs: List[torch.Tensor] = []
+    send_seed_bufs: List[torch.Tensor] = []
     if is_prefill:
         prompts = torch.randint(
             0,
@@ -252,11 +288,41 @@ def _run_torchrun_worker(
             device=device,
             dtype=torch.long,
         )
+        if overlap:
+            send_kv_bufs = [
+                torch.empty(
+                    (cfg.batch_size, cfg.context_window, cfg.hidden_size),
+                    device=device,
+                    dtype=cfg.dtype,
+                )
+                for _ in range(cfg.requests_per_rank)
+            ]
+            send_seed_bufs = [
+                torch.empty(
+                    (cfg.batch_size, 1),
+                    device=device,
+                    dtype=torch.long,
+                )
+                for _ in range(cfg.requests_per_rank)
+            ]
 
     recv_kv_bufs: List[torch.Tensor] = []
     recv_seed_bufs: List[torch.Tensor] = []
-    kv_caches: List[torch.Tensor] = []
-    if overlap and not is_prefill:
+    ready_events = (
+        [torch.cuda.Event() for _ in range(cfg.requests_per_rank)]
+        if is_prefill and overlap
+        else []
+    )
+    max_inflight = max(1, min(8, cfg.requests_per_rank))
+    prefill_pending_slots: List[Optional[List[dist.Work]]] = (
+        [None] * max_inflight if is_prefill and overlap else []
+    )
+    recv_pending_slots: List[Optional[List[dist.Work]]] = (
+        [None] * cfg.requests_per_rank if (not is_prefill and overlap) else []
+    )
+    decode_kv_cache: Optional[torch.Tensor] = None
+    decode_outputs: List[torch.Tensor] = []
+    if not is_prefill:
         recv_kv_bufs = [
             torch.empty(
                 (cfg.batch_size, cfg.context_window, cfg.hidden_size),
@@ -273,39 +339,55 @@ def _run_torchrun_worker(
             )
             for _ in range(cfg.requests_per_rank)
         ]
-        kv_caches = [
-            allocate_kv_cache(
-                cfg.batch_size,
-                cfg.tokens_per_request,
-                cfg.hidden_size,
-                cfg.dtype,
-                device,
-            )
-            for _ in range(cfg.requests_per_rank)
-        ]
+        decode_kv_cache = allocate_kv_cache(
+            cfg.batch_size,
+            cfg.tokens_per_request,
+            cfg.hidden_size,
+            cfg.dtype,
+            device,
+        )
+        decode_outputs = [torch.empty(0) for _ in range(cfg.requests_per_rank)]
 
     def run_iteration() -> List[torch.Tensor]:
         if is_prefill:
             if overlap:
-                pending: List[List[dist.Work]] = []
-                max_inflight = min(8, cfg.requests_per_rank)
-                with torch.no_grad():
+                pending = prefill_pending_slots
+                pending_count = 0
+                pending_read_idx = 0
+                pending_write_idx = 0
+                prefill_stream = torch.cuda.current_stream(device)
+                with torch.inference_mode():
                     for req_idx in range(cfg.requests_per_rank):
                         request_prompt = prompts[req_idx]
                         hidden, logits = model.prefill(request_prompt)
                         seed_tokens = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                        ready = torch.cuda.Event()
-                        ready.record()
+                        send_kv_bufs[req_idx].copy_(hidden)
+                        send_seed_bufs[req_idx].copy_(seed_tokens)
+                        ready = ready_events[req_idx]
+                        ready.record(prefill_stream)
                         handles = _batch_isend(
-                            hidden.contiguous(),
-                            seed_tokens.contiguous(),
+                            send_kv_bufs[req_idx],
+                            send_seed_bufs[req_idx],
                             ready_event=ready,
                         )
-                        pending.append(handles)
-                        if len(pending) >= max_inflight:
-                            _wait_handles(pending.pop(0))
-                for handles in pending:
+                        pending[pending_write_idx] = handles
+                        pending_write_idx = (pending_write_idx + 1) % max_inflight
+                        pending_count += 1
+                        if pending_count >= max_inflight:
+                            oldest = pending[pending_read_idx]
+                            if oldest is None:
+                                raise RuntimeError("Missing pending send handle")
+                            _wait_handles(oldest)
+                            pending[pending_read_idx] = None
+                            pending_read_idx = (pending_read_idx + 1) % max_inflight
+                            pending_count -= 1
+                for _ in range(pending_count):
+                    handles = pending[pending_read_idx]
+                    if handles is None:
+                        raise RuntimeError("Missing pending send handle")
                     _wait_handles(handles)
+                    pending[pending_read_idx] = None
+                    pending_read_idx = (pending_read_idx + 1) % max_inflight
             else:
                 kv_chunks, seed_chunks = _run_prefill(cfg, model, prompts)
                 for kv_prompt, seed_tokens in zip(kv_chunks, seed_chunks):
@@ -316,12 +398,14 @@ def _run_torchrun_worker(
             return []
 
         if overlap:
-            if not recv_kv_bufs or not recv_seed_bufs:
+            if not recv_kv_bufs or not recv_seed_bufs or decode_kv_cache is None:
                 raise RuntimeError("Overlap buffers not initialized")
-            outputs: List[torch.Tensor] = []
-            pending: List[Optional[List[dist.Work]]] = [None] * cfg.requests_per_rank
+            outputs = decode_outputs
+            if len(outputs) != cfg.requests_per_rank:
+                raise RuntimeError("Decode output slots not initialized")
+            pending = recv_pending_slots
             pending[0] = _batch_irecv(recv_kv_bufs[0], recv_seed_bufs[0])
-            with torch.no_grad():
+            with torch.inference_mode():
                 for req_idx in range(cfg.requests_per_rank):
                     next_idx = req_idx + 1
                     if next_idx < cfg.requests_per_rank:
@@ -333,39 +417,37 @@ def _run_torchrun_worker(
                     if handles is None:
                         raise RuntimeError("Missing receive handle in overlap pipeline")
                     _wait_handles(handles)
-                    kv_cache = kv_caches[req_idx]
-                    kv_cache[:, : cfg.context_window] = recv_kv_bufs[req_idx]
+                    pending[req_idx] = None
+                    decode_kv_cache[:, : cfg.context_window].copy_(recv_kv_bufs[req_idx])
                     tokens = recv_seed_bufs[req_idx]
                     for step in range(cfg.decode_tokens):
                         _, decode_logits = model.decode(
                             tokens,
-                            kv_cache=kv_cache,
+                            kv_cache=decode_kv_cache,
                             position=cfg.context_window + step,
                         )
                         tokens = torch.argmax(decode_logits[:, -1, :], dim=-1, keepdim=True)
-                    outputs.append(tokens)
+                    outputs[req_idx] = tokens
             return outputs
 
-        kv_chunks: List[torch.Tensor] = []
-        seed_chunks: List[torch.Tensor] = []
-        for _ in range(cfg.requests_per_rank):
-            kv_buf = torch.empty(
-                (cfg.batch_size, cfg.context_window, cfg.hidden_size),
-                device=device,
-                dtype=cfg.dtype,
-            )
-            seed_buf = torch.empty(
-                (cfg.batch_size, 1),
-                device=device,
-                dtype=torch.long,
-            )
+        if not recv_kv_bufs or not recv_seed_bufs or decode_kv_cache is None:
+            raise RuntimeError("Decode receive buffers not initialized")
+        for req_idx in range(cfg.requests_per_rank):
+            kv_buf = recv_kv_bufs[req_idx]
+            seed_buf = recv_seed_bufs[req_idx]
             _recv_blocking(kv_buf, seed_buf)
             torch.cuda.synchronize(device)
             # Naive handoff: sync per request to keep baseline fully serialized.
             _barrier()
-            kv_chunks.append(kv_buf)
-            seed_chunks.append(seed_buf)
-        decoded = _run_decode(cfg, model, kv_chunks, seed_chunks, device)
+        decoded = _run_decode(
+            cfg,
+            model,
+            recv_kv_bufs,
+            recv_seed_bufs,
+            device,
+            kv_cache=decode_kv_cache,
+            outputs=decode_outputs,
+        )
         return decoded
 
     _barrier()
@@ -416,7 +498,12 @@ class _DisaggregatedInferenceMultiGPUBenchmark(VerificationPayloadMixin, BaseBen
         self.label = label
         self._pairs: List[_LocalPair] = []
         self._output: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._pending_outputs: List[torch.Tensor] = []
+        self._pending_output_count = 0
+        self._expected_output_count = 0
         self._verify_prompt: Optional[torch.Tensor] = None
+        self._metadata_inputs: Dict[str, torch.Tensor] = {}
         self._param_count: int = 0
 
         total_requests = self.cfg.requests_per_rank * self.num_pairs * self.cfg.batch_size
@@ -425,6 +512,16 @@ class _DisaggregatedInferenceMultiGPUBenchmark(VerificationPayloadMixin, BaseBen
             requests_per_iteration=float(total_requests),
             tokens_per_iteration=float(tokens_per_iter),
         )
+
+    def _allocate_output_buffer(self) -> torch.Tensor:
+        shape = (
+            self.num_pairs * self.cfg.requests_per_rank * self.cfg.batch_size,
+            1,
+        )
+        try:
+            return torch.empty(shape, device="cpu", dtype=torch.long, pin_memory=True)
+        except RuntimeError:
+            return torch.empty(shape, device="cpu", dtype=torch.long)
 
     def setup(self) -> None:
         if not torch.cuda.is_available():
@@ -446,6 +543,65 @@ class _DisaggregatedInferenceMultiGPUBenchmark(VerificationPayloadMixin, BaseBen
             prefill_model = SimpleMoEGPT(moe_cfg, device=prefill_device).eval()
             decode_model = SimpleMoEGPT(moe_cfg, device=decode_device).eval()
             decode_model.load_state_dict(prefill_model.state_dict())
+            decode_kv_cache = allocate_kv_cache(
+                self.cfg.batch_size,
+                self.cfg.tokens_per_request,
+                self.cfg.hidden_size,
+                self.cfg.dtype,
+                decode_device,
+            )
+            prefill_kv_chunks = [
+                torch.empty(
+                    self.cfg.batch_size,
+                    self.cfg.context_window,
+                    self.cfg.hidden_size,
+                    device=prefill_device,
+                    dtype=self.cfg.dtype,
+                )
+                for _ in range(self.cfg.requests_per_rank)
+            ]
+            prefill_seed_chunks = [
+                torch.empty(
+                    self.cfg.batch_size,
+                    1,
+                    device=prefill_device,
+                    dtype=torch.long,
+                )
+                for _ in range(self.cfg.requests_per_rank)
+            ]
+            transfer_kv_chunks = [
+                torch.empty(
+                    self.cfg.batch_size,
+                    self.cfg.context_window,
+                    self.cfg.hidden_size,
+                    device=decode_device,
+                    dtype=self.cfg.dtype,
+                )
+                for _ in range(self.cfg.requests_per_rank)
+            ]
+            transfer_seed_chunks = [
+                torch.empty(
+                    self.cfg.batch_size,
+                    1,
+                    device=decode_device,
+                    dtype=torch.long,
+                )
+                for _ in range(self.cfg.requests_per_rank)
+            ]
+            transfer_slots = tuple(
+                (req_idx, transfer_kv_chunks[req_idx], transfer_seed_chunks[req_idx])
+                for req_idx in range(self.cfg.requests_per_rank)
+            )
+            transfer_slot_counts = (
+                len(transfer_kv_chunks),
+                len(transfer_seed_chunks),
+                len(transfer_slots),
+            )
+            expected_transfer_slot_counts = (
+                self.cfg.requests_per_rank,
+                self.cfg.requests_per_rank,
+                self.cfg.requests_per_rank,
+            )
             prompts = torch.randint(
                 0,
                 self.cfg.vocab_size,
@@ -462,6 +618,15 @@ class _DisaggregatedInferenceMultiGPUBenchmark(VerificationPayloadMixin, BaseBen
                     prefill_model=prefill_model,
                     decode_model=decode_model,
                     prompts=prompts,
+                    decode_kv_cache=decode_kv_cache,
+                    decode_outputs=[torch.empty(0) for _ in range(self.cfg.requests_per_rank)],
+                    prefill_kv_chunks=prefill_kv_chunks,
+                    prefill_seed_chunks=prefill_seed_chunks,
+                    transfer_kv_chunks=transfer_kv_chunks,
+                    transfer_seed_chunks=transfer_seed_chunks,
+                    transfer_slots=transfer_slots,
+                    transfer_slot_counts=transfer_slot_counts,
+                    expected_transfer_slot_counts=expected_transfer_slot_counts,
                 )
             )
 
@@ -469,6 +634,19 @@ class _DisaggregatedInferenceMultiGPUBenchmark(VerificationPayloadMixin, BaseBen
         if not self._pairs:
             raise RuntimeError("Failed to initialize prompts for verification")
         self._verify_prompt = self._pairs[0].prompts
+        self._pending_outputs = [
+            torch.empty(0) for _ in range(self.num_pairs * self.cfg.requests_per_rank)
+        ]
+        self._pending_output_count = len(self._pending_outputs)
+        self._expected_output_count = self.num_pairs * self.cfg.requests_per_rank
+        self._output_buffer = self._allocate_output_buffer()
+        meta_dtype = torch.float32
+        self._metadata_inputs = {
+            "decode_tokens": torch.zeros((self.cfg.decode_tokens,), dtype=meta_dtype),
+            "hidden_size": torch.zeros((self.cfg.hidden_size,), dtype=meta_dtype),
+            "num_layers": torch.zeros((self.cfg.num_layers,), dtype=meta_dtype),
+            "num_experts": torch.zeros((self.cfg.num_experts,), dtype=meta_dtype),
+        }
         for pair in self._pairs:
             torch.cuda.synchronize(pair.prefill_device)
             torch.cuda.synchronize(pair.decode_device)
@@ -477,33 +655,73 @@ class _DisaggregatedInferenceMultiGPUBenchmark(VerificationPayloadMixin, BaseBen
         if not self._pairs:
             raise RuntimeError("setup() must run before benchmark_fn()")
 
-        outputs: List[torch.Tensor] = []
-        with torch.no_grad():
+        outputs = self._pending_outputs
+        if self._pending_output_count != self._expected_output_count:
+            raise RuntimeError("Decode output slots not initialized")
+        output_idx = 0
+        with torch.inference_mode():
             for pair in self._pairs:
-                kv_chunks, seed_chunks = _run_prefill(self.cfg, pair.prefill_model, pair.prompts)
+                kv_chunks, seed_chunks = _run_prefill(
+                    self.cfg,
+                    pair.prefill_model,
+                    pair.prompts,
+                    pair.prefill_kv_chunks,
+                    pair.prefill_seed_chunks,
+                )
+                if pair.transfer_slot_counts != pair.expected_transfer_slot_counts:
+                    raise RuntimeError("Transfer chunk slots not initialized")
+                for req_idx, transfer_kv, transfer_seed in pair.transfer_slots:
+                    transfer_kv.copy_(
+                        kv_chunks[req_idx],
+                        non_blocking=self.overlap,
+                    )
+                    transfer_seed.copy_(
+                        seed_chunks[req_idx],
+                        non_blocking=self.overlap,
+                    )
                 decoded = _run_decode(
                     self.cfg,
                     pair.decode_model,
-                    [kv.to(pair.decode_device, non_blocking=self.overlap) for kv in kv_chunks],
-                    [seed.to(pair.decode_device, non_blocking=self.overlap) for seed in seed_chunks],
+                    pair.transfer_kv_chunks,
+                    pair.transfer_seed_chunks,
                     pair.decode_device,
+                    kv_cache=pair.decode_kv_cache,
+                    outputs=pair.decode_outputs,
                 )
-                outputs.extend(decoded)
+                for decoded_tokens in decoded:
+                    outputs[output_idx] = decoded_tokens
+                    output_idx += 1
 
-        self._output = torch.cat([out.detach().cpu() for out in outputs], dim=0)
+        self._pending_outputs = outputs
+        self._output = None
 
     def capture_verification_payload(self) -> None:
-        if self._output is None or self._verify_prompt is None:
+        if self._verify_prompt is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        if self._output is None:
+            if not self._pending_outputs:
+                raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+            if self._output_buffer is None:
+                raise RuntimeError("Output buffer not initialized")
+            output_offset = 0
+            for output in self._pending_outputs:
+                output_rows = int(output.shape[0])
+                self._output_buffer[output_offset : output_offset + output_rows].copy_(
+                    output,
+                    non_blocking=False,
+                )
+                output_offset += output_rows
+            self._output = self._output_buffer
         tf32_enabled = torch.cuda.is_available() and bool(torch.backends.cuda.matmul.allow_tf32)
-        meta_dtype = torch.float32
+        if not self._metadata_inputs:
+            raise RuntimeError("setup() must initialize verification metadata tensors")
         self._set_verification_payload(
             inputs={
                 "prompt": self._verify_prompt,
-                "decode_tokens": torch.zeros((self.cfg.decode_tokens,), dtype=meta_dtype),
-                "hidden_size": torch.zeros((self.cfg.hidden_size,), dtype=meta_dtype),
-                "num_layers": torch.zeros((self.cfg.num_layers,), dtype=meta_dtype),
-                "num_experts": torch.zeros((self.cfg.num_experts,), dtype=meta_dtype),
+                "decode_tokens": self._metadata_inputs["decode_tokens"],
+                "hidden_size": self._metadata_inputs["hidden_size"],
+                "num_layers": self._metadata_inputs["num_layers"],
+                "num_experts": self._metadata_inputs["num_experts"],
             },
             output=self._output,
             batch_size=int(self._output.shape[0]),
@@ -538,7 +756,12 @@ class _DisaggregatedInferenceMultiGPUBenchmark(VerificationPayloadMixin, BaseBen
     def teardown(self) -> None:
         self._pairs = []
         self._output = None
+        self._output_buffer = None
+        self._pending_outputs = []
+        self._pending_output_count = 0
+        self._expected_output_count = 0
         self._verify_prompt = None
+        self._metadata_inputs = {}
         torch.cuda.empty_cache()
 
     def validate_result(self) -> Optional[str]:

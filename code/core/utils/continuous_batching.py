@@ -43,10 +43,14 @@ class ContinuousBatchingBase(BaseBenchmark):
         self.device_ids: List[int] = []
         self.models: List[nn.Module] = []
         self.samples: List[torch.Tensor] = []
+        self.state_buffers: List[torch.Tensor] = []
+        self.dynamic_batch_buffers: List[torch.Tensor] = []
         self.lengths: List[List[int]] = []
         self.lengths_tensor: List[torch.Tensor] = []
         self.group_indices: List[List[torch.Tensor]] = []
+        self.group_ranges: List[List[tuple[int, int]]] = []
         self.group_max_steps: List[List[int]] = []
+        self.group_active_masks: List[List[torch.Tensor]] = []
         self.schedules: List[List[torch.Tensor]] = []
         self.outputs: List[torch.Tensor] = []
         self.output: Optional[torch.Tensor] = None
@@ -60,7 +64,11 @@ class ContinuousBatchingBase(BaseBenchmark):
         )
 
     @staticmethod
-    def _build_dynamic_schedule(lengths: List[int], max_batch_size: int, device: torch.device) -> List[torch.Tensor]:
+    def _build_dynamic_schedule(
+        lengths: List[int],
+        max_batch_size: int,
+        device: torch.device,
+    ) -> List[torch.Tensor]:
         """Precompute dynamic schedule indices for continuous batching."""
         remaining = lengths.copy()
         active: List[int] = list(range(min(max_batch_size, len(lengths))))
@@ -97,11 +105,16 @@ class ContinuousBatchingBase(BaseBenchmark):
 
         self.models = []
         self.samples = []
+        self.state_buffers = []
+        self.dynamic_batch_buffers = []
         self.lengths = []
         self.lengths_tensor = []
         self.group_indices = []
+        self.group_ranges = []
         self.group_max_steps = []
+        self.group_active_masks = []
         self.schedules = []
+        self.outputs = []
         self.streams = []
         total_tokens = 0
 
@@ -121,19 +134,49 @@ class ContinuousBatchingBase(BaseBenchmark):
                 dtype=self.dtype,
             )
             self.samples.append(samples)
+            self.state_buffers.append(torch.empty_like(samples))
+            self.dynamic_batch_buffers.append(
+                torch.empty(
+                    self.max_batch_size,
+                    self.hidden_dim,
+                    device=device,
+                    dtype=self.dtype,
+                )
+            )
 
             rng = random.Random(123 + device_id)
-            lengths = [rng.randint(1, self.max_decode_steps) for _ in range(self.num_samples_per_device)]
+            lengths = [
+                rng.randint(1, self.max_decode_steps)
+                for _ in range(self.num_samples_per_device)
+            ]
             total_tokens += int(sum(lengths))
             self.lengths.append(lengths)
             lengths_tensor = torch.tensor(lengths, device=device, dtype=torch.int32)
             self.lengths_tensor.append(lengths_tensor)
 
             if self.dynamic:
-                self.schedules.append(self._build_dynamic_schedule(lengths, self.max_batch_size, device))
+                self.schedules.append(
+                    self._build_dynamic_schedule(lengths, self.max_batch_size, device)
+                )
                 self.group_indices.append([])
+                self.group_ranges.append([])
                 self.group_max_steps.append([])
+                self.group_active_masks.append([])
             else:
+                group_ranges = [
+                    (i * self.max_batch_size, (i + 1) * self.max_batch_size)
+                    for i in range(self.num_batches)
+                ]
+                group_max_steps = [max(lengths[start:end]) for start, end in group_ranges]
+                group_active_masks = []
+                for (start, end), group_max in zip(group_ranges, group_max_steps):
+                    group_lengths = lengths_tensor[start:end].view(1, -1, 1)
+                    group_steps = torch.arange(
+                        group_max,
+                        device=device,
+                        dtype=lengths_tensor.dtype,
+                    ).view(-1, 1, 1)
+                    group_active_masks.append(group_steps < group_lengths)
                 groups = [
                     torch.arange(
                         i * self.max_batch_size,
@@ -144,8 +187,12 @@ class ContinuousBatchingBase(BaseBenchmark):
                     for i in range(self.num_batches)
                 ]
                 self.group_indices.append(groups)
-                self.group_max_steps.append([max(lengths[i * self.max_batch_size : (i + 1) * self.max_batch_size]) for i in range(self.num_batches)])
+                self.group_ranges.append(group_ranges)
+                self.group_max_steps.append(group_max_steps)
+                self.group_active_masks.append(group_active_masks)
                 self.schedules.append([])
+
+        self.outputs = list(self.state_buffers)
 
         self._verify_input = self.samples[0][:2].detach()
         total_requests = self.num_samples_per_device * len(self.device_ids)
@@ -159,39 +206,49 @@ class ContinuousBatchingBase(BaseBenchmark):
         )
 
     def benchmark_fn(self) -> None:
-        self.outputs = []
-
         with self._nvtx_range(self.label):
             with torch.inference_mode():
                 for idx, device_id in enumerate(self.device_ids):
                     model = self.models[idx]
                     samples = self.samples[idx]
-                    lengths_tensor = self.lengths_tensor[idx]
+                    state = self.state_buffers[idx]
+                    dynamic_batch_buffer = self.dynamic_batch_buffers[idx]
                     schedule = self.schedules[idx]
-                    groups = self.group_indices[idx]
+                    group_ranges = self.group_ranges[idx]
+                    group_max_steps = self.group_max_steps[idx]
+                    group_active_masks = self.group_active_masks[idx]
                     with torch.cuda.device(device_id):
-                        state = samples.clone()
+                        state.copy_(samples)
                         if self.dynamic:
                             for active_idx in schedule:
-                                batch_state = state.index_select(0, active_idx)
+                                batch_state = dynamic_batch_buffer[: active_idx.numel()]
+                                torch.index_select(state, 0, active_idx, out=batch_state)
                                 y = model(batch_state)
                                 state.index_copy_(0, active_idx, y)
                         else:
-                            for group_idx, group_max in zip(groups, self.group_max_steps[idx]):
-                                group_state = state.index_select(0, group_idx)
-                                group_lengths = lengths_tensor.index_select(0, group_idx)
+                            for (group_start, group_end), group_max, active_masks in zip(
+                                group_ranges,
+                                group_max_steps,
+                                group_active_masks,
+                            ):
+                                group_state = state[group_start:group_end]
                                 for step in range(group_max):
                                     y = model(group_state)
-                                    active = step < group_lengths
-                                    group_state[active] = y[active]
-                                state.index_copy_(0, group_idx, group_state)
-                        self.outputs.append(state)
+                                    torch.where(
+                                        active_masks[step],
+                                        y,
+                                        group_state,
+                                        out=group_state,
+                                    )
 
-        self.output = self.outputs[0]
+        self.output = self.state_buffers[0]
 
     def capture_verification_payload(self) -> None:
         if self.output is None or self._verify_input is None:
-            raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
+            raise RuntimeError(
+                "setup() and benchmark_fn() must be called before "
+                "capture_verification_payload()"
+            )
         param_count = sum(p.numel() for p in self.models[0].parameters())
         self._set_verification_payload(
             inputs={"probe": self._verify_input},
@@ -202,7 +259,11 @@ class ContinuousBatchingBase(BaseBenchmark):
                 "fp16": self.dtype == torch.float16,
                 "bf16": self.dtype == torch.bfloat16,
                 "fp8": False,
-                "tf32": torch.backends.cuda.matmul.allow_tf32 if torch.cuda.is_available() else False,
+                "tf32": (
+                    torch.backends.cuda.matmul.allow_tf32
+                    if torch.cuda.is_available()
+                    else False
+                ),
             },
             output_tolerance=(1e-2, 1e-2),
             signature_overrides={
@@ -213,10 +274,14 @@ class ContinuousBatchingBase(BaseBenchmark):
     def teardown(self) -> None:
         self.models = []
         self.samples = []
+        self.state_buffers = []
+        self.dynamic_batch_buffers = []
         self.lengths = []
         self.lengths_tensor = []
         self.group_indices = []
+        self.group_ranges = []
         self.group_max_steps = []
+        self.group_active_masks = []
         self.schedules = []
         self.outputs = []
         self.streams = []

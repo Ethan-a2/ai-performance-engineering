@@ -46,6 +46,9 @@ class GPT4ArchitectureOptimization:
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.output: Optional[torch.Tensor] = None
+        self._timing_events: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
+        self._last_tokens_per_sec = 0.0
+        self._throughput_logged = False
         
         logger.info(f"GPT-4 Architecture Optimization")
         logger.info(f"  MoE: {use_moe}")
@@ -109,7 +112,7 @@ class GPT4ArchitectureOptimization:
         self.layers = nn.ModuleList([
             SimplifiedGPT4Layer(test_hidden)
             for _ in range(4)  # Test with 4 layers
-        ]).to(self.device).to(torch.bfloat16)
+        ]).to(self.device).to(torch.bfloat16).eval()
         
         # Create input
         self.input = torch.randn(
@@ -119,27 +122,44 @@ class GPT4ArchitectureOptimization:
             device=self.device,
             dtype=torch.bfloat16
         )
+        if self.device.type == "cuda":
+            self._timing_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        self._throughput_logged = False
         
         logger.info("Simplified GPT-4 model initialized")
     
+    @torch.inference_mode()
     def run(self) -> float:
         """Execute forward pass."""
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        start = time.perf_counter()
-        
-        x = self.input
-        for layer in self.layers:
-            x = layer(x)
-        
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        self.output = x[:1, : min(4, x.shape[1]), : min(8, x.shape[2])]
+        if self.device.type == "cuda":
+            if self._timing_events is None:
+                raise RuntimeError("CUDA timing events are not initialized")
+            start_event, end_event = self._timing_events
+            current_stream = torch.cuda.current_stream(self.device)
+            start_event.record(current_stream)
+            x = self.input
+            for layer in self.layers:
+                x = layer(x)
+            end_event.record(current_stream)
+            end_event.synchronize()
+            elapsed_ms = start_event.elapsed_time(end_event)
+        else:
+            start = time.perf_counter()
+            x = self.input
+            for layer in self.layers:
+                x = layer(x)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+        self.output = x
         
         tokens_per_sec = (self.batch_size * self.seq_length) / (elapsed_ms / 1000)
+        self._last_tokens_per_sec = tokens_per_sec
         
-        logger.info(f"Throughput: {tokens_per_sec:.2f} tokens/sec")
+        if not self._throughput_logged:
+            logger.info("Throughput: %.2f tokens/sec", tokens_per_sec)
+            self._throughput_logged = True
         
         return elapsed_ms
     
@@ -147,6 +167,7 @@ class GPT4ArchitectureOptimization:
         """Clean up."""
         del self.layers, self.input
         self.output = None
+        self._timing_events = None
         torch.cuda.empty_cache()
 
 
@@ -159,8 +180,14 @@ class GPT4ArchitectureOptimizationBenchmark(VerificationPayloadMixin, BaseBenchm
         super().__init__()
         self.model_wrapper: Optional[GPT4ArchitectureOptimization] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count = 0
-        self._last_metrics: Dict[str, float] = {}
+        self._last_metrics: Dict[str, float] = {
+            "gpt4_architecture.mean_time_ms": 0.0,
+            "gpt4_architecture.use_moe": 0.0,
+            "gpt4_architecture.use_fp8": 0.0,
+            "gpt4_architecture.use_context_parallel": 0.0,
+        }
         self.register_workload_metadata(requests_per_iteration=1.0)
 
     def setup(self) -> None:
@@ -172,27 +199,39 @@ class GPT4ArchitectureOptimizationBenchmark(VerificationPayloadMixin, BaseBenchm
         self.model_wrapper = GPT4ArchitectureOptimization()
         self.model_wrapper.setup()
         self.parameter_count = sum(p.numel() for p in self.model_wrapper.layers.parameters())
+        self._verify_output_buffer = torch.empty(
+            (1, min(4, self.model_wrapper.seq_length), min(8, self.model_wrapper.input.shape[2])),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
     def benchmark_fn(self) -> None:
         if self.model_wrapper is None:
             raise RuntimeError("Model wrapper not initialized")
         elapsed_ms = self.model_wrapper.run()
         self.output = self.model_wrapper.output
-        self._last_metrics = {
-            "gpt4_architecture.mean_time_ms": float(elapsed_ms),
-            "gpt4_architecture.use_moe": 1.0 if self.model_wrapper.use_moe else 0.0,
-            "gpt4_architecture.use_fp8": 1.0 if self.model_wrapper.use_fp8 else 0.0,
-            "gpt4_architecture.use_context_parallel": 1.0 if self.model_wrapper.use_context_parallel else 0.0,
-        }
+        metrics = self._last_metrics
+        metrics["gpt4_architecture.mean_time_ms"] = float(elapsed_ms)
+        metrics["gpt4_architecture.use_moe"] = 1.0 if self.model_wrapper.use_moe else 0.0
+        metrics["gpt4_architecture.use_fp8"] = 1.0 if self.model_wrapper.use_fp8 else 0.0
+        metrics["gpt4_architecture.use_context_parallel"] = (
+            1.0 if self.model_wrapper.use_context_parallel else 0.0
+        )
         if self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
-        if self.model_wrapper is None or self.output is None:
+        if self.model_wrapper is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input": self.model_wrapper.input.detach()},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.model_wrapper.batch_size,
             parameter_count=self.parameter_count,
             precision_flags={
@@ -209,6 +248,7 @@ class GPT4ArchitectureOptimizationBenchmark(VerificationPayloadMixin, BaseBenchm
             self.model_wrapper.cleanup()
         self.model_wrapper = None
         self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
@@ -256,4 +296,3 @@ def run_benchmark(
 
 def get_benchmark() -> BaseBenchmark:
     return GPT4ArchitectureOptimizationBenchmark()
-

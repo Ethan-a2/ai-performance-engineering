@@ -12,24 +12,34 @@ but swaps the FP32 refresh for an adaptive-bitwidth quantized refresh.
 
 from __future__ import annotations
 
-import statistics
 from typing import Dict, List, Optional
 
 import torch
 
 from core.benchmark.cuda_event_timing import elapsed_ms
+from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (  # noqa: E402
     BaseBenchmark,
     BenchmarkConfig,
     WorkloadMetadata,
 )
-from core.benchmark.verification_mixin import VerificationPayloadMixin
 
 _CACHE_SHAPE = (64, 1024, 512)
 _CACHE_ROWS = _CACHE_SHAPE[0] * _CACHE_SHAPE[1]
 _CACHE_LAST_DIM = _CACHE_SHAPE[-1]
 _FP4_PACKED_LAST_DIM = _CACHE_LAST_DIM // 2
 _FP6_PACKED_LAST_DIM = (_CACHE_LAST_DIM // 4) * 3
+
+
+def _coalesce_repeated_bits(schedule_bits: List[int]) -> List[int]:
+    """Collapse consecutive same-width refreshes into one physical copy."""
+    coalesced: List[int] = []
+    previous: Optional[int] = None
+    for bits in schedule_bits:
+        if bits != previous:
+            coalesced.append(bits)
+            previous = bits
+    return coalesced
 
 
 def _pack_int4(values: torch.Tensor, out: torch.Tensor) -> None:
@@ -93,9 +103,19 @@ def _unpack_int6_to_float(packed: torch.Tensor, scale: torch.Tensor, out: torch.
 class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
     """Base class for KV cache quantization benchmarks."""
 
-    def __init__(self, *, schedule_bits: List[int], use_fp32_baseline: bool = False):
+    def __init__(
+        self,
+        *,
+        schedule_bits: List[int],
+        use_fp32_baseline: bool = False,
+        coalesce_repeated_bits: bool = False,
+    ):
         super().__init__()
         self.schedule_bits = schedule_bits
+        self._refresh_schedule_bits = (
+            _coalesce_repeated_bits(schedule_bits) if coalesce_repeated_bits else list(schedule_bits)
+        )
+        self.coalesce_repeated_bits = coalesce_repeated_bits
         self.use_fp32_baseline = use_fp32_baseline
         self._verification_input = torch.tensor(_CACHE_SHAPE, dtype=torch.int32)
         self._cache_numel = _CACHE_SHAPE[0] * _CACHE_SHAPE[1] * _CACHE_SHAPE[2]
@@ -111,8 +131,18 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._scale6_src: Optional[torch.Tensor] = None
         self._scale4_src: Optional[torch.Tensor] = None
         self._packed_dst_bytes: Optional[torch.Tensor] = None
+        self._packed_dst_int8: Optional[torch.Tensor] = None
+        self._packed_dst_int6: Optional[torch.Tensor] = None
+        self._packed_dst_int4: Optional[torch.Tensor] = None
+        self._last_packed_dst: Optional[torch.Tensor] = None
+        self._packed_dst_bytes_cpu: Optional[torch.Tensor] = None
+        self._last_scale_cpu: Optional[torch.Tensor] = None
+        self._dequantized_cpu: Optional[torch.Tensor] = None
         self._last_scale: Optional[torch.Tensor] = None
-        self._history: Dict[str, List[float]] = {"latency_ms": [], "error": []}
+        self._latency_total_ms = 0.0
+        self._latency_count = 0
+        self._error_total = 0.0
+        self._error_count = 0
         total_tokens = len(schedule_bits) * _CACHE_ROWS
         self._workload = WorkloadMetadata(
             requests_per_iteration=1.0,
@@ -125,7 +155,9 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
         )
         self._verification_payload = None
         self._pending_timing_pair: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
-        self._last_bits = schedule_bits[-1]
+        self._timing_pair: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
+        self._empty_iteration_result: Dict[str, List[float]] = {}
+        self._last_bits = self._refresh_schedule_bits[-1]
 
     def setup(self) -> None:
         torch.manual_seed(42)
@@ -151,12 +183,41 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
             self._scale8_src = torch.empty(self._reference_cache.shape[:-1] + (1,), device=self.device, dtype=torch.float32)
             self._scale6_src = torch.empty_like(self._scale8_src)
             self._scale4_src = torch.empty_like(self._scale8_src)
-            self._packed_dst_bytes = torch.empty_like(self._reference_cache, dtype=torch.uint8)
+            self._packed_dst_int8 = torch.empty_like(self._reference_cache, dtype=torch.uint8)
+            self._packed_dst_int6 = torch.empty_like(self._packed_int6_src)
+            self._packed_dst_int4 = torch.empty_like(self._packed_int4_src)
+            self._packed_dst_bytes = self._packed_dst_int8
             self._prepare_quantized_sources()
             self._reference_cache = None
+            pin_cpu_output = self.device.type == "cuda" and torch.cuda.is_available()
+            self._packed_dst_bytes_cpu = torch.empty(
+                _CACHE_SHAPE,
+                device="cpu",
+                dtype=torch.uint8,
+                pin_memory=pin_cpu_output,
+            )
+            self._last_scale_cpu = torch.empty(
+                _CACHE_SHAPE[:-1] + (1,),
+                device="cpu",
+                dtype=torch.float32,
+                pin_memory=pin_cpu_output,
+            )
+            self._dequantized_cpu = torch.empty_like(self._reference_cache_cpu)
         self._quant_scratch = None
         self.output = None
+        self._timing_pair = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         torch.cuda.synchronize(self.device)
+
+    def _get_timing_pair(self) -> tuple[torch.cuda.Event, torch.cuda.Event]:
+        if self._timing_pair is None:
+            self._timing_pair = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        return self._timing_pair
 
     def _refresh_reference_cache(self) -> None:
         if self._quant_scratch is None or self._reference_cache is None:
@@ -181,7 +242,7 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._scale8_src.copy_(self._reference_cache.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / 127.0)
         torch.div(self._reference_cache, self._scale8_src, out=self._quant_scratch)
         self._quant_scratch.round_().clamp_(-127, 127)
-        self._quantized_int8_src.copy_(self._quant_scratch.to(torch.int8))
+        self._quantized_int8_src.copy_(self._quant_scratch)
 
         self._scale6_src.copy_(self._reference_cache.abs().amax(dim=-1, keepdim=True).clamp(min=1e-6) / 31.0)
         torch.div(self._reference_cache, self._scale6_src, out=self._quant_scratch)
@@ -210,17 +271,22 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
             or self._scale8_src is None
             or self._scale6_src is None
             or self._scale4_src is None
-            or self._packed_dst_bytes is None
+            or self._packed_dst_int8 is None
+            or self._packed_dst_int6 is None
+            or self._packed_dst_int4 is None
         ):
             raise RuntimeError("Quantized cache buffers not initialized")
         if bits == 8:
-            self._packed_dst_bytes.copy_(self._quantized_int8_src.view(torch.uint8))
+            self._packed_dst_int8.copy_(self._quantized_int8_src.view(torch.uint8))
+            self._last_packed_dst = self._packed_dst_int8
             self._last_scale = self._scale8_src
         elif bits == 6:
-            self._packed_dst_bytes[..., :_FP6_PACKED_LAST_DIM].copy_(self._packed_int6_src)
+            self._packed_dst_int6.copy_(self._packed_int6_src)
+            self._last_packed_dst = self._packed_dst_int6
             self._last_scale = self._scale6_src
         elif bits == 4:
-            self._packed_dst_bytes[..., :_FP4_PACKED_LAST_DIM].copy_(self._packed_int4_src)
+            self._packed_dst_int4.copy_(self._packed_int4_src)
+            self._last_packed_dst = self._packed_dst_int4
             self._last_scale = self._scale4_src
         else:
             raise ValueError(f"Unsupported quantization bits: {bits}")
@@ -231,31 +297,51 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if (
             self.use_fp32_baseline
             or self._reference_cache_cpu is None
-            or self._packed_dst_bytes is None
+            or self._last_packed_dst is None
             or self._last_scale is None
+            or self._packed_dst_bytes_cpu is None
+            or self._last_scale_cpu is None
+            or self._dequantized_cpu is None
         ):
             return
         last_bits = self._last_bits
-        dequantized = torch.empty_like(self._reference_cache_cpu)
+        packed_cpu = self._packed_dst_bytes_cpu
+        scale_cpu = self._last_scale_cpu
+        dequantized = self._dequantized_cpu
+        scale_cpu.copy_(self._last_scale, non_blocking=scale_cpu.is_pinned())
         if last_bits == 8:
-            dequantized.copy_(self._packed_dst_bytes.view(torch.int8).cpu().to(torch.float32))
-            dequantized.mul_(self._last_scale.cpu())
+            packed_view = packed_cpu
+            packed_view.copy_(self._last_packed_dst, non_blocking=packed_cpu.is_pinned())
+            dequantized.copy_(packed_cpu.view(torch.int8))
+            dequantized.mul_(scale_cpu)
         elif last_bits == 6:
+            packed_view = packed_cpu[..., :_FP6_PACKED_LAST_DIM]
+            packed_view.copy_(
+                self._last_packed_dst,
+                non_blocking=packed_cpu.is_pinned(),
+            )
             _unpack_int6_to_float(
-                self._packed_dst_bytes[..., :_FP6_PACKED_LAST_DIM].cpu(),
-                self._last_scale.cpu(),
+                packed_view,
+                scale_cpu,
                 dequantized,
             )
         elif last_bits == 4:
+            packed_view = packed_cpu[..., :_FP4_PACKED_LAST_DIM]
+            packed_view.copy_(
+                self._last_packed_dst,
+                non_blocking=packed_cpu.is_pinned(),
+            )
             _unpack_int4_to_float(
-                self._packed_dst_bytes[..., :_FP4_PACKED_LAST_DIM].cpu(),
-                self._last_scale.cpu(),
+                packed_view,
+                scale_cpu,
                 dequantized,
             )
         else:
             raise ValueError(f"Unsupported final quantization bits: {last_bits}")
         self.output = dequantized
-        self._history["error"].append(float((self._reference_cache_cpu - dequantized).abs().max().item()))
+        error = float((self._reference_cache_cpu - dequantized).abs().max().item())
+        self._error_total += error
+        self._error_count += 1
 
     def benchmark_fn(self) -> Dict[str, List[float]]:
         if self.use_fp32_baseline:
@@ -264,29 +350,32 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
         elif self._packed_dst_bytes is None:
             raise RuntimeError("Quantized cache not initialized")
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
+        timing_pair = self._get_timing_pair()
+        start_event, end_event = timing_pair
+        current_stream = torch.cuda.current_stream(self.device)
+        start_event.record(current_stream)
 
-        if self.use_fp32_baseline:
-            for _ in self.schedule_bits:
-                self._non_adaptive_cache_update()
-        else:
-            for bits in self.schedule_bits:
-                self._adaptive_cache_update(bits)
+        with torch.inference_mode():
+            if self.use_fp32_baseline:
+                for _ in self._refresh_schedule_bits:
+                    self._non_adaptive_cache_update()
+            else:
+                for bits in self._refresh_schedule_bits:
+                    self._adaptive_cache_update(bits)
 
-        end_event.record()
-        self._pending_timing_pair = (start_event, end_event)
-        return {}
+        end_event.record(current_stream)
+        self._pending_timing_pair = timing_pair
+        return self._empty_iteration_result
 
     def finalize_iteration_metrics(self) -> Optional[Dict[str, List[float]]]:
         if self._pending_timing_pair is None:
             return None
         latency_ms = elapsed_ms(self._pending_timing_pair)
         self._pending_timing_pair = None
-        self._history["latency_ms"].append(latency_ms)
+        self._latency_total_ms += latency_ms
+        self._latency_count += 1
         if self.use_fp32_baseline:
-            self._history["error"].append(0.0)
+            self._error_count += 1
         else:
             self._finalize_quantized_output()
         return None
@@ -314,7 +403,16 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._scale6_src = None
         self._scale4_src = None
         self._packed_dst_bytes = None
+        self._packed_dst_int8 = None
+        self._packed_dst_int6 = None
+        self._packed_dst_int4 = None
+        self._last_packed_dst = None
+        self._packed_dst_bytes_cpu = None
+        self._last_scale_cpu = None
+        self._dequantized_cpu = None
         self._last_scale = None
+        self._timing_pair = None
+        self._pending_timing_pair = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -326,15 +424,15 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def get_custom_metrics(self) -> Optional[Dict[str, float]]:
         self.finalize_iteration_metrics()
-        if not self._history["latency_ms"]:
+        if self._latency_count == 0:
             return None
-        avg_ms = statistics.mean(self._history["latency_ms"])
-        avg_err = statistics.mean(self._history["error"]) if self._history["error"] else 0.0
+        avg_ms = self._latency_total_ms / self._latency_count
+        avg_err = self._error_total / self._error_count if self._error_count else 0.0
         elements = self._cache_numel
         if self.use_fp32_baseline:
-            payload_bits = len(self.schedule_bits) * 32 * elements
+            payload_bits = len(self._refresh_schedule_bits) * 32 * elements
         else:
-            payload_bits = sum(bits * elements for bits in self.schedule_bits)
+            payload_bits = sum(bits * elements for bits in self._refresh_schedule_bits)
         throughput_gbps = 0.0
         if avg_ms > 0 and payload_bits:
             throughput_gbps = (payload_bits / avg_ms) / 1e6
@@ -342,6 +440,8 @@ class _DynamicQuantizedCacheBenchmark(VerificationPayloadMixin, BaseBenchmark):
             "kv_cache.mean_latency_ms": float(avg_ms),
             "kv_cache.mean_error": float(avg_err),
             "kv_cache.throughput_gbps": float(throughput_gbps),
+            "kv_cache.logical_refresh_steps": float(len(self.schedule_bits)),
+            "kv_cache.physical_refresh_steps": float(len(self._refresh_schedule_bits)),
         }
 
 

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Optional, List
+from typing import List, Optional
 
 import torch
 
+from core.benchmark.gpu_requirements import skip_if_insufficient_gpus
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
-from core.benchmark.gpu_requirements import skip_if_insufficient_gpus
 
 
 class OptimizedDistributedBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -20,9 +20,12 @@ class OptimizedDistributedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         super().__init__()
         self.data: List[torch.Tensor] = []
         self.local_sums: List[torch.Tensor] = []
+        self._sum_pairs: List[tuple[torch.Tensor, torch.Tensor]] = []
         self.reduced_sums: List[torch.Tensor] = []
         self.device_ids: List[int] = []
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._verify_probe_buffer: Optional[torch.Tensor] = None
         self.num_elements = 200_000_000
         self._workload = WorkloadMetadata(
             requests_per_iteration=1.0,
@@ -39,8 +42,11 @@ class OptimizedDistributedBenchmark(VerificationPayloadMixin, BaseBenchmark):
             torch.randn(self.num_elements, device=f"cuda:{device_id}")
             for device_id in self.device_ids
         ]
-        self.local_sums = [torch.zeros(1, device=t.device, dtype=torch.float32) for t in self.data]
-        self.reduced_sums = [torch.zeros_like(t) for t in self.local_sums]
+        self.local_sums = [torch.empty(1, device=t.device, dtype=torch.float32) for t in self.data]
+        self._sum_pairs = list(zip(self.data, self.local_sums, strict=True))
+        self.reduced_sums = [torch.empty_like(t) for t in self.local_sums]
+        self._verify_output_buffer = torch.empty_like(self.local_sums[0])
+        self._verify_probe_buffer = torch.empty(256, dtype=self.data[0].dtype, pin_memory=True)
         total_tokens = self.num_elements * len(self.device_ids)
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(len(self.device_ids)),
@@ -53,26 +59,33 @@ class OptimizedDistributedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._synchronize()
 
     def benchmark_fn(self) -> None:
-        with self._nvtx_range("optimized_distributed_multigpu"):
+        with torch.inference_mode(), self._nvtx_range("optimized_distributed_multigpu"):
             if not self.data:
                 raise RuntimeError("setup() must be called before benchmark_fn()")
             if not self.local_sums or not self.reduced_sums:
                 raise RuntimeError("setup() must be called before benchmark_fn()")
-            for idx, tensor in enumerate(self.data):
-                self.local_sums[idx].copy_(tensor.sum().view(1))
+            for tensor, local_sum in self._sum_pairs:
+                torch.sum(tensor, dim=0, keepdim=True, out=local_sum)
             torch.cuda.nccl.all_reduce(self.local_sums, outputs=self.reduced_sums)
-            torch.cuda.synchronize()
-            self.output = self.reduced_sums[0].detach().clone()
+            self.output = self.reduced_sums[0]
 
     def capture_verification_payload(self) -> None:
         if not self.data:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
         if self.output is None:
             raise RuntimeError("benchmark_fn() must be called before capture_verification_payload()")
-        probe = self.data[0][:256].detach().cpu()
+        if self._verify_output_buffer is None:
+            raise RuntimeError("setup() must initialize verification output buffer")
+        if self._verify_probe_buffer is None:
+            raise RuntimeError("setup() must initialize verification input buffer")
+        self._verify_output_buffer.copy_(self.output)
+        self._verify_probe_buffer.copy_(
+            self.data[0][: self._verify_probe_buffer.numel()],
+            non_blocking=False,
+        )
         self._set_verification_payload(
-            inputs={"data_probe": probe},
-            output=self.output.detach().clone(),
+            inputs={"data_probe": self._verify_probe_buffer},
+            output=self._verify_output_buffer,
             batch_size=1,
             parameter_count=0,
             precision_flags={
@@ -87,8 +100,11 @@ class OptimizedDistributedBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.data = []
         self.local_sums = []
+        self._sum_pairs = []
         self.reduced_sums = []
         self.output = None
+        self._verify_output_buffer = None
+        self._verify_probe_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

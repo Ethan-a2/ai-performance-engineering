@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 
-from core.discovery import chapter_slug, discover_all_chapters, discover_benchmarks
-from ch15.speculative_decoding_benchmarks import SpeculativeDecodingBenchmark
 from ch08.tcgen05_custom_vs_cublas_benchmark_base import Tcgen05CustomVsCublasBase
 from ch08.threshold_tma_benchmark_base import ThresholdBenchmarkBaseTMA
 from ch08.tiling_benchmark_base import TilingBenchmarkBase
+from ch15.speculative_decoding_benchmarks import SpeculativeDecodingBenchmark
+from core.discovery import chapter_slug, discover_all_chapters, discover_benchmarks
 from core.harness.run_benchmarks import INFORMATIONAL_BENCHMARKS
 from scripts.canonical_queue_batches import (
     CAPABILITY_VALIDATION_BATCH,
@@ -73,8 +73,10 @@ def test_ch02_cublas_benchmark_fn_uses_shared_nvtx_helper_symmetrically() -> Non
     baseline_bench = _benchmark_section("ch02/baseline_cublas.py")
     optimized_bench = _benchmark_section("ch02/optimized_cublas.py")
 
-    assert 'with self._nvtx_range("baseline_cublas_fp32"):' in baseline_bench
-    assert 'with self._nvtx_range("optimized_cublas_tf32"):' in optimized_bench
+    assert 'with torch.inference_mode(), self._nvtx_range("baseline_cublas_fp32"):' in baseline_bench
+    assert 'with torch.inference_mode(), self._nvtx_range("optimized_cublas_tf32"):' in optimized_bench
+    assert "torch.no_grad()" not in baseline_bench
+    assert "torch.no_grad()" not in optimized_bench
     assert "core.profiling.nvtx_helper" not in optimized_bench
     assert "get_config()" not in optimized_bench
     assert "get_nvtx_enabled" not in optimized_bench
@@ -112,14 +114,58 @@ def test_ch06_attention_ilp_pair_keeps_math_fixed_and_only_changes_ilp_schedule(
     assert "keep the math fixed while changing independent chains per thread" in readme_text
 
 
+def test_ch06_ilp_benchmarks_defer_verification_clone_out_of_hot_path() -> None:
+    for relative_path in (
+        "ch06/baseline_elementwise_ilp.py",
+        "ch06/optimized_elementwise_ilp.py",
+        "ch06/baseline_attention_ilp.py",
+        "ch06/optimized_attention_ilp.py",
+    ):
+        source_text = _read(relative_path)
+        benchmark_text = _benchmark_section(relative_path)
+        capture_text = source_text.split("def capture_verification_payload", 1)[1]
+        probe_size = "4096" if "attention" in relative_path else "1024"
+
+        assert "self._output_view0: Optional[torch.Tensor] = None" in source_text
+        assert "self._output_view1: Optional[torch.Tensor] = None" in source_text
+        assert f"self._output_view0 = self._buf0[:{probe_size}]" in source_text
+        assert f"self._output_view1 = self._buf1[:{probe_size}]" in source_text
+        assert ".clone()" not in benchmark_text
+        assert "self.output = src[:" not in benchmark_text
+        assert "self.output = self._output_view0 if src is buf0 else self._output_view1" in benchmark_text
+        assert "output=self.output.detach().clone()" in capture_text
+
+
+def test_ch17_static_routing_reuses_verification_output_buffer() -> None:
+    for relative_path in (
+        "ch17/baseline_routing_static.py",
+        "ch17/optimized_routing_static.py",
+    ):
+        source_text = _read(relative_path)
+        benchmark_text = _benchmark_section(relative_path)
+        setup_text = source_text.split("def setup", 1)[1].split("def benchmark_fn", 1)[0]
+        capture_text = source_text.split("def capture_verification_payload", 1)[1]
+
+        assert "self._verify_output_buffer: Optional[torch.Tensor] = None" in source_text
+        assert "self._verify_output_buffer = torch.empty(" in setup_text
+        assert ".clone()" not in benchmark_text
+        assert ".float()" not in benchmark_text
+        assert "self._verify_output_buffer.copy_(self.output)" in capture_text
+        assert "output=self._verify_output_buffer" in capture_text
+        assert "output=self.output.detach().float().clone()" not in capture_text
+
+
 def test_ch06_optimized_adaptive_uses_chunk_plan_without_extra_staging_buffers() -> None:
     optimized_text = _read("ch06/optimized_adaptive.py")
 
     assert "self.chunk_plan: list[tuple[int, int]] = []" in optimized_text
+    assert "self._chunk_views: list[tuple[torch.Tensor, torch.Tensor]] = []" in optimized_text
     assert "self._output_buffer = torch.empty_like(self.input)" in optimized_text
-    assert "for start, end in self.chunk_plan:" in optimized_text
-    assert "window = self.input[start:end]" in optimized_text
-    assert "self._output_buffer[start:end].copy_(transformed)" in optimized_text
+    assert "for start, end in self.chunk_plan" in optimized_text
+    assert "self._chunk_views = [" in optimized_text
+    assert "for window, out_window in self._chunk_views:" in optimized_text
+    assert "self._transform(window, out_window)" in optimized_text
+    assert "self._output_buffer[start:end].copy_(transformed)" not in optimized_text
 
     for forbidden in ("host_buffer", "device_buffer", "pin_memory", "torch.cuda.Stream"):
         assert forbidden not in optimized_text
@@ -165,8 +211,67 @@ def test_ch08_bridge_comparison_pairs_are_explicitly_marked_in_structured_metric
 
 def test_ch08_threshold_tma_bridge_workload_uses_larger_row_count() -> None:
     threshold_base_text = _read("ch08/threshold_benchmark_base.py")
+    validate_section = threshold_base_text.split("def _validate_correctness", maxsplit=1)[1].split(
+        "def get_config",
+        maxsplit=1,
+    )[0]
 
     assert "rows: int = 1 << 26" in threshold_base_text
+    assert "torch.full_like(self.inputs" not in validate_section
+    assert "torch.zeros_like(self.inputs)" not in validate_section
+    assert "scale = torch.where(outer, THRESHOLD_OUTER_SCALE, THRESHOLD_INNER_SCALE)" in validate_section
+    assert "reference.copysign_(self.inputs)" in validate_section
+    assert "reference.masked_fill_(active.logical_not_(), 0.0)" in validate_section
+
+
+def test_ch08_threshold_demos_use_relu_without_zero_tensor() -> None:
+    for filename in ("threshold_op.py", "jit_threshold_op.py"):
+        source = _read(f"ch08/{filename}")
+        function_section = source.split("def threshold_op", maxsplit=1)[1].split(
+            "def main",
+            maxsplit=1,
+        )[0]
+
+        assert "torch.zeros_like(x)" not in function_section
+        assert "torch.maximum(x" not in function_section
+        assert "return torch.relu(x)" in function_section
+
+
+def test_ch08_mask_strategy_demo_reuses_output_workspaces() -> None:
+    source = _read("ch08/warp_divergence_pytorch.py")
+    mask_section = source.split("def compare_mask_strategies", maxsplit=1)[1].split(
+        "def compiled_conditionals",
+        maxsplit=1,
+    )[0]
+
+    assert "zeros = torch.zeros_like(data)" not in mask_section
+    assert "return torch.where(mask, processed, zeros)" not in mask_section
+    assert "result = zeros.clone()" not in mask_section
+    assert "all_output = torch.empty_like(data)" in mask_section
+    assert "active_output = torch.empty_like(data)" in mask_section
+    assert "active_data = torch.empty(active_indices.numel(), device=device, dtype=data.dtype)" in mask_section
+    assert "active_scratch = torch.empty_like(active_data)" in mask_section
+    assert "torch.sin(data, out=all_output)" in mask_section
+    assert "torch.index_select(data, 0, active_indices, out=active_data)" in mask_section
+    assert "torch.cos(active_data, out=active_scratch)" in mask_section
+    assert "torch.sin(active_data, out=active_data)" in mask_section
+    assert "active_data.mul_(active_scratch)" in mask_section
+    assert "active_output.index_copy_(0, active_indices, active_data)" in mask_section
+    assert "active_data = data[active_indices]" not in mask_section
+    assert "processed = torch.sin(active_data) * torch.cos(active_data)" not in mask_section
+    assert "torch.sin(data[active_indices])" not in mask_section
+    assert "torch.cos(data[active_indices])" not in mask_section
+    assert "all_output.masked_fill_(inactive, 0.0)" in mask_section
+    assert "active_output.zero_()" in mask_section
+    assert "scalar_tensor_to_float(torch.max(torch.abs(res_all - res_active)))" in mask_section
+    assert "torch.max(torch.abs(res_all - res_active)).item()" not in mask_section
+
+    compiled_section = source.split("def compiled_conditionals", maxsplit=1)[1]
+    assert "max_diff = scalar_tensor_to_float(" in compiled_section
+    assert (
+        "torch.max(torch.abs(uncompiled(x, y, threshold) - compiled(x, y, threshold))).item()"
+        not in compiled_section
+    )
 
 
 def test_ch08_tiling_optimized_wrapper_uses_strict_fast_path() -> None:
@@ -228,9 +333,20 @@ def test_ch04_gradient_fusion_batches_reductions_per_timed_call() -> None:
     assert "reduction_repeats: int = 16" in common_text
     assert "requests_per_iteration=float(self.reduction_repeats)" in common_text
     assert "tokens_per_iteration=float(total_bytes * self.reduction_repeats)" in common_text
-    assert "for _ in range(self.reduction_repeats):" in common_text
-    assert "accum.add_(self.fused_tensor.sum())" in common_text
-    assert "accum.add_(tensor.sum())" in common_text
+    assert "self._repeat_tail_range = range(1, self.reduction_repeats)" in common_text
+    assert "for _ in self._repeat_tail_range:" in common_text
+    assert "self._sum_buffer = torch.empty_like(self._accum_buffer)" in common_text
+    assert "torch.sum(self.fused_tensor, dim=None, out=accum)" in common_text
+    assert "self._seed_tensor = self.tensors[0]" in common_text
+    assert "self._tail_tensors = self.tensors[1:]" in common_text
+    assert "torch.sum(self._seed_tensor, dim=None, out=accum)" in common_text
+    assert "for tensor in self._tail_tensors:" in common_text
+    assert "torch.sum(self.fused_tensor, dim=None, out=sum_buffer)" in common_text
+    assert "torch.sum(tensor, dim=None, out=sum_buffer)" in common_text
+    assert ".sum()" not in common_text.split("def benchmark_fn", maxsplit=1)[1].split(
+        "def capture_verification_payload",
+        maxsplit=1,
+    )[0]
 
 
 def test_ch08_tiling_bridge_comparison_batches_enough_inner_iterations() -> None:
@@ -381,7 +497,8 @@ def test_ch18_split_paged_attention_targets_isolate_backend_from_layout() -> Non
     assert "class LayoutPagedAttnBase" in common_text
     assert 'metrics["paged_attn.backend_math"] = 1.0 if self.backend == "math" else 0.0' in common_text
     assert "def _build_block_table" in common_text
-    assert "return torch.stack(" in common_text
+    assert "return (block_ids.unsqueeze(0) - batch_offsets).remainder_(num_blocks)" in common_text
+    assert "return torch.stack(" not in common_text
     assert "return create_block_mask(" in common_text
     assert "dense masked decode versus block-table-driven FlexAttention sparse kernels" in readme_text
     assert "fused FlexAttention block-mask kernel" in readme_text
@@ -435,17 +552,21 @@ def test_reviewed_pair_fixes_remain_applied() -> None:
 
     assert "_ = weight.sum()" not in fp4_baseline
 
-    assert "for pos in range(seq_len):" in baseline_kv
-    assert "token = x[:, pos:pos+1, :]" in baseline_kv
-    assert "range(0, seq_len, self.block_size)" in optimized_kv
-    assert "token_block = x[:, pos:pos + self.block_size, :]" in optimized_kv
-    assert "self.output = hidden[:, -1:, :].detach()" in optimized_kv
+    assert "self._request_token_groups = [" in baseline_kv
+    assert "for request_id, token_views in self._request_token_groups:" in baseline_kv
+    assert "for pos, token in token_views:" in baseline_kv
+    assert "self._request_block_groups = [" in optimized_kv
+    assert "for request_id, seq_len, block_views in self._request_block_groups:" in optimized_kv
+    assert "for pos, block_view in block_views:" in optimized_kv
+    assert "self.output = hidden[:, -1:, :] if hidden is not None else None" in optimized_kv
+    assert "hidden[:, -1:, :].detach()" not in optimized_kv
 
     assert "class OptimizedMemoryStandardBenchmark" in optimized_memory_standard
     assert "OptimizedMemoryHBM3eBenchmark" not in optimized_memory_standard
     assert "HBM3e" not in baseline_memory_standard
 
-    assert "with torch.no_grad():" in baseline_pipeline_bench
+    assert "with torch.inference_mode():" in baseline_pipeline_bench
+    assert "with torch.no_grad():" not in baseline_pipeline_bench
 
 
 def test_ch04_torchrun_wrappers_keep_entrypoints_and_side_effect_free_specs() -> None:
@@ -508,12 +629,18 @@ def test_ch13_pair_remediations_keep_canonical_and_informational_targets_split()
     assert '"tf32": False' in baseline_quant
     assert '"tf32": False' in canonical_quant
 
-    assert "for pos in range(seq_len):" in canonical_kv
+    assert "self._request_token_groups = [" in canonical_kv
+    assert "for request_id, seq_len, token_views in self._request_token_groups:" in canonical_kv
+    assert "self.output = hidden" in canonical_kv
+    assert "self.output = hidden.detach()" not in canonical_kv
     assert "range(0, seq_len, self.block_size)" not in canonical_kv
     assert 'return "memory"' in canonical_kv
     assert 'return "memory"' in memory_baseline
     assert 'return "memory"' in memory_optimized
-    assert "range(0, seq_len, self.block_size)" in flash_kv
+    assert "self._request_block_groups = [" in flash_kv
+    assert "for request_id, seq_len, block_views in self._request_block_groups:" in flash_kv
+    assert "self.output = hidden[:, -1:, :]" in flash_kv
+    assert "hidden[:, -1:, :].detach()" not in flash_kv
     assert "kv_cache_naive_flash_blockwise" in INFORMATIONAL_BENCHMARKS["ch13"]
 
 
@@ -921,6 +1048,8 @@ def test_ch14_flex_attention_sparse_uses_longer_and_sparser_window() -> None:
     for source in (baseline_text, optimized_text):
         assert "self.seq_len = 4096" in source
         assert "self.window_size = 128" in source
+    assert "scores.masked_fill_(~allowed_mask, float(\"-inf\"))" in baseline_text
+    assert "scores = scores.masked_fill(~allowed_mask, float(\"-inf\"))" not in baseline_text
 
 
 def test_ch17_memory_uses_larger_replayed_transfer_workload() -> None:
@@ -959,6 +1088,114 @@ def test_parameterized_graph_verification_capture_uses_fixed_request_slot() -> N
     source = _read("labs/parameterized_cuda_graphs/parameterized_cuda_graphs_common.py")
     assert "slot_idx = 0" in source
     assert "self._run_verification_slot(slot_idx)" in source
+    setup_section = source.split("def setup", maxsplit=1)[1].split(
+        "def _build_request_slots",
+        maxsplit=1,
+    )[0]
+    build_slots = source.split("def _build_request_slots", maxsplit=1)[1].split(
+        "def _warmup_eager_path",
+        maxsplit=1,
+    )[0]
+    output_slice = source.split("def _current_output_slice", maxsplit=1)[1].split(
+        "def _run_verification_slot",
+        maxsplit=1,
+    )[0]
+    capture_section = source.split("def capture_verification_payload", maxsplit=1)[1].split(
+        "def get_config",
+        maxsplit=1,
+    )[0]
+    teardown_section = source.split("def teardown", maxsplit=1)[1].split(
+        "class ParameterizedGraphRecaptureBenchmark",
+        maxsplit=1,
+    )[0]
+    assert "self.host_inputs = [torch.empty(0) for _ in range(self.cfg.request_slots)]" in build_slots
+    assert "self.host_scales = [torch.empty(0) for _ in range(self.cfg.request_slots)]" in build_slots
+    assert "self.host_outputs = [torch.empty(0) for _ in range(self.cfg.request_slots)]" in build_slots
+    assert "self.host_inputs[slot_idx] = host_input" in build_slots
+    assert "self.host_scales[slot_idx] = host_scale" in build_slots
+    assert "self.host_outputs[slot_idx] = host_output" in build_slots
+    assert "self._refresh_slot_memcpy_bindings()" in build_slots
+    assert ".append(" not in build_slots
+    assert "self._verify_input_buffer: Optional[torch.Tensor] = None" in source
+    assert "self._verify_scale_buffer: Optional[torch.Tensor] = None" in source
+    assert "self._verify_output_buffer: Optional[torch.Tensor] = None" in source
+    assert "self._verify_input_buffer = torch.empty_like(self.host_inputs[0])" in setup_section
+    assert "self._verify_scale_buffer = torch.empty_like(self.host_scales[0])" in setup_section
+    assert 'self._verify_output_buffer = torch.empty((2, 16), dtype=torch.float32, device="cpu")' in setup_section
+    assert "self._verify_output_buffer.copy_(host_output[:2, :16])" in output_slice
+    assert "return self._verify_output_buffer" in output_slice
+    assert "self._verify_input_buffer.copy_(self.host_inputs[slot_idx])" in capture_section
+    assert "self._verify_scale_buffer.copy_(self.host_scales[slot_idx])" in capture_section
+    assert '"x": self._verify_input_buffer' in capture_section
+    assert '"scale": self._verify_scale_buffer' in capture_section
+    assert "self.host_inputs[slot_idx].clone()" not in capture_section
+    assert "self.host_scales[slot_idx].clone()" not in capture_section
+    assert ".to(dtype=torch.float32).clone()" not in output_slice
+    assert "self._verify_input_buffer = None" in teardown_section
+    assert "self._verify_scale_buffer = None" in teardown_section
+    assert "self._verify_output_buffer = None" in teardown_section
+
+
+def test_parameterized_graph_residual_block_writes_directly_to_output_buffer() -> None:
+    source = _read("labs/parameterized_cuda_graphs/parameterized_cuda_graphs_common.py")
+    program_section = source.split("def _schedule_request_program", maxsplit=1)[1].split(
+        "def _refresh_slot_memcpy_bindings",
+        maxsplit=1,
+    )[0]
+
+    assert "def forward_into(self, x: torch.Tensor, scale: torch.Tensor, out: torch.Tensor)" in source
+    assert "torch.mul(hidden, scale, out=out)" in source
+    assert "out.add_(x)" in source
+    assert "model.forward_into(device_input, device_scale, device_output)" in program_section
+    assert "device_output.copy_(model(" not in program_section
+
+
+def test_parameterized_graph_residual_block_forward_into_matches_forward() -> None:
+    from labs.parameterized_cuda_graphs.parameterized_cuda_graphs_common import _ResidualScaleBlock
+
+    torch.manual_seed(1234)
+    model = _ResidualScaleBlock(hidden_size=8, expansion_factor=2).eval()
+    x = torch.randn(3, 8)
+    scale = torch.tensor([0.75])
+    out = torch.empty_like(x)
+
+    with torch.inference_mode():
+        expected = model(x, scale)
+        actual = model.forward_into(x, scale, out)
+
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(actual, expected)
+
+
+def test_parameterized_graph_replay_uses_cached_memcpy_bindings() -> None:
+    source = _read("labs/parameterized_cuda_graphs/parameterized_cuda_graphs_common.py")
+    cache_section = source.split("def _refresh_slot_memcpy_bindings", maxsplit=1)[1].split(
+        "def _next_slot",
+        maxsplit=1,
+    )[0]
+    bind_section = source.split("def _bind_memcpy_nodes", maxsplit=1)[1].split(
+        "def _check_cudart",
+        maxsplit=1,
+    )[0]
+    update_section = source.split("def _update_exec_params_for_slot", maxsplit=1)[1].split(
+        "def benchmark_fn",
+        maxsplit=1,
+    )[0]
+
+    assert "SlotMemcpyBinding = Tuple[int, int, int, int, int, int, int, int, int]" in source
+    assert "self._slot_memcpy_bindings: List[SlotMemcpyBinding] = []" in source
+    assert "self._slot_memcpy_bindings = [" in cache_section
+    assert "host_input.numel() * host_input.element_size()" in cache_section
+    assert "host_scale.numel() * host_scale.element_size()" in cache_section
+    assert "host_output.numel() * host_output.element_size()" in cache_section
+    assert ") = self._slot_memcpy_bindings[slot_idx]" in bind_section
+    assert ") = self._slot_memcpy_bindings[slot_idx]" in update_section
+    assert "slot_input = self.host_inputs[slot_idx]" not in update_section
+    assert "slot_scale = self.host_scales[slot_idx]" not in update_section
+    assert "slot_output = self.host_outputs[slot_idx]" not in update_section
+    assert ".data_ptr()" not in update_section
+    assert ".numel()" not in update_section
+    assert ".element_size()" not in update_section
 
 
 def test_ch18_and_fullstack_pairs_keep_semantics_fixed() -> None:
@@ -1009,7 +1246,8 @@ def test_ch17_memory_pair_keeps_discrete_input_distribution() -> None:
     assert "torch.randint(" in baseline_memory
     assert "256," in baseline_memory
     assert "dtype=torch.uint8" in baseline_memory
-    assert "random_(0, 256).floor_()" in optimized_memory
+    assert "random_(0, 256)" in optimized_memory
+    assert ".floor_()" not in optimized_memory
     assert "discrete 0..255 population" in optimized_memory
 
 
@@ -1024,13 +1262,116 @@ def test_ch10_flashattention3_pair_keeps_shared_warmup_and_unfused_qkv_structure
         assert "self.k_proj = nn.Linear(" in source
         assert "self.v_proj = nn.Linear(" in source
         assert "qkv_proj" not in source
+    assert "self._q_buffer: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._k_buffer: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._v_buffer: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._output_buffer: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._q_forward_view: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._k_forward_view: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._v_forward_view: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._output_forward_view: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._q_proj_weight_t: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._k_proj_weight_t: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._v_proj_weight_t: Optional[torch.Tensor] = None" in optimized_source
+    assert "self._out_proj_weight_t: Optional[torch.Tensor] = None" in optimized_source
+    assert "def cache_weight_views(self) -> None:" in optimized_source
+    assert "self.model.cache_weight_views()" in optimized_source
+    assert "def _projection_workspace(" in optimized_source
+    assert "def prepare_projection_buffers(self, x: torch.Tensor) -> None:" in optimized_source
+    assert "def forward_prepared(" in optimized_source
+    assert 'raise RuntimeError("forward_prepared() requires prepare_projection_buffers()")' in optimized_source
+    assert "self.model.prepare_projection_buffers(self.input)" in optimized_source
+    assert "self.model.forward_prepared(self.input, is_causal=self.use_causal)" in optimized_source
+    assert "or buffer.numel() < numel" in optimized_source
+    assert "return buffer[:numel].view(shape)" in optimized_source
+    assert "self._q_buffer.shape != q_shape" not in optimized_source
+    assert "self._output_buffer.shape != output_shape" not in optimized_source
+    optimized_forward = optimized_source.split("def forward", maxsplit=1)[1].split(
+        "class OptimizedFlashAttention3Benchmark",
+        maxsplit=1,
+    )[0]
+    assert "enable_gqa=enable_gqa" in optimized_forward
+    assert "repeat_interleave(n_rep" not in optimized_forward
+    assert "q_proj = torch.matmul(x, self._q_proj_weight_t, out=q_buffer)" in optimized_forward
+    assert "k_proj = torch.matmul(x, self._k_proj_weight_t, out=k_buffer)" in optimized_forward
+    assert "v_proj = torch.matmul(x, self._v_proj_weight_t, out=v_buffer)" in optimized_forward
+    assert "return torch.matmul(attn_output, self._out_proj_weight_t, out=output_buffer)" in optimized_forward
+    assert "self.q_proj.weight.t()" not in optimized_forward
+    assert "self.k_proj.weight.t()" not in optimized_forward
+    assert "self.v_proj.weight.t()" not in optimized_forward
+    assert "self.out_proj.weight.t()" not in optimized_forward
+
+
+def test_ch10_flashattention3_projection_buffers_reuse_capacity() -> None:
+    from ch10.optimized_flashattention3_pipeline import FA3PipelinedAttention
+
+    module = FA3PipelinedAttention(
+        hidden_dim=8,
+        num_heads=2,
+        num_kv_heads=1,
+        use_fp8=False,
+    ).eval()
+    large_input = torch.empty(4, 5, 8)
+    small_input = torch.empty(2, 3, 8)
+    grown_input = torch.empty(5, 5, 8)
+
+    large_q, large_k, large_v, large_out = module._ensure_projection_buffers(
+        large_input,
+        4,
+        5,
+    )
+    ptrs = (
+        module._q_buffer.data_ptr(),
+        module._k_buffer.data_ptr(),
+        module._v_buffer.data_ptr(),
+        module._output_buffer.data_ptr(),
+    )
+    small_q, small_k, small_v, small_out = module._ensure_projection_buffers(
+        small_input,
+        2,
+        3,
+    )
+    module.prepare_projection_buffers(large_input)
+    grown_q, grown_k, grown_v, grown_out = module._ensure_projection_buffers(
+        grown_input,
+        5,
+        5,
+    )
+
+    assert large_q.shape == (4, 5, 8)
+    assert large_k.shape == (4, 5, 4)
+    assert large_v.shape == (4, 5, 4)
+    assert large_out.shape == (4, 5, 8)
+    assert small_q.shape == (2, 3, 8)
+    assert small_k.shape == (2, 3, 4)
+    assert small_v.shape == (2, 3, 4)
+    assert small_out.shape == (2, 3, 8)
+    assert small_q.data_ptr() == ptrs[0]
+    assert small_k.data_ptr() == ptrs[1]
+    assert small_v.data_ptr() == ptrs[2]
+    assert small_out.data_ptr() == ptrs[3]
+    assert module._q_forward_view is not None
+    assert module._k_forward_view is not None
+    assert module._v_forward_view is not None
+    assert module._output_forward_view is not None
+    assert module._q_forward_view.data_ptr() == ptrs[0]
+    assert module._k_forward_view.data_ptr() == ptrs[1]
+    assert module._v_forward_view.data_ptr() == ptrs[2]
+    assert module._output_forward_view.data_ptr() == ptrs[3]
+    assert grown_q.shape == (5, 5, 8)
+    assert grown_k.shape == (5, 5, 4)
+    assert grown_v.shape == (5, 5, 4)
+    assert grown_out.shape == (5, 5, 8)
+    assert module._q_buffer.numel() == 5 * 5 * 8
+    assert module._k_buffer.numel() == 5 * 5 * 4
+    assert module._v_buffer.numel() == 5 * 5 * 4
+    assert module._output_buffer.numel() == 5 * 5 * 8
 
 
 def test_persistent_decode_keeps_canonical_iteration_parity_and_marks_cuda_variant_informational() -> None:
     baseline_source = _read("labs/persistent_decode/baseline_persistent_decode.py")
     triton_source = _read("labs/persistent_decode/optimized_persistent_decode_triton.py")
     cuda_source = _read("labs/persistent_decode/optimized_persistent_decode_cuda.py")
-    readme_text = _read("labs/persistent_decode/README.md")
 
     assert "iterations=12" in baseline_source
     assert "iterations=12" in triton_source

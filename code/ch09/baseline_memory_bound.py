@@ -12,7 +12,6 @@ from core.harness.benchmark_harness import (  # noqa: E402
     BenchmarkConfig,
     WorkloadMetadata,
 )
-from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range  # noqa: E402
 
 
 class BaselineMemoryBoundBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -22,8 +21,10 @@ class BaselineMemoryBoundBenchmark(VerificationPayloadMixin, BaseBenchmark):
         super().__init__()
         self.tensor: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.repeats = 64
         self.N = 16_777_216  # ~64 MB
+        self._repeat_range = range(self.repeats)
         # Memory-bound benchmark - fixed dimensions for roofline analysis
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.repeats),
@@ -35,28 +36,28 @@ class BaselineMemoryBoundBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
         self.tensor = torch.randn(self.N, device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty(4096, device=self.device, dtype=torch.float32)
 
     def benchmark_fn(self) -> None:
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        with nvtx_range("baseline_memory_bound", enable=enable_nvtx):
+        with torch.inference_mode(), self._nvtx_range("baseline_memory_bound"):
             t = self.tensor
-            for _ in range(self.repeats):
+            for _ in self._repeat_range:
                 t = t * 1.0001 + 0.0001
             self.output = t
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
-        if self.output is None:
+        if self.output is None or self.tensor is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must be called before verification")
         # Keep verification lightweight: slice the large output tensor.
         # This avoids serializing ~64MB outputs in subprocess mode while still
         # validating correctness on representative data.
-        verify_output = self.output[:4096].detach().clone()
+        output_slice = self.output[: self._verify_output_buffer.numel()].detach()
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"tensor": self.tensor},
-            output=verify_output,
+            output=self._verify_output_buffer,
             batch_size=self.tensor.shape[0],
             parameter_count=0,
             precision_flags={
@@ -70,6 +71,8 @@ class BaselineMemoryBoundBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def teardown(self) -> None:
         self.tensor = None
+        self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

@@ -21,20 +21,25 @@ class BaselinePerformanceFP16Benchmark(BaselinePerformanceBenchmark):
         self.register_workload_metadata(
             samples_per_iteration=PERFORMANCE_FP16_WORKLOAD.samples_per_iteration,
         )
+        self._enable_nvtx = False
+
+    def setup(self) -> None:
+        super().setup()
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
 
     def benchmark_fn(self) -> None:
         """Mirror the inherited baseline loop explicitly for pair-audit equivalence."""
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range("baseline_performance_fp16", enable=enable_nvtx):
-            total = len(self.microbatches)
-            for start in range(0, total, self.fusion):
-                group_data = self.microbatches[start : start + self.fusion]
-                group_targets = self.targets[start : start + self.fusion]
-                group_size = max(1, len(group_data))
+        assert (
+            self._microbatch_groups is not None
+            and self._target_groups is not None
+            and self._group_sizes is not None
+            and self._training_groups is not None
+        )
+        with nvtx_range("baseline_performance_fp16", enable=self._enable_nvtx):
+            for paired_group, group_size in self._training_groups:
                 self.optimizer.zero_grad(set_to_none=True)
-                for data, target in zip(group_data, group_targets):
+                for data, target in paired_group:
                     logits = self.model(data)
                     loss = torch.nn.functional.cross_entropy(logits, target)
                     (loss / group_size).backward()
@@ -43,4 +48,3 @@ class BaselinePerformanceFP16Benchmark(BaselinePerformanceBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return BaselinePerformanceFP16Benchmark()
-

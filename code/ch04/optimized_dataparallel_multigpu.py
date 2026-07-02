@@ -46,10 +46,17 @@ class OptimizedDataParallelMultiGPUBenchmark(VerificationPayloadMixin, BaseBench
         self.inputs: List[torch.Tensor] = []
         self.targets: List[torch.Tensor] = []
         self.streams: List[torch.cuda.Stream] = []
+        self._grad_staging: List[List[torch.Tensor]] = []
+        self._parameter_groups: list[tuple[nn.Parameter, ...]] = []
+        self._launch_groups: list[tuple[torch.cuda.Stream, int, nn.Module, torch.Tensor, torch.Tensor]] = []
+        self._wait_groups: list[tuple[torch.cuda.Stream, int]] = []
+        self._reduction_groups: list[tuple[nn.Parameter, tuple[tuple[nn.Parameter, torch.Tensor], ...]]] = []
+        self._broadcast_groups: list[tuple[nn.Parameter, tuple[nn.Parameter, ...]]] = []
         self.output: Optional[torch.Tensor] = None
         self._verify_state: Optional[dict] = None
         self._verify_input: Optional[torch.Tensor] = None
         self._verify_target: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
         tokens = self.batch_size * self.input_size
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
@@ -81,6 +88,7 @@ class OptimizedDataParallelMultiGPUBenchmark(VerificationPayloadMixin, BaseBench
             )
 
         base_model = SimpleNet(self.input_size).to(torch.device(f"cuda:{self.device_ids[0]}"))
+        self._payload_parameter_count = sum(p.numel() for p in base_model.parameters())
         self._verify_state = {k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()}
         base_state = base_model.state_dict()
 
@@ -111,57 +119,83 @@ class OptimizedDataParallelMultiGPUBenchmark(VerificationPayloadMixin, BaseBench
             self.inputs.append(cpu_input[start:end].to(device))
             self.targets.append(cpu_target[start:end].to(device))
 
+        master_device = next(self.models[0].parameters()).device
+        self._parameter_groups = [
+            tuple(param_group)
+            for param_group in zip(*(model.parameters() for model in self.models), strict=True)
+        ]
+        self._grad_staging = [
+            [
+                torch.empty_like(param_group[0], device=master_device)
+                for param_group in self._parameter_groups
+            ]
+            for _ in self.models[1:]
+        ]
+        self._launch_groups = list(
+            zip(self.streams, self.device_ids, self.models, self.inputs, self.targets, strict=True)
+        )
+        self._wait_groups = list(zip(self.streams, self.device_ids, strict=True))
+        self._reduction_groups = []
+        self._broadcast_groups = []
+        for param_idx, param_group in enumerate(self._parameter_groups):
+            master_param = param_group[0]
+            replica_pairs = tuple(
+                (replica_param, self._grad_staging[replica_idx][param_idx])
+                for replica_idx, replica_param in enumerate(param_group[1:])
+            )
+            self._reduction_groups.append((master_param, replica_pairs))
+            self._broadcast_groups.append(
+                (master_param, tuple(replica_param for replica_param, _ in replica_pairs))
+            )
+
         self._sync_all()
 
     def benchmark_fn(self) -> None:
         if not self.models or not self.optimizers:
             raise RuntimeError("setup() must be called before benchmark_fn()")
 
-        outputs: List[torch.Tensor] = []
+        first_output: Optional[torch.Tensor] = None
 
         with self._nvtx_range("optimized_dataparallel_multigpu"):
-            for stream, device_id, model, batch, target in zip(
-                self.streams,
-                self.device_ids,
-                self.models,
-                self.inputs,
-                self.targets,
-            ):
+            for stream, device_id, model, batch, target in self._launch_groups:
                 with torch.cuda.device(device_id), torch.cuda.stream(stream):
                     output = model(batch)
                     loss = nn.functional.mse_loss(output, target)
                     loss.backward()
-                    outputs.append(output)
+                    if first_output is None:
+                        first_output = output
 
-            for stream, device_id in zip(self.streams, self.device_ids):
+            for stream, device_id in self._wait_groups:
                 with torch.cuda.device(device_id):
                     torch.cuda.current_stream(device_id).wait_stream(stream)
 
             # Reduce gradients onto GPU0 and update master parameters.
-            for param_group in zip(*(model.parameters() for model in self.models)):
-                grads = [param.grad for param in param_group]
-                if grads[0] is None:
+            for master_param, replica_pairs in self._reduction_groups:
+                master_grad = master_param.grad
+                if master_grad is None:
                     continue
-                reduced = grads[0].detach()
-                master_device = reduced.device
-                for grad in grads[1:]:
+                reduced = master_grad
+                for replica_param, staging in replica_pairs:
+                    grad = replica_param.grad
                     if grad is None:
                         continue
-                    reduced.add_(grad.to(master_device, non_blocking=True))
-                param_group[0].grad = reduced
-
+                    staging.copy_(grad, non_blocking=True)
+                    reduced.add_(staging)
+                master_param.grad = reduced
 
             self.optimizers[0].step()
             for opt in self.optimizers:
                 opt.zero_grad(set_to_none=True)
 
             # Broadcast updated parameters from GPU0 to all replicas.
-            for param_group in zip(*(model.parameters() for model in self.models)):
-                master_param = param_group[0].data
-                for replica_param in param_group[1:]:
-                    replica_param.data.copy_(master_param, non_blocking=True)
+            for master_param, replica_params in self._broadcast_groups:
+                master_data = master_param.data
+                for replica_param in replica_params:
+                    replica_param.data.copy_(master_data, non_blocking=True)
 
-        self.output = outputs[0].detach()
+        if first_output is None:
+            raise RuntimeError("No model output captured")
+        self.output = first_output.detach_()
 
     def capture_verification_payload(self) -> None:
         if (
@@ -179,12 +213,11 @@ class OptimizedDataParallelMultiGPUBenchmark(VerificationPayloadMixin, BaseBench
             verify_input = self._verify_input.to(verify_device)
             verify_target = self._verify_target.to(verify_device)
             output = verify_model(verify_input)
-        param_count = sum(p.numel() for p in verify_model.parameters())
         self._set_verification_payload(
             inputs={"data": verify_input, "target": verify_target},
             output=output,
             batch_size=int(self.batch_size),
-            parameter_count=param_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -200,6 +233,12 @@ class OptimizedDataParallelMultiGPUBenchmark(VerificationPayloadMixin, BaseBench
         self.inputs = []
         self.targets = []
         self.streams = []
+        self._grad_staging = []
+        self._parameter_groups = []
+        self._launch_groups = []
+        self._wait_groups = []
+        self._reduction_groups = []
+        self._broadcast_groups = []
         self._verify_state = None
         self._verify_input = None
         self._verify_target = None

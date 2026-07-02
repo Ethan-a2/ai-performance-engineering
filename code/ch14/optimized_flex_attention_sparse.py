@@ -23,8 +23,7 @@ REQUIREMENTS:
 
 from __future__ import annotations
 
-import math
-from typing import Optional, Callable
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -110,9 +109,55 @@ class SlidingWindowCausalAttention(nn.Module):
         
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self._qkv_buffer: Optional[torch.Tensor] = None
+        self._attn_merge_buffer: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[torch.Tensor] = None
+        self._qkv_weight_t: Optional[torch.Tensor] = None
+        self._out_proj_weight_t: Optional[torch.Tensor] = None
         
         self._compiled_flex = torch.compile(flex_attention) if HAS_FLEX_ATTENTION else None
         self._block_mask_cache = {}
+
+    def cache_weight_views(self) -> None:
+        self._qkv_weight_t = self.qkv_proj.weight.t()
+        self._out_proj_weight_t = self.out_proj.weight.t()
+
+    def _ensure_projection_buffers(
+        self,
+        x: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv_shape = (batch_size, seq_len, 3 * self.embed_dim)
+        merge_shape = (batch_size, seq_len, self.num_heads, self.head_dim)
+        output_shape = (batch_size, seq_len, self.embed_dim)
+        rows = int(batch_size * seq_len)
+        if (
+            self._qkv_buffer is None
+            or self._qkv_buffer.size(0) < rows
+            or self._qkv_buffer.device != x.device
+            or self._qkv_buffer.dtype != x.dtype
+        ):
+            self._qkv_buffer = torch.empty(rows, qkv_shape[-1], device=x.device, dtype=x.dtype)
+        if (
+            self._attn_merge_buffer is None
+            or self._attn_merge_buffer.size(0) < rows
+            or self._attn_merge_buffer.device != x.device
+            or self._attn_merge_buffer.dtype != x.dtype
+        ):
+            self._attn_merge_buffer = torch.empty(rows, output_shape[-1], device=x.device, dtype=x.dtype)
+        if (
+            self._output_buffer is None
+            or self._output_buffer.size(0) < rows
+            or self._output_buffer.device != x.device
+            or self._output_buffer.dtype != x.dtype
+        ):
+            self._output_buffer = torch.empty(rows, output_shape[-1], device=x.device, dtype=x.dtype)
+        return (
+            self._qkv_buffer[:rows].view(qkv_shape),
+            self._output_buffer[:rows].view(output_shape),
+            self._attn_merge_buffer[:rows].view(merge_shape),
+        )
     
     def _get_block_mask(self, batch_size: int, seq_len: int, device: torch.device):
         """Get or create cached block mask."""
@@ -137,10 +182,19 @@ class SlidingWindowCausalAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         
-        qkv = self.qkv_proj(x)
+        if torch.is_grad_enabled():
+            qkv = self.qkv_proj(x)
+            output_buffer = None
+            attn_merge_buffer = None
+        else:
+            if self._qkv_weight_t is None or self._out_proj_weight_t is None:
+                self.cache_weight_views()
+            qkv_buffer, output_buffer, attn_merge_buffer = self._ensure_projection_buffers(
+                x, batch_size, seq_len
+            )
+            qkv = torch.matmul(x, self._qkv_weight_t, out=qkv_buffer)
         qkv = qkv.view(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
         
         if self._compiled_flex is None or not HAS_FLEX_ATTENTION:
             raise RuntimeError(
@@ -156,7 +210,13 @@ class SlidingWindowCausalAttention(nn.Module):
                 "FlexAttention block mask/kernels."
             ) from exc
         
-        output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        if attn_merge_buffer is None:
+            output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.embed_dim)
+        else:
+            attn_merge_buffer.copy_(output.transpose(1, 2))
+            output = attn_merge_buffer.view(batch_size, seq_len, self.embed_dim)
+        if output_buffer is not None:
+            return torch.matmul(output, self._out_proj_weight_t, out=output_buffer)
         return self.out_proj(output)
 
 
@@ -199,12 +259,13 @@ def benchmark():
     
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream(device)
     
-    start.record()
+    start.record(current_stream)
     for _ in range(10):
         _ = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-    end.record()
-    torch.cuda.synchronize()
+    end.record(current_stream)
+    end.synchronize()
     
     sdpa_ms = start.elapsed_time(end) / 10
     
@@ -226,11 +287,11 @@ def benchmark():
             _ = compiled_flex(q, k, v, block_mask=block_mask)
         torch.cuda.synchronize()
         
-        start.record()
+        start.record(current_stream)
         for _ in range(10):
             _ = compiled_flex(q, k, v, block_mask=block_mask)
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         
         flex_ms = start.elapsed_time(end) / 10
         
@@ -266,6 +327,8 @@ class FlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.parameter_count: int = 0
         self._verification_payload = None
         self.output = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._enable_nvtx = False
         
         tokens = self.batch_size * self.seq_len
         self._workload = WorkloadMetadata(
@@ -282,6 +345,8 @@ class FlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         
         embed_dim = self.num_heads * self.head_dim
         self.attn = SlidingWindowCausalAttention(
@@ -289,6 +354,7 @@ class FlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchmark):
             num_heads=self.num_heads,
             window_size=self.window_size,
         ).to(self.device, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+        self.attn.cache_weight_views()
         self.model = self.attn
         self.parameter_count = sum(p.numel() for p in self.attn.parameters())
         
@@ -298,30 +364,43 @@ class FlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchmark):
             device=self.device,
             dtype=dtype,
         )
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            min(128, self.seq_len),
+            min(256, self.hidden_dim),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         self.attn._get_block_mask(self.batch_size, self.seq_len, self.device)
         
         # Warmup
         for _ in range(3):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.attn(self.x)
 
     def benchmark_fn(self) -> None:
         """Benchmark: FlexAttention sliding window forward pass."""
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        with nvtx_range("optimized_flex_attention_sparse", enable=enable_nvtx):
-            with torch.no_grad():
+        with nvtx_range("optimized_flex_attention_sparse", enable=self._enable_nvtx):
+            with torch.inference_mode():
                 self.output = self.model(self.x)
         if self.output is None or self.x is None:
             raise RuntimeError("benchmark_fn() must produce output")
         self._payload_dtype = self.x.dtype
 
     def capture_verification_payload(self) -> None:
+        if self.x is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("capture_verification_payload() requires completed run")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         dtype = self._payload_dtype
         self._set_verification_payload(
             inputs={"input": self.x},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             parameter_count=self.parameter_count,
             precision_flags={
@@ -338,6 +417,8 @@ class FlexAttentionSparseBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.attn = None
         self.model = None
         self.x = None
+        self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

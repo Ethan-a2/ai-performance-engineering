@@ -1,13 +1,5 @@
-import os
-import torch.profiler as profiler
-from torch.profiler import profile, record_function, ProfilerActivity, schedule
-import torch.cuda.nvtx as nvtx
 import torch
-from core.utils.architecture_runtime import (
-    get_arch_config,
-    get_architecture,
-    get_architecture_info,
-)
+from core.utils.architecture_runtime import get_arch_config
 
 _ARCH_CFG = get_arch_config()
 
@@ -19,17 +11,51 @@ QoS mechanisms for ultra-scale inference systems."""
 
 import time
 import random
-import statistics
 from typing import Dict, List, Optional, Tuple, Deque
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import deque
+from bisect import bisect_left, bisect_right, insort
 import threading
 
 class Priority(Enum):
     FREE = "free"
     STANDARD = "standard"
     PREMIUM = "premium"
+
+
+def _exclusive_quantile_from_sorted(sorted_values: List[float], n: int, cut_index: int) -> float:
+    """Return one cut point using statistics.quantiles' exclusive method."""
+    count = len(sorted_values)
+    if count < 2:
+        raise ValueError("exclusive quantile requires at least two samples")
+    scale = count + 1
+    j = cut_index * scale // n
+    j = 1 if j < 1 else count - 1 if j > count - 1 else j
+    delta = cut_index * scale - j * n
+    return (sorted_values[j - 1] * (n - delta) + sorted_values[j] * delta) / n
+
+
+def _ttft_p95_p99_from_ordered(ordered_samples: List[float]) -> Tuple[float, float]:
+    count = len(ordered_samples)
+    if count == 0:
+        return 0.0, 0.0
+    if count >= 100:
+        return (
+            _exclusive_quantile_from_sorted(ordered_samples, 100, 95),
+            _exclusive_quantile_from_sorted(ordered_samples, 100, 99),
+        )
+    p95 = _exclusive_quantile_from_sorted(ordered_samples, 20, 19) if count >= 20 else ordered_samples[-1]
+    return p95, ordered_samples[-1]
+
+
+def _ttft_p95_p99(samples: List[float]) -> Tuple[float, float]:
+    samples.sort()
+    return _ttft_p95_p99_from_ordered(samples)
+
+
+def _count_ttft_violations_from_ordered(ordered_samples: List[float], slo_limit: float) -> int:
+    return len(ordered_samples) - bisect_right(ordered_samples, slo_limit)
 
 @dataclass
 class Request:
@@ -60,7 +86,35 @@ class SystemMetrics:
     current_load: float = 0.0  # 0-1
     recent_ttft_samples: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
     recent_tpot_samples: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    recent_ttft_ordered: List[float] = field(default_factory=list)
     last_updated: float = field(default_factory=time.time)
+
+
+def _ordered_ttft_samples(metrics: SystemMetrics) -> List[float]:
+    if len(metrics.recent_ttft_ordered) != len(metrics.recent_ttft_samples):
+        metrics.recent_ttft_ordered = sorted(metrics.recent_ttft_samples)
+    return metrics.recent_ttft_ordered
+
+
+def _append_ttft_sample(metrics: SystemMetrics, sample: float) -> None:
+    evicted = None
+    if (
+        metrics.recent_ttft_samples.maxlen is not None
+        and len(metrics.recent_ttft_samples) == metrics.recent_ttft_samples.maxlen
+    ):
+        evicted = metrics.recent_ttft_samples[0]
+    metrics.recent_ttft_samples.append(sample)
+    if evicted is not None:
+        evict_idx = bisect_left(metrics.recent_ttft_ordered, evicted)
+        if (
+            evict_idx < len(metrics.recent_ttft_ordered)
+            and metrics.recent_ttft_ordered[evict_idx] == evicted
+        ):
+            del metrics.recent_ttft_ordered[evict_idx]
+        else:
+            metrics.recent_ttft_ordered = sorted(metrics.recent_ttft_samples)
+            return
+    insort(metrics.recent_ttft_ordered, sample)
 
 class QoSController:
     """
@@ -199,9 +253,9 @@ class QoSController:
         """Additional system health checks."""
         # Check recent performance
         if len(self.metrics.recent_ttft_samples) > 10:
-            recent_p95_ttft = statistics.quantiles(
-                list(self.metrics.recent_ttft_samples), n=20
-            )[18]  # 95th percentile
+            recent_p95_ttft = _exclusive_quantile_from_sorted(
+                _ordered_ttft_samples(self.metrics), 20, 19
+            )
             
             # If recent performance is bad, be more conservative
             if recent_p95_ttft > self.TTFT_SLO_MAX[Priority.STANDARD] * 1.5:
@@ -243,7 +297,7 @@ class QoSController:
             self.active_requests[request.priority] -= 1
             
             # Update performance metrics
-            self.metrics.recent_ttft_samples.append(actual_ttft)
+            _append_ttft_sample(self.metrics, actual_ttft)
             self.metrics.recent_tpot_samples.append(actual_tpot)
             
             # Update exponential moving averages
@@ -277,12 +331,16 @@ class QoSController:
         """Print current QoS statistics."""
         print("\n=== QoS Statistics ===")
         
-        total_requests = sum(stats["total"] for stats in self.rejection_stats.values())
-        total_rejected = sum(stats["rejected"] for stats in self.rejection_stats.values())
+        total_requests = 0
+        total_rejected = 0
+        for stats in self.rejection_stats.values():
+            total_requests += stats["total"]
+            total_rejected += stats["rejected"]
+        overall_rejection_rate = (total_rejected / total_requests * 100) if total_requests else 0.0
         
         print(f"Total requests: {total_requests}")
         print(f"Total rejected: {total_rejected}")
-        print(f"Overall rejection rate: {total_rejected/total_requests*100:.1f}%")
+        print(f"Overall rejection rate: {overall_rejection_rate:.1f}%")
         
         print(f"\nBy priority:")
         for priority in Priority:
@@ -347,8 +405,8 @@ def simulate_load_spike():
         )
         
         # Generate requests for this scenario
-        scenario_start = time.time()
-        while time.time() - scenario_start < scenario['duration']:
+        scenario_start = time.perf_counter()
+        while time.perf_counter() - scenario_start < scenario['duration']:
             # Randomly generate a request
             priority = random.choices(
                 list(scenario['priority_distribution'].keys()),
@@ -403,9 +461,9 @@ def simulate_load_spike():
     # Analyze SLO compliance
     print(f"\n=== SLO Analysis ===")
     if len(qos.metrics.recent_ttft_samples) > 0:
-        ttft_samples = list(qos.metrics.recent_ttft_samples)
-        ttft_p95 = statistics.quantiles(ttft_samples, n=20)[18] if len(ttft_samples) >= 20 else max(ttft_samples)
-        ttft_p99 = statistics.quantiles(ttft_samples, n=100)[98] if len(ttft_samples) >= 100 else max(ttft_samples)
+        ttft_ordered = _ordered_ttft_samples(qos.metrics)
+        ttft_p95, ttft_p99 = _ttft_p95_p99_from_ordered(ttft_ordered)
+        ttft_count = len(ttft_ordered)
         
         print(f"TTFT P95: {ttft_p95:.1f}ms")
         print(f"TTFT P99: {ttft_p99:.1f}ms")
@@ -413,8 +471,8 @@ def simulate_load_spike():
         # Check SLO compliance by priority
         for priority in Priority:
             slo_limit = qos.TTFT_SLO_MAX[priority]
-            violations = sum(1 for ttft in ttft_samples if ttft > slo_limit)
-            violation_rate = violations / len(ttft_samples) if ttft_samples else 0
+            violations = _count_ttft_violations_from_ordered(ttft_ordered, slo_limit)
+            violation_rate = violations / ttft_count if ttft_count else 0
             
             print(f"{priority.value} SLO ({slo_limit}ms): {violation_rate*100:.1f}% violations")
 

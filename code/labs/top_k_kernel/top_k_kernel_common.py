@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.common.device_utils import require_cuda_device
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
@@ -197,10 +198,11 @@ def build_inputs(workload: TopKKernelWorkload, device: torch.device) -> TopKKern
 
     # Add a deterministic routing feature so Top-K cutoffs are not dominated by
     # near-ties across numerically different backends.
-    q[..., 0] += torch.tensor(1.0, dtype=workload.dtype)
+    q[..., 0] += 1.0
     block_bias = (
-        torch.arange(workload.num_blocks, dtype=torch.float32)
-        .repeat_interleave(workload.positions_per_block)
+        torch.arange(workload.compressed_k_len, dtype=torch.int64)
+        .div_(workload.positions_per_block, rounding_mode="floor")
+        .to(torch.float32)
         .mul_(5e-3)
         .to(dtype=workload.dtype)
     )
@@ -229,7 +231,13 @@ def _group_q(q: torch.Tensor, workload: TopKKernelWorkload) -> torch.Tensor:
 
 
 def _repeat_k_over_query_heads(k: torch.Tensor, workload: TopKKernelWorkload) -> torch.Tensor:
-    return k.repeat_interleave(workload.gqa_size, dim=1).contiguous()
+    batch_size, kv_heads, k_len, head_dim = k.shape
+    return (
+        k.view(batch_size, kv_heads, 1, k_len, head_dim)
+        .expand(batch_size, kv_heads, workload.gqa_size, k_len, head_dim)
+        .reshape(batch_size, kv_heads * workload.gqa_size, k_len, head_dim)
+        .contiguous()
+    )
 
 
 def _build_block_k(k: torch.Tensor, workload: TopKKernelWorkload) -> torch.Tensor:
@@ -307,8 +315,9 @@ def _softmax_topk_backward(
     grad_probs: torch.Tensor,
     workload: TopKKernelWorkload,
 ) -> torch.Tensor:
+    grad_probs_float = grad_probs.float()
     grad_topk_values = probs * (
-        grad_probs.float() - (grad_probs.float() * probs).sum(dim=-1, keepdim=True)
+        grad_probs_float - (grad_probs_float * probs).sum(dim=-1, keepdim=True)
     )
     grad_block_scores = torch.zeros(
         workload.batch_size,
@@ -524,8 +533,8 @@ def _run_triton_group_block_scores(
     ) * workload.scale
 
 
-def _run_cutlass_group_block_scores(
-    q_group: torch.Tensor,
+def _run_cutlass_reduced_group_block_scores(
+    q_sum: torch.Tensor,
     block_k: torch.Tensor,
     workload: TopKKernelWorkload,
 ) -> torch.Tensor:
@@ -533,21 +542,20 @@ def _run_cutlass_group_block_scores(
 
     extension = load_top_k_kernel_extension()
 
-    q_group_half = q_group.to(dtype=torch.float16)
+    q_sum_half = q_sum.to(dtype=torch.float16)
     block_k_half = block_k.to(dtype=torch.float16)
     scores = torch.empty(
         workload.batch_size,
         workload.kv_heads,
         workload.q_len,
         workload.num_blocks,
-        device=q_group.device,
+        device=q_sum.device,
         dtype=torch.float32,
     )
 
-    q_groups = q_group_half.reshape(
+    q_groups = q_sum_half.reshape(
         workload.batch_size * workload.kv_heads,
         workload.q_len,
-        workload.gqa_size,
         workload.head_dim,
     )
     block_groups = block_k_half.reshape(
@@ -563,23 +571,15 @@ def _run_cutlass_group_block_scores(
 
     for group_idx in range(q_groups.shape[0]):
         q_group_tile = q_groups[group_idx]
-        block_k_tile = block_groups[group_idx]
+        block_k_tile = block_groups[group_idx].contiguous()
         group_scores = score_groups[group_idx]
         for q_start in range(0, workload.q_len, workload.cuda_q_tile):
             q_end = min(q_start + workload.cuda_q_tile, workload.q_len)
-            q_chunk = q_group_tile[q_start:q_end].reshape(
-                (q_end - q_start) * workload.gqa_size,
-                workload.head_dim,
-            )
             dense_chunk = extension.matmul_cutlass_topk(
-                q_chunk.contiguous(),
-                block_k_tile.contiguous(),
+                q_group_tile[q_start:q_end].contiguous(),
+                block_k_tile,
             )
-            group_scores[q_start:q_end].copy_(
-                dense_chunk.view(q_end - q_start, workload.gqa_size, workload.num_blocks)
-                .sum(dim=1)
-                .mul_(workload.scale)
-            )
+            torch.mul(dense_chunk, workload.scale, out=group_scores[q_start:q_end])
     return scores
 
 
@@ -587,13 +587,18 @@ def _run_cuda_reduced_group_block_scores(
     q: torch.Tensor,
     k: torch.Tensor,
     workload: TopKKernelWorkload,
+    *,
+    use_cutlass: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # The grouped Top-K score reduces query heads before selection, so the
     # backward benchmark can score the reduced Q tile directly instead of
     # materializing all GQA rows and summing them after GEMM.
     q_sum = _group_q(q, workload).sum(dim=3, dtype=torch.float32).contiguous()
     block_k = _build_block_k_reduced(k, workload)
-    block_scores = torch.matmul(q_sum, block_k.transpose(-1, -2)) * workload.scale
+    if use_cutlass:
+        block_scores = _run_cutlass_reduced_group_block_scores(q_sum, block_k, workload)
+    else:
+        block_scores = torch.matmul(q_sum, block_k.transpose(-1, -2)) * workload.scale
     return block_scores, q_sum, block_k
 
 
@@ -731,21 +736,18 @@ class TritonTopKSelectionFunction(torch.autograd.Function):
 class CudaTopKSelectionFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q: torch.Tensor, k: torch.Tensor, workload: TopKKernelWorkload):
-        if workload.mode == "fwd_bwd":
-            block_scores, q_sum, block_k = _run_cuda_reduced_group_block_scores(
-                q,
-                k,
-                workload,
-            )
-        else:
-            q_float = q.float().contiguous()
-            k_float = k.float().contiguous()
-            q_group = _group_q(q_float, workload)
-            block_k = _build_block_k(k_float, workload)
-            block_scores = _run_cutlass_group_block_scores(q_group, block_k, workload)
-            q_sum = q_group.sum(dim=3).contiguous()
+        needs_backward = bool(ctx.needs_input_grad[0] or ctx.needs_input_grad[1])
+        block_scores, q_sum, block_k = _run_cuda_reduced_group_block_scores(
+            q,
+            k,
+            workload,
+            use_cutlass=workload.mode == "forward",
+        )
         probs, topk_indices = _finalize_topk_from_block_scores(block_scores, workload)
-        ctx.save_for_backward(q_sum, block_k, probs, topk_indices)
+        if needs_backward:
+            ctx.save_for_backward(q_sum, block_k, probs, topk_indices)
+        else:
+            ctx.save_for_backward()
         ctx.workload = workload
         ctx.q_dtype = q.dtype
         ctx.k_dtype = k.dtype
@@ -782,17 +784,41 @@ def run_optimized_top_k_select(
     raise ValueError(f"Unsupported optimized backend: {backend}")
 
 
-def build_verification_tensor(outputs: TopKKernelOutputs) -> torch.Tensor:
-    sorted_indices = outputs.indices[:1, :1, :4, :4].sort(dim=-1).values
-    pieces = [
-        outputs.probs[:1, :1, :4, :4].reshape(-1).float(),
-        sorted_indices.reshape(-1).float(),
-    ]
+def _verification_tensor_size(outputs: TopKKernelOutputs) -> int:
+    size = 32
     if outputs.q_grad is not None:
-        pieces.append(outputs.q_grad[:1, :1, :2, :8].reshape(-1).float())
+        size += 16
     if outputs.k_grad is not None:
-        pieces.append(outputs.k_grad[:1, :1, :2, :8].reshape(-1).float())
-    return torch.cat(pieces, dim=0)
+        size += 16
+    return size
+
+
+def _copy_verification_piece(out: torch.Tensor, offset: int, tensor: torch.Tensor) -> int:
+    flat = tensor.reshape(-1)
+    next_offset = offset + int(flat.numel())
+    out[offset:next_offset].copy_(flat)
+    return next_offset
+
+
+def build_verification_tensor(
+    outputs: TopKKernelOutputs,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    required_size = _verification_tensor_size(outputs)
+    if out is None:
+        out = torch.empty(required_size, device=outputs.probs.device, dtype=torch.float32)
+    elif out.numel() < required_size or out.dtype != torch.float32 or out.device != outputs.probs.device:
+        raise RuntimeError("verification output buffer has an incompatible shape, dtype, or device")
+
+    sorted_indices = outputs.indices[:1, :1, :4, :4].sort(dim=-1).values
+    offset = 0
+    offset = _copy_verification_piece(out, offset, outputs.probs[:1, :1, :4, :4])
+    offset = _copy_verification_piece(out, offset, sorted_indices)
+    if outputs.q_grad is not None:
+        offset = _copy_verification_piece(out, offset, outputs.q_grad[:1, :1, :2, :8])
+    if outputs.k_grad is not None:
+        offset = _copy_verification_piece(out, offset, outputs.k_grad[:1, :1, :2, :8])
+    return out[:offset]
 
 
 class TopKKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -809,6 +835,8 @@ class TopKKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.outputs: Optional[TopKKernelOutputs] = None
         self.device = resolve_device()
         self._custom_metrics: dict[str, float] = {}
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._loss_weights_flat: Optional[torch.Tensor] = None
         self._refresh_workload_metadata()
 
     def _refresh_workload_metadata(self) -> None:
@@ -825,7 +853,10 @@ class TopKKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def setup(self) -> None:
         self.inputs = build_inputs(self.workload, self.device)
+        self._loss_weights_flat = self.inputs.loss_weights.reshape(-1)
         self.outputs = None
+        verify_size = 64 if self.workload.mode == "fwd_bwd" else 32
+        self._verify_output_buffer = torch.empty(verify_size, device=self.device, dtype=torch.float32)
         if self.workload.mode == "fwd_bwd":
             self.inputs.q.requires_grad_(True)
             self.inputs.k.requires_grad_(True)
@@ -855,7 +886,7 @@ class TopKKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
                     self.workload,
                     self.backend,
                 )
-                (warm_probs * self.inputs.loss_weights).sum().backward()
+                torch.dot(warm_probs.reshape(-1), self._loss_weights_flat).backward()
 
         self._custom_metrics = {
             "topk.backend.baseline": 1.0 if self.backend == "baseline" else 0.0,
@@ -885,13 +916,30 @@ class TopKKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def benchmark_fn(self) -> None:
         if self.inputs is None:
             raise RuntimeError("Top-K inputs not initialized")
+        if self.workload.mode == "fwd_bwd" and self._loss_weights_flat is None:
+            raise RuntimeError("Top-K loss weights not initialized")
 
         if self.workload.mode == "fwd_bwd":
             self.inputs.q.grad = None
             self.inputs.k.grad = None
 
         with self._nvtx_range(self.label):
-            if self.backend == "baseline":
+            if self.workload.mode == "forward":
+                with torch.inference_mode():
+                    if self.backend == "baseline":
+                        probs, indices = baseline_top_k_select(
+                            self.inputs.q,
+                            self.inputs.k,
+                            self.workload,
+                        )
+                    else:
+                        probs, indices = run_optimized_top_k_select(
+                            self.inputs.q,
+                            self.inputs.k,
+                            self.workload,
+                            self.backend,
+                        )
+            elif self.backend == "baseline":
                 probs, indices = baseline_top_k_select(
                     self.inputs.q,
                     self.inputs.k,
@@ -908,14 +956,15 @@ class TopKKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             q_grad = None
             k_grad = None
             if self.workload.mode == "fwd_bwd":
-                loss = (probs * self.inputs.loss_weights).sum()
+                loss = torch.dot(probs.reshape(-1), self._loss_weights_flat)
                 loss.backward()
-                q_grad = self.inputs.q.grad.detach().clone()
-                k_grad = self.inputs.k.grad.detach().clone()
+                q_grad = self.inputs.q.grad
+                k_grad = self.inputs.k.grad
+                probs = probs.detach_()
 
         self.outputs = TopKKernelOutputs(
-            probs=probs.detach().clone(),
-            indices=indices.detach().clone(),
+            probs=probs,
+            indices=indices,
             q_grad=q_grad,
             k_grad=k_grad,
         )
@@ -933,7 +982,7 @@ class TopKKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 "q": self.inputs.q.detach(),
                 "k": self.inputs.k.detach(),
             },
-            output=build_verification_tensor(self.outputs),
+            output=build_verification_tensor(self.outputs, self._verify_output_buffer),
             batch_size=self.workload.batch_size,
             parameter_count=0,
             precision_flags={
@@ -947,6 +996,8 @@ class TopKKernelBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.inputs = None
         self.outputs = None
+        self._verify_output_buffer = None
+        self._loss_weights_flat = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

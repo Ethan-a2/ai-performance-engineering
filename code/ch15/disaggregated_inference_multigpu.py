@@ -13,25 +13,17 @@ speculative decoding algorithms and optimizations, see:
 - ch18/run_vllm_decoder.py (production vLLM integration)
 """
 
-import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Tuple, Optional
 
-import torch.profiler as profiler
-from torch.profiler import profile, record_function, ProfilerActivity, schedule
-import torch.cuda.nvtx as nvtx
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from core.utils.compile_utils import compile_callable, maybe_nested_compile_region
 from core.utils.architecture_runtime import (
     get_arch_config,
-    get_architecture,
-    get_architecture_info,
 )
 from core.benchmark.gpu_requirements import require_min_gpus
 
@@ -42,12 +34,9 @@ Chapter 15: Disaggregated Inference Architectures
 
 Simulated disaggregated prefill-decode benchmarking on Blackwell clusters."""
 
-from torch.nn.parallel import DistributedDataParallel as DDP
 import time
 import numpy as np
 import json
-import threading
-import queue
 
 
 @maybe_nested_compile_region
@@ -224,6 +213,51 @@ class ScaledDotProductAttentionLayer(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
         self.to(device=device, dtype=compute_dtype)
+        self._k_cat_buffer: Optional[torch.Tensor] = None
+        self._v_cat_buffer: Optional[torch.Tensor] = None
+
+    def _concat_kv_cache(
+        self,
+        past_k: torch.Tensor,
+        past_v: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        past_len = past_k.size(2)
+        total_len = past_len + k.size(2)
+        capacity = total_len
+        current_capacity = self._k_cat_buffer.size(2) if self._k_cat_buffer is not None else 0
+        if current_capacity > 0:
+            capacity = max(capacity, current_capacity)
+        needs_buffer = (
+            self._k_cat_buffer is None
+            or self._v_cat_buffer is None
+            or self._k_cat_buffer.size(0) != k.size(0)
+            or self._k_cat_buffer.size(1) != k.size(1)
+            or self._k_cat_buffer.size(2) < total_len
+            or self._k_cat_buffer.size(3) != k.size(3)
+            or self._k_cat_buffer.device != k.device
+            or self._k_cat_buffer.dtype != k.dtype
+        )
+        if needs_buffer:
+            capacity = max(total_len, max(1, current_capacity) * 2)
+            self._k_cat_buffer = torch.empty(
+                k.size(0),
+                k.size(1),
+                capacity,
+                k.size(3),
+                device=k.device,
+                dtype=k.dtype,
+            )
+            self._v_cat_buffer = torch.empty_like(self._k_cat_buffer)
+
+        k_out = self._k_cat_buffer[:, :, :total_len, :]
+        v_out = self._v_cat_buffer[:, :, :total_len, :]
+        k_out[:, :, :past_len, :].copy_(past_k)
+        v_out[:, :, :past_len, :].copy_(past_v)
+        k_out[:, :, past_len:total_len, :].copy_(k)
+        v_out[:, :, past_len:total_len, :].copy_(v)
+        return k_out, v_out
 
     @torch.inference_mode()
     def forward(
@@ -232,7 +266,8 @@ class ScaledDotProductAttentionLayer(nn.Module):
         kv_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = x.shape
-        x = x.to(dtype=self.compute_dtype)
+        if x.dtype != self.compute_dtype:
+            raise RuntimeError("ScaledDotProductAttentionLayer expects inputs in compute_dtype")
 
         q = self.q_proj(x)
         k = self.k_proj(x)
@@ -245,8 +280,7 @@ class ScaledDotProductAttentionLayer(nn.Module):
         if kv_state is not None and all(isinstance(t, torch.Tensor) for t in kv_state):
             past_k, past_v = kv_state
             if past_k is not None and past_v is not None:
-                k = torch.cat([past_k, k], dim=2)
-                v = torch.cat([past_v, v], dim=2)
+                k, v = self._concat_kv_cache(past_k, past_v, k, v)
 
         sdpa_ctx = get_sdpa_context()
         with sdpa_ctx:
@@ -254,7 +288,7 @@ class ScaledDotProductAttentionLayer(nn.Module):
 
         attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, self.embed_dim)
         output = self.out_proj(attn_out)
-        return output, k.detach(), v.detach()
+        return output, k, v
 
 
 class PrefillKernel(nn.Module):
@@ -267,12 +301,13 @@ class PrefillKernel(nn.Module):
 
     @torch.inference_mode()
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
-        key_states: List[torch.Tensor] = []
-        value_states: List[torch.Tensor] = []
-        for attn, ffn in zip(self.attention_layers, self.ffn_layers):
+        layer_count = min(len(self.attention_layers), len(self.ffn_layers))
+        key_states: List[torch.Tensor] = [x] * layer_count
+        value_states: List[torch.Tensor] = [x] * layer_count
+        for idx, (attn, ffn) in enumerate(zip(self.attention_layers, self.ffn_layers)):
             attn_out, key_state, value_state = _run_attn(attn, x)
-            key_states.append(key_state)
-            value_states.append(value_state)
+            key_states[idx] = key_state
+            value_states[idx] = value_state
             x = _run_ffn(ffn, attn_out)
         return x, tuple(key_states), tuple(value_states)
 
@@ -292,14 +327,15 @@ class DecodeKernel(nn.Module):
         x: torch.Tensor,
         kv_state: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
-        key_states: List[torch.Tensor] = []
-        value_states: List[torch.Tensor] = []
+        layer_count = min(len(self.attention_layers), len(self.ffn_layers))
+        key_states: List[torch.Tensor] = [x] * layer_count
+        value_states: List[torch.Tensor] = [x] * layer_count
 
         for idx, (attn, ffn) in enumerate(zip(self.attention_layers, self.ffn_layers)):
             past_state = kv_state[idx] if kv_state and idx < len(kv_state) else None
             attn_out, key_state, value_state = _run_attn(attn, x, kv_state=past_state)
-            key_states.append(key_state)
-            value_states.append(value_state)
+            key_states[idx] = key_state
+            value_states[idx] = value_state
             x = _run_ffn(ffn, attn_out)
 
         logits = self.lm_head(x[:, -1, :])
@@ -312,31 +348,44 @@ class GuidedDecoder:
     def __init__(self, backend: str = "tensorrt-llm-guided_json"):
         self.backend = backend
         self.schema: Optional[Dict] = None
+        self._schema_keys: Optional[Tuple[str, ...]] = None
+        self._cached_backend = ""
+        self._simulated_latency_ms = 0.0
+        self._refresh_backend_cache()
         self._compiled = False
+
+    def _refresh_backend_cache(self):
+        self._cached_backend = self.backend
+        backend_lower = self.backend.lower()
+        # Simulated latencies: TensorRT-LLM guided_json tends to be faster than generic fallbacks.
+        self._simulated_latency_ms = (
+            3.5 if "tensorrt" in backend_lower or "guided_json" in backend_lower else 7.0
+        )
 
     def load_schema(self, schema: Dict):
         self.schema = schema
+        self._schema_keys = tuple(schema.keys())
         self._compiled = True
 
     def compile_backend(self):
         """Simulate backend compilation."""
+        if self.backend != self._cached_backend:
+            self._refresh_backend_cache()
         self._compiled = True
 
     def generate(self, prompt: str) -> Dict:
         if not self._compiled:
             raise RuntimeError("GuidedDecoder requires compile_backend() or load_schema() before generation.")
-
-        backend_lower = self.backend.lower()
-        # Simulated latencies: TensorRT-LLM guided_json tends to be faster than generic fallbacks.
-        simulated_latency_ms = 3.5 if "tensorrt" in backend_lower or "guided_json" in backend_lower else 7.0
+        if self.backend != self._cached_backend:
+            self._refresh_backend_cache()
 
         payload = {
             "backend": self.backend,
             "prompt_prefix": prompt[:32],
-            "latency_ms": simulated_latency_ms,
+            "latency_ms": self._simulated_latency_ms,
         }
-        if self.schema:
-            payload["schema_keys"] = list(self.schema.keys())
+        if self._schema_keys:
+            payload["schema_keys"] = self._schema_keys
         return payload
 
 class DisaggregatedInferenceSystem:
@@ -392,7 +441,7 @@ class DisaggregatedInferenceSystem:
         print(f"Prefill phase: Processing prompt of length {len(prompt)}")
         
         # Simulate prefill computation
-        start_time = time.time()
+        start_time = time.perf_counter()
         
         # Distribute across prefill workers
         kv_cache = {}
@@ -400,7 +449,7 @@ class DisaggregatedInferenceSystem:
             worker_kv = worker.process_prompt(prompt)
             kv_cache.update(worker_kv)
             
-        prefill_time = time.time() - start_time
+        prefill_time = time.perf_counter() - start_time
         print(f"Prefill completed in {prefill_time:.3f}s")
         
         return kv_cache
@@ -429,18 +478,18 @@ class DisaggregatedInferenceSystem:
         """Generate response using decode workers."""
         print("Decode phase: Generating response tokens...")
         
-        start_time = time.time()
+        start_time = time.perf_counter()
         response_tokens = []
         
         # Generate tokens autoregressively
-        for i in range(100):  # Generate up to 100 tokens
+        for _i in range(100):  # Generate up to 100 tokens
             token = self.decode_workers[0].generate_next_token()
             response_tokens.append(token)
             
             if token == "<EOS>":
                 break
                 
-        decode_time = time.time() - start_time
+        decode_time = time.perf_counter() - start_time
         print(f"Decode completed in {decode_time:.3f}s")
         
         return " ".join(response_tokens)
@@ -567,6 +616,10 @@ class DecodeWorker:
         # Seed with a random token for the first decode step.
         seed_token = torch.randint(0, self.vocab_size, (1,), device=self.device)
         self._last_token_id = seed_token
+        self._sample_logits = torch.empty(self.vocab_size, dtype=torch.float32, device=self.device)
+        self._sample_probs = torch.empty_like(self._sample_logits)
+        self._sample_token = torch.empty(1, dtype=torch.long, device=self.device)
+        self._sample_token_host = torch.empty(1, dtype=torch.long, device="cpu", pin_memory=True)
         
     def _create_attention_layers(self) -> nn.ModuleList:
         """Create attention layers for decode."""
@@ -617,17 +670,18 @@ class DecodeWorker:
             return "<EOS>"
 
         token_embed = self.token_embedding(self._last_token_id).unsqueeze(1)
-        token_embed = token_embed.to(device=self.device, dtype=self.compute_dtype)
 
         kernel = self.decode_kernel_compiled or self.decode_kernel
         logits, key_states, value_states = kernel(token_embed, self.kv_cache)
         self.kv_cache = tuple((k, v) for k, v in zip(key_states, value_states))
 
-        probs = torch.softmax(logits[0].float(), dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        self._last_token_id = next_token.to(self.device)
+        self._sample_logits.copy_(logits[0])
+        torch.softmax(self._sample_logits, dim=-1, out=self._sample_probs)
+        torch.multinomial(self._sample_probs, num_samples=1, out=self._sample_token)
+        self._last_token_id.copy_(self._sample_token)
 
-        token_index = int(next_token.item()) % len(self.vocab)
+        self._sample_token_host.copy_(self._sample_token)
+        token_index = int(self._sample_token_host[0]) % len(self.vocab)
         return self.vocab[token_index]
 
 class MoERouter:
@@ -668,12 +722,7 @@ class MoERouter:
         
         for token in tokens:
             expert_scores = self._get_expert_scores(token)
-            
-            top_experts = sorted(
-                range(self.num_experts),
-                key=lambda x: expert_scores[x],
-                reverse=True
-            )[:self.top_k]
+            top_experts = self._rank_top_experts(expert_scores)
             
             routed = False
             for expert_id in top_experts:
@@ -692,20 +741,50 @@ class MoERouter:
                         
         return expert_assignments
         
-    def _get_expert_scores(self, token: int) -> List[float]:
+    def _get_expert_scores(self, token: int) -> np.ndarray:
         """Get expert preference scores for a token."""
-        scores = np.random.random(self.num_experts)
-        return scores.tolist()
+        return np.random.random(self.num_experts)
+
+    def _rank_top_experts(self, expert_scores: np.ndarray) -> List[int]:
+        """Return expert ids sorted by descending score without a full Python sort."""
+        expert_count = int(expert_scores.shape[0])
+        ranked_count = min(max(int(self.top_k), 0), expert_count)
+        if ranked_count == 0:
+            return []
+        if ranked_count == expert_count:
+            ranked = np.argsort(expert_scores)[::-1]
+        else:
+            split_index = expert_count - ranked_count
+            candidate_indices = np.argpartition(expert_scores, split_index)[split_index:]
+            ranked = candidate_indices[np.argsort(expert_scores[candidate_indices])[::-1]]
+        return [int(expert_id) for expert_id in ranked]
         
     def get_load_balance_metrics(self) -> Dict:
         """Get load balancing metrics."""
-        loads = list(self.expert_loads.values())
+        load_count = len(self.expert_loads)
+        if load_count == 0:
+            mean_load = std_load = max_load = min_load = 0.0
+        else:
+            load_total = 0.0
+            max_load = float("-inf")
+            min_load = float("inf")
+            for load in self.expert_loads.values():
+                load_value = float(load)
+                load_total += load_value
+                max_load = max(max_load, load_value)
+                min_load = min(min_load, load_value)
+            mean_load = load_total / load_count
+            variance = 0.0
+            for load in self.expert_loads.values():
+                delta = float(load) - mean_load
+                variance += delta * delta
+            std_load = float(np.sqrt(variance / load_count))
         metrics = {
-            "mean_load": float(np.mean(loads)),
-            "std_load": float(np.std(loads)),
-            "max_load": float(max(loads)),
-            "min_load": float(min(loads)),
-            "load_imbalance": float(max(loads) - min(loads)),
+            "mean_load": mean_load,
+            "std_load": std_load,
+            "max_load": max_load,
+            "min_load": min_load,
+            "load_imbalance": max_load - min_load,
         }
         if self.compression_stats:
             metrics.update(self.compression_stats)
@@ -808,7 +887,6 @@ class ParallelismManager:
         
         # Each GPU handles different stages
         stages_per_gpu = 1
-        total_stages = self.config.num_gpus * stages_per_gpu
         
         for gpu_id in range(self.config.num_gpus):
             stage_start = gpu_id * stages_per_gpu

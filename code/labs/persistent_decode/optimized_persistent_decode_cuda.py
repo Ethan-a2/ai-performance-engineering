@@ -40,7 +40,13 @@ def _load_extension() -> object:
             "--expt-relaxed-constexpr",
             "--expt-extended-lambda",
             "-DCUTE_ARCH_TCGEN05_TMEM_ENABLED",
+            # sm_100 (B200) SASS does not load on sm_103 (GB300). Match the sibling
+            # tma_extension.py / optimized_tma_prefill_decode.py arch set so the
+            # persistent decode kernel has a Blackwell-Ultra (sm_103) image too.
             "-gencode=arch=compute_100,code=sm_100",
+            "-gencode=arch=compute_103,code=sm_103",
+            "-gencode=arch=compute_120,code=sm_120",
+            "-gencode=arch=compute_121,code=sm_121",
         ] + [f"-I{p}" for p in include_dirs if p.exists()],
     )
 
@@ -59,6 +65,8 @@ class OptimizedPersistentDecodeCUDABenchmark(VerificationPayloadMixin, BaseBench
         self.blocks = 8
         self._ext: Optional[object] = None
         self.output: Optional[torch.Tensor] = None
+        self._output_view: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.register_workload_metadata(tokens_per_iteration=tokens_per_iteration())
 
     def setup(self) -> None:
@@ -78,14 +86,16 @@ class OptimizedPersistentDecodeCUDABenchmark(VerificationPayloadMixin, BaseBench
             ) from exc
         
         self.inputs = build_inputs(self.batch, self.seq_len, self.head_dim, self.device)
+        self._output_view = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])]
+        self._verify_output_buffer = torch.empty_like(self._output_view, dtype=torch.float32)
 
     def benchmark_fn(self) -> None:
         """Run the persistent decode kernel."""
-        if self._ext is None or self.inputs is None:
+        if self._ext is None or self.inputs is None or self._output_view is None:
             raise RuntimeError("SKIPPED: persistent_decode_ext not initialized")
         
         # Call the extension's forward pass
-        with self._nvtx_range("persistent_decode_cuda"):
+        with torch.inference_mode(), self._nvtx_range("persistent_decode_cuda"):
             self._ext.persistent_decode(
                 self.inputs.q,
                 self.inputs.k,
@@ -94,18 +104,21 @@ class OptimizedPersistentDecodeCUDABenchmark(VerificationPayloadMixin, BaseBench
                 self.blocks,
             )
         # Capture a representative slice of the output
-        self.output = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])].detach()
+        self.output = self._output_view
         if self.inputs is None or self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
+        if self.inputs is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "q": self.inputs.q.detach(),
                 "k": self.inputs.k.detach(),
                 "v": self.inputs.v.detach(),
             },
-            output=self.output.float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch,
             parameter_count=0,
             precision_flags={
@@ -120,6 +133,8 @@ class OptimizedPersistentDecodeCUDABenchmark(VerificationPayloadMixin, BaseBench
         torch.cuda.empty_cache()
         self.inputs = None
         self.output = None
+        self._output_view = None
+        self._verify_output_buffer = None
 
     def get_config(self) -> BenchmarkConfig:
         # NOTE: CUDA binary runs external executable, warmup=5 ensures CUDA driver is initialized

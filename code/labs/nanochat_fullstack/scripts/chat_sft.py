@@ -168,6 +168,9 @@ def get_lr_multiplier(it):
 # Go!
 step = 0
 train_iter = iter(train_loader)
+num_tokens = torch.empty((), dtype=torch.int64, device=device)
+log_value_buffer = torch.empty(2, dtype=torch.float64, device=device)
+eval_loss_buffer = torch.empty(eval_steps, dtype=torch.float64, device=device)
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
 
@@ -175,16 +178,16 @@ for step in range(num_iterations):
     if last_step or step % eval_every == 0:
         model.eval()
         val_iter = iter(build_val_loader())
-        losses = []
-        for _ in range(eval_steps):
+        for eval_idx in range(eval_steps):
             val_inputs, val_targets = next(val_iter)
-            with torch.no_grad(), autocast_ctx:
+            with torch.inference_mode(), autocast_ctx:
                 loss = model(val_inputs, val_targets)
-            losses.append(loss)
-        val_loss = torch.stack(losses).mean() # average over eval_steps
+            eval_loss_buffer[eval_idx].copy_(loss.detach())
+        val_loss = eval_loss_buffer.mean() # average over eval_steps
         if ddp:
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) # average over ranks
-        val_loss = val_loss.item()
+        log_value_buffer[0].copy_(val_loss)
+        val_loss = float(log_value_buffer.detach().cpu()[0])
         print0(f"Step {step:05d} | Validation loss: {val_loss:.6f}")
         wandb_run.log({
             "step": step,
@@ -196,8 +199,8 @@ for step in range(num_iterations):
     if last_step or (step > 0 and step % eval_metrics_every == 0):
         model.eval()
         metrics = {}
-        with torch.no_grad(), autocast_ctx:
-            # note that because these are inside no_grad, we can usually afford to at least ~2X the batch size
+        with torch.inference_mode(), autocast_ctx:
+            # note that because these are inference-only, we can usually afford to at least ~2X the batch size
             metrics["mmlu_acc"] = run_chat_eval("MMLU", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
             metrics["arc_easy_acc"] = run_chat_eval("ARC-Easy", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
         metrics_str = ', '.join(f'{k}: {v:.6f}' for k, v in metrics.items())
@@ -212,8 +215,8 @@ for step in range(num_iterations):
         break
 
     # evaluate the gradient
-    num_tokens = torch.tensor(0, device=device) # the number of "active" tokens of supervision seen
-    for micro_step in range(grad_accum_steps):
+    num_tokens.zero_() # the number of "active" tokens of supervision seen
+    for _ in range(grad_accum_steps):
         train_inputs, train_targets = next(train_iter)
         with autocast_ctx:
             loss = model(train_inputs, train_targets)
@@ -236,8 +239,11 @@ for step in range(num_iterations):
     model.zero_grad(set_to_none=True)
 
     # logging
-    train_loss_item = train_loss.item()
-    num_tokens_item = num_tokens.item()
+    log_value_buffer[0].copy_(train_loss.detach())
+    log_value_buffer[1].copy_(num_tokens)
+    log_values_host = log_value_buffer.detach().cpu()
+    train_loss_item = float(log_values_host[0])
+    num_tokens_item = int(log_values_host[1])
     print0(f"Step {step:05d}/{num_iterations:05d} | Training loss: {train_loss_item:.6f}| lrm: {lrm:.6f}| num_tokens: {num_tokens_item:,}")
     wandb_run.log({
         "step": step,

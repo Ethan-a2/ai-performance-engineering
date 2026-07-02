@@ -15,13 +15,10 @@ Results:
 """
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import time
-from typing import List
 
-from core.harness.benchmark_harness import BaseBenchmark
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.harness.benchmark_harness import BaseBenchmark
 
 
 class NativeFP8MoE(VerificationPayloadMixin, BaseBenchmark):
@@ -69,6 +66,7 @@ class NativeFP8MoE(VerificationPayloadMixin, BaseBenchmark):
         I = self.INTERMEDIATE_SIZE
         E = self.NUM_EXPERTS
         K = self.TOP_K
+        self._expert_range = range(E)
         batch_seq = self.BATCH_SIZE * self.SEQ_LEN
         
         print("=" * 60)
@@ -79,6 +77,11 @@ class NativeFP8MoE(VerificationPayloadMixin, BaseBenchmark):
         
         # Input and weights - use CPU randn + to(device) to avoid CUDA RNG graph issues
         self.x = torch.randn(batch_seq, H, dtype=torch.bfloat16).to(self.device)
+        self._verify_output_buffer = torch.empty(
+            (1, min(8, H)),
+            device=self.device,
+            dtype=torch.float32,
+        )
         
         # BF16 reference weights
         w1 = torch.randn(E, H, I, dtype=torch.bfloat16).to(self.device)
@@ -94,22 +97,62 @@ class NativeFP8MoE(VerificationPayloadMixin, BaseBenchmark):
         self.scale = torch.ones((), device=self.device)
         
         # Routing - use CPU tensors + to(device)
-        self.expert_indices = torch.randint(0, E, (batch_seq, K)).to(self.device)
-        self.expert_weights = F.softmax(
+        expert_indices_cpu = torch.randint(0, E, (batch_seq, K))
+        expert_weights_cpu = F.softmax(
             torch.randn(batch_seq, K), dim=-1
-        ).to(torch.bfloat16).to(self.device)
+        ).to(torch.bfloat16)
+        expert_indices = expert_indices_cpu.to(self.device)
+        expert_weights = expert_weights_cpu.to(self.device)
         
         # Pre-compute routing
-        flat_idx = self.expert_indices.view(-1)
-        self.sorted_order = torch.argsort(flat_idx, stable=True)
-        sorted_expert_ids = flat_idx[self.sorted_order]
-        self.counts = torch.bincount(sorted_expert_ids, minlength=E).tolist()
+        flat_idx = expert_indices.view(-1)
+        sorted_order = torch.argsort(flat_idx, stable=True)
+        self.counts = torch.bincount(expert_indices_cpu.view(-1), minlength=E).tolist()
+        expanded_token_indices = torch.arange(batch_seq * K, device=self.device, dtype=torch.int64)
+        if K != 1:
+            expanded_token_indices.div_(K, rounding_mode="floor")
+        self._sorted_token_indices = expanded_token_indices.index_select(0, sorted_order)
+        self._sorted_weights = expert_weights.view(-1).index_select(0, sorted_order)
+        self._sorted_tokens = torch.empty(
+            batch_seq * K,
+            H,
+            device=self.device,
+            dtype=self.x.dtype,
+        )
         self._output_buffer = torch.empty(
             batch_seq * K,
             H,
             device=self.device,
             dtype=self.x.dtype,
         )
+        max_expert_tokens = max(self.counts)
+        self._tokens_fp8_buffer = torch.empty(
+            max_expert_tokens,
+            H,
+            device=self.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        self._hidden_fp8_buffer = torch.empty(
+            max_expert_tokens,
+            I,
+            device=self.device,
+            dtype=torch.float8_e4m3fn,
+        )
+        self._expert_token_views = []
+        self._expert_weight_views = []
+        self._expert_output_views = []
+        self._expert_tokens_fp8_views = []
+        self._expert_hidden_fp8_views = []
+        offset = 0
+        for count in self.counts:
+            next_offset = offset + count
+            self._expert_token_views.append(self._sorted_tokens[offset:next_offset])
+            self._expert_weight_views.append(self._sorted_weights[offset:next_offset].unsqueeze(-1))
+            self._expert_output_views.append(self._output_buffer[offset:next_offset])
+            self._expert_tokens_fp8_views.append(self._tokens_fp8_buffer[:count])
+            self._expert_hidden_fp8_views.append(self._hidden_fp8_buffer[:count])
+            offset = next_offset
+        self._payload_param_count = int(self.w1_fp8.numel() + self.w2_fp8.numel() + self.w3_fp8.numel())
         
         print(f"FP8 weight memory: {(self.w1_fp8.numel() + self.w3_fp8.numel() + self.w2_fp8.numel()) / 1e9:.2f} GB")
         print(f"(vs BF16: {(w1.numel() + w3.numel() + w2.numel()) * 2 / 1e9:.2f} GB)")
@@ -118,60 +161,61 @@ class NativeFP8MoE(VerificationPayloadMixin, BaseBenchmark):
     def benchmark_fn(self) -> None:
         """Run FP8 MoE forward pass."""
         x = self.x
-        E = self.NUM_EXPERTS
-        H = self.HIDDEN_SIZE
         scale = self.scale
         output = self._output_buffer
 
-        sorted_tokens = x.repeat_interleave(self.TOP_K, dim=0)[self.sorted_order]
-        sorted_w = self.expert_weights.view(-1)[self.sorted_order]
+        torch.index_select(x, 0, self._sorted_token_indices, out=self._sorted_tokens)
 
-        offset = 0
-        for e in range(E):
+        for e in self._expert_range:
             count = self.counts[e]
             if count == 0:
                 continue
                 
-            tokens_e = sorted_tokens[offset:offset+count]
-            tokens_fp8 = tokens_e.to(torch.float8_e4m3fn)
-            weights_e = sorted_w[offset:offset+count].unsqueeze(-1)
+            tokens_e = self._expert_token_views[e]
+            tokens_fp8_slice = self._expert_tokens_fp8_views[e]
+            tokens_fp8_slice.copy_(tokens_e)
+            weights_e = self._expert_weight_views[e]
             
             # Native FP8 matmul via _scaled_mm
             gate = torch._scaled_mm(
-                tokens_fp8, self.w1_fp8[e].T,
+                tokens_fp8_slice, self.w1_fp8[e].T,
                 scale_a=scale, scale_b=scale,
                 out_dtype=torch.bfloat16
             )
-            gate = F.silu(gate)
+            gate = F.silu(gate, inplace=True)
             
             up = torch._scaled_mm(
-                tokens_fp8, self.w3_fp8[e].T,
+                tokens_fp8_slice, self.w3_fp8[e].T,
                 scale_a=scale, scale_b=scale,
                 out_dtype=torch.bfloat16
             )
             
-            hidden_fp8 = (gate * up).to(torch.float8_e4m3fn)
+            gate.mul_(up)
+            hidden_fp8_slice = self._expert_hidden_fp8_views[e]
+            hidden_fp8_slice.copy_(gate)
             
             expert_out = torch._scaled_mm(
-                hidden_fp8, self.w2_fp8[e].T,
+                hidden_fp8_slice, self.w2_fp8[e].T,
                 scale_a=scale, scale_b=scale,
                 out_dtype=torch.bfloat16
             )
             
-            output[offset:offset+count] = expert_out * weights_e
-            offset += count
+            torch.mul(expert_out, weights_e, out=self._expert_output_views[e])
         
-        self.output = output[:1, : min(8, output.shape[1])].detach().float().clone()
+        self.output = output
         if self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
-        param_count = int(self.w1_fp8.numel() + self.w2_fp8.numel() + self.w3_fp8.numel())
-        self._payload_param_count = param_count
 
     def capture_verification_payload(self) -> None:
+        verify_output = getattr(self, "_verify_output_buffer", None)
+        if self.output is None or verify_output is None:
+            raise RuntimeError("benchmark_fn() must run before verification capture")
         param_count = self._payload_param_count
+        output_slice = self.output[: verify_output.shape[0], : verify_output.shape[1]]
+        verify_output.copy_(output_slice)
         self._set_verification_payload(
             inputs={"x": self.x.detach()},
-            output=self.output,
+            output=verify_output,
             batch_size=self.BATCH_SIZE,
             parameter_count=param_count,
             precision_flags={"bf16": True, "fp8": True, "tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -186,7 +230,29 @@ class NativeFP8MoE(VerificationPayloadMixin, BaseBenchmark):
             "b200_peak_tflops": 2250,
         }
 
+    def teardown(self) -> None:
+        for name in (
+            "x",
+            "w1_fp8",
+            "w2_fp8",
+            "w3_fp8",
+            "scale",
+            "_sorted_token_indices",
+            "_sorted_weights",
+            "_sorted_tokens",
+            "_output_buffer",
+            "_tokens_fp8_buffer",
+            "_hidden_fp8_buffer",
+            "_expert_output_buffer",
+            "_expert_range",
+            "output",
+            "_verify_output_buffer",
+        ):
+            if hasattr(self, name):
+                setattr(self, name, None)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        super().teardown()
+
 def get_benchmark() -> NativeFP8MoE:
     return NativeFP8MoE()
-
-

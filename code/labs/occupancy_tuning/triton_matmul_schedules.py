@@ -13,6 +13,23 @@ from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
 from labs.occupancy_tuning import triton_matmul
 
 
+def _tcgen05_codegen_broken() -> bool:
+    """Previously True on Blackwell Ultra (sm_103, CC 10.3) with Triton >= 3.6: the
+    matmul kernel JITted to a tcgen05.wait.st intrinsic the LLVM backend could not
+    select ("LLVM ERROR: Cannot select"), an uncatchable abort that forced this lab to
+    skip on GB300.
+
+    ROOT CAUSE (mechanism-proven 2026-06-11, Front P2): core/benchmark/triton_compat.py
+    (imported via `import arch_config`) de-suffixed sm_103a -> sm_103, and Triton's
+    arch-conditional tcgen05 intrinsics are only selectable for the 'a' target — probe D
+    in code/upstream/triton-tcgen05-wait-st/STATUS.md reproduces the abort from exactly
+    that transform on vanilla Triton 3.7. (The dead `num_warps: tl.constexpr` kernel
+    param suspected by B18 was a red herring: probe B shows it JITs clean without the
+    de-suffix.) triton_compat.py now preserves the 'a' suffix for all arches, so the
+    arch_config import is unconditional again and the lab does not skip."""
+    return False
+
+
 @dataclass(frozen=True)
 class MatmulSchedule:
     name: str
@@ -122,6 +139,7 @@ class TritonMatmulProtonBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._a: Optional[torch.Tensor] = None
         self._b: Optional[torch.Tensor] = None
         self._scratch: Optional[torch.Tensor] = None
+        self._validation_scalars: Optional[torch.Tensor] = None
         # Keep harness runs fast; enable profiling/proton explicitly for analysis.
         self._config = BenchmarkConfig(
             iterations=iterations,
@@ -143,6 +161,12 @@ class TritonMatmulProtonBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("SKIPPED: Triton Proton lab requires a CUDA device.")
         if torch.cuda.device_count() < 1:
             raise RuntimeError("SKIPPED: CUDA device unavailable for Triton Proton lab.")
+        if _tcgen05_codegen_broken():
+            raise RuntimeError(
+                "SKIPPED: Triton >=3.6 on sm_103 (Blackwell Ultra) emits an "
+                "unloadable tcgen05 kernel (LLVM ERROR: Cannot select); use the "
+                "repo-pinned Triton 3.5.0."
+            )
 
         device = torch.device("cuda")
         _ensure_inductor_env()
@@ -153,7 +177,8 @@ class TritonMatmulProtonBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._a = torch.randn((self._size_m, self._size_k), dtype=self._dtype, device=device)
         self._b = torch.randn((self._size_k, self._size_n), dtype=self._dtype, device=device)
         self._scratch = torch.empty((self._size_m, self._size_n), dtype=self._dtype, device=device)
-        with torch.no_grad():
+        self._validation_scalars = torch.empty(2, dtype=torch.float32, device=device)
+        with torch.inference_mode():
             self._reference = torch.matmul(self._a, self._b)
 
         def _run_once() -> torch.Tensor:
@@ -182,7 +207,7 @@ class TritonMatmulProtonBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def benchmark_fn(self) -> None:
         assert self._runner is not None
         try:
-            with self._nvtx_range(self.schedule.name):
+            with torch.inference_mode(), self._nvtx_range(self.schedule.name):
                 self._output = self._runner()
                 # Expose output for harness verification (harness looks for self.output)
                 self.output = self._output
@@ -210,8 +235,15 @@ class TritonMatmulProtonBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def validate_result(self) -> Optional[str]:
         if self._reference is None or self._output is None:
             return None
-        diff = (self._output - self._reference).abs().max().item()
-        if torch.isnan(self._output).any():
+        if self._validation_scalars is None:
+            return "Validation scalar buffer not initialized"
+        validation_scalars = self._validation_scalars
+        validation_scalars[0].copy_((self._output - self._reference).abs().max().float())
+        validation_scalars[1].copy_(torch.isnan(self._output).any().to(torch.float32))
+        validation_scalars_host = validation_scalars.detach().cpu()
+        diff = float(validation_scalars_host[0])
+        has_nan = bool(validation_scalars_host[1])
+        if has_nan:
             return "NaNs detected in Triton output"
         if diff > 2.0:
             return f"Max diff {diff:.4f} exceeds tolerance"
@@ -224,6 +256,7 @@ class TritonMatmulProtonBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._a = None
         self._b = None
         self._scratch = None
+        self._validation_scalars = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

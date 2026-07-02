@@ -43,6 +43,13 @@ def _require_flex_attention() -> tuple[Callable[..., object], Callable[..., torc
     return create_block_mask, flex_attention
 
 
+def _empty_cpu_staging(shape: torch.Size | tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    try:
+        return torch.empty(shape, device="cpu", dtype=dtype, pin_memory=True)
+    except RuntimeError:
+        return torch.empty(shape, device="cpu", dtype=dtype)
+
+
 class DensePagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
     """Dense attention benchmark that varies only the SDPA backend."""
 
@@ -52,6 +59,9 @@ class DensePagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
     def __init__(self) -> None:
         super().__init__()
         self.qkv: Optional[torch.Tensor] = None
+        self._q_view: Optional[torch.Tensor] = None
+        self._k_view: Optional[torch.Tensor] = None
+        self._v_view: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self.batch_size = 4
         self.num_heads = 16
@@ -59,10 +69,14 @@ class DensePagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
         self.head_dim = 64
         self.block_size = 128
         self.chunk_size = 2048
+        self._empty_iteration_result = {}
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
             tokens_per_iteration=float(self.batch_size * self.seq_len),
         )
+        self._enable_nvtx = False
+        self._verify_input_buffers: dict[str, torch.Tensor] = {}
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
     def _configure_backend(self) -> None:
         if self.backend == "math":
@@ -75,39 +89,47 @@ class DensePagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
     def setup(self) -> None:
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         if not torch.cuda.is_available():
             raise RuntimeError("FAIL FAST: paged attention benchmark requires CUDA")
 
         b, h, s, d = self.batch_size, self.num_heads, self.seq_len, self.head_dim
         self.qkv = torch.randn(b, h, s, 3, d, device=self.device, dtype=torch.bfloat16)
         self._configure_backend()
-        q = self.qkv[:, :, :, 0]
-        k = self.qkv[:, :, :, 1]
-        v = self.qkv[:, :, :, 2]
+        self._q_view = self.qkv[:, :, :, 0]
+        self._k_view = self.qkv[:, :, :, 1]
+        self._v_view = self.qkv[:, :, :, 2]
+        self._verify_input_buffers = {
+            "qkv": _empty_cpu_staging(self.qkv.shape, self.qkv.dtype),
+        }
+        self._verify_output_buffer = _empty_cpu_staging(self._q_view.shape, self.qkv.dtype)
         for _ in range(8):
-            _ = F.scaled_dot_product_attention(q, k, v)
+            _ = F.scaled_dot_product_attention(self._q_view, self._k_view, self._v_view)
             torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> Optional[dict]:
-        if self.qkv is None:
+        if self.qkv is None or self._q_view is None or self._k_view is None or self._v_view is None:
             raise RuntimeError("FAIL FAST: QKV not initialized")
-        q = self.qkv[:, :, :, 0]
-        k = self.qkv[:, :, :, 1]
-        v = self.qkv[:, :, :, 2]
 
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        with nvtx_range(self.nvtx_label, enable=enable_nvtx):
-            self.output = F.scaled_dot_product_attention(q, k, v)
+        with nvtx_range(self.nvtx_label, enable=self._enable_nvtx):
+            self.output = F.scaled_dot_product_attention(self._q_view, self._k_view, self._v_view)
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output")
-        return {}
+        return self._empty_iteration_result
 
     def capture_verification_payload(self) -> None:
+        if self.qkv is None or self.output is None:
+            raise RuntimeError("FAIL FAST: paged_attn verification requires setup() and benchmark_fn()")
+        if self._verify_output_buffer is None or "qkv" not in self._verify_input_buffers:
+            raise RuntimeError("FAIL FAST: paged_attn verification buffers are not initialized")
+        self._verify_input_buffers["qkv"].copy_(self.qkv, non_blocking=False)
+        self._verify_output_buffer.copy_(self.output, non_blocking=False)
         self._set_verification_payload(
             # Move verification tensors off GPU so the worker can release device
             # memory before the next phase starts.
-            inputs={"qkv": self.qkv.detach().cpu()},
-            output=self.output.detach().cpu(),
+            inputs=self._verify_input_buffers,
+            output=self._verify_output_buffer,
             batch_size=self.qkv.shape[0],
             parameter_count=0,
             precision_flags={
@@ -127,7 +149,12 @@ class DensePagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
 
     def teardown(self) -> None:
         self.qkv = None
+        self._q_view = None
+        self._k_view = None
+        self._v_view = None
         self.output = None
+        self._verify_input_buffers = {}
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_custom_metrics(self) -> Optional[dict]:
@@ -173,14 +200,20 @@ class LayoutPagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
         self.local_blocks = 4
         self.chunk_size = self.block_size * self.local_blocks
         self.q_offset = self.seq_len - self.decode_tokens
+        self._empty_iteration_result = {}
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
             tokens_per_iteration=float(self.batch_size * self.decode_tokens),
         )
+        self._enable_nvtx = False
+        self._verify_input_buffers: dict[str, torch.Tensor] = {}
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
     def setup(self) -> None:
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         if not torch.cuda.is_available():
             raise RuntimeError("FAIL FAST: paged attention benchmark requires CUDA")
         if self.seq_len % self.block_size != 0:
@@ -195,6 +228,13 @@ class LayoutPagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
         self.v_dense = torch.randn(b, h, s, d, device=self.device, dtype=torch.bfloat16).contiguous()
         self.block_table = self._build_block_table()
         self.dense_mask = self._build_dense_mask_from_block_table()
+        self._verify_input_buffers = {
+            "q": _empty_cpu_staging(self.q.shape, self.q.dtype),
+            "k_dense": _empty_cpu_staging(self.k_dense.shape, self.k_dense.dtype),
+            "v_dense": _empty_cpu_staging(self.v_dense.shape, self.v_dense.dtype),
+            "block_table": _empty_cpu_staging(self.block_table.shape, self.block_table.dtype),
+        }
+        self._verify_output_buffer = _empty_cpu_staging(self.q.shape, self.q.dtype)
         _set_math_backend()
         if self.uses_paged_kv:
             self.block_mask = self._build_block_mask_from_block_table()
@@ -207,10 +247,8 @@ class LayoutPagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
     def _build_block_table(self) -> torch.Tensor:
         num_blocks = self.seq_len // self.block_size
         block_ids = torch.arange(num_blocks, device=self.device, dtype=torch.int64)
-        return torch.stack(
-            [torch.roll(block_ids, shifts=batch_idx % num_blocks) for batch_idx in range(self.batch_size)],
-            dim=0,
-        ).contiguous()
+        batch_offsets = torch.arange(self.batch_size, device=self.device, dtype=torch.int64).unsqueeze(1)
+        return (block_ids.unsqueeze(0) - batch_offsets).remainder_(num_blocks)
 
     def _build_dense_mask_from_block_table(self) -> torch.Tensor:
         if self.block_table is None:
@@ -288,26 +326,30 @@ class LayoutPagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
         return self._flex_attention_fn(self.q, self.k_dense, self.v_dense, block_mask=self.block_mask)
 
     def benchmark_fn(self) -> Optional[dict]:
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        with nvtx_range(self.nvtx_label, enable=enable_nvtx):
+        with nvtx_range(self.nvtx_label, enable=self._enable_nvtx):
             self.output = self._run_attention()
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output")
-        return {}
+        return self._empty_iteration_result
 
     def capture_verification_payload(self) -> None:
         if self.q is None or self.k_dense is None or self.v_dense is None or self.block_table is None or self.output is None:
             raise RuntimeError("FAIL FAST: paged_attn_layout verification requires setup() and benchmark_fn()")
+        if self._verify_output_buffer is None:
+            raise RuntimeError("FAIL FAST: paged_attn_layout verification output buffer is not initialized")
+        for name, tensor in (
+            ("q", self.q),
+            ("k_dense", self.k_dense),
+            ("v_dense", self.v_dense),
+            ("block_table", self.block_table),
+        ):
+            self._verify_input_buffers[name].copy_(tensor, non_blocking=False)
+        self._verify_output_buffer.copy_(self.output, non_blocking=False)
         self._set_verification_payload(
             # Move verification tensors off GPU so the worker can release device
             # memory before the next phase starts.
-            inputs={
-                "q": self.q.detach().cpu(),
-                "k_dense": self.k_dense.detach().cpu(),
-                "v_dense": self.v_dense.detach().cpu(),
-                "block_table": self.block_table.detach().cpu(),
-            },
-            output=self.output.detach().cpu(),
+            inputs=self._verify_input_buffers,
+            output=self._verify_output_buffer,
             batch_size=self.q.shape[0],
             parameter_count=0,
             precision_flags={
@@ -334,6 +376,8 @@ class LayoutPagedAttnBase(VerificationPayloadMixin, BaseBenchmark):
         self.block_mask = None
         self._flex_attention_fn = None
         self.output = None
+        self._verify_input_buffers = {}
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_custom_metrics(self) -> Optional[dict]:

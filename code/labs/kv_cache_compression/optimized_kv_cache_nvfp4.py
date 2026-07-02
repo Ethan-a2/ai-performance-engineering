@@ -6,12 +6,16 @@ from typing import Optional
 
 import torch
 
-from labs.kv_cache_compression.baseline_kv_cache import BaselineKVCacheBenchmark, TE_AVAILABLE, TE_IMPORT_ERROR
-from labs.kv_cache_compression.kv_cache_common import reset_cache
+from labs.kv_cache_compression.baseline_kv_cache import (
+    TE_AVAILABLE,
+    TE_IMPORT_ERROR,
+    BaselineKVCacheBenchmark,
+)
 
 if TE_AVAILABLE:
-    from transformer_engine.pytorch import autocast as te_autocast, is_nvfp4_available
     from transformer_engine.common import recipe as te_recipe
+    from transformer_engine.pytorch import autocast as te_autocast
+    from transformer_engine.pytorch import is_nvfp4_available
 else:  # pragma: no cover
     te_autocast = is_nvfp4_available = te_recipe = None  # type: ignore
 
@@ -43,38 +47,30 @@ class OptimizedKVCacheNVFP4Benchmark(BaselineKVCacheBenchmark):
         return super().validate_result()
 
     def benchmark_fn(self) -> None:
-        if self.model is None or self.cache is None:
+        if self.model is None or self.cache is None or not self._prefill_groups or not self._decode_groups:
             raise RuntimeError("Benchmark not initialized")
-        reset_cache(self.cache)
-        offset = 0
         recipe = self.runtime_recipe
         if recipe is None:
             raise RuntimeError("No NVFP4 recipe available for benchmark")
-        with te_autocast(enabled=True, recipe=recipe):
-            for prefill in self.prefill_inputs:
+        with torch.inference_mode(), te_autocast(enabled=True, recipe=recipe):
+            for prefill, offset in self._prefill_groups:
                 _ = self.model(prefill, self.cache, offset)
-                offset += prefill.shape[1]
-            for decode in self.decode_inputs:
+            for decode, offset in self._decode_groups:
                 _ = self.model(decode, self.cache, offset)
-                offset += decode.shape[1]
-        if self.cache is not None:
-            k_slice = self.cache.cache_k[:, : min(1, self.cache.cache_k.shape[1]), :1, : min(8, self.cache.cache_k.shape[-1])]
-            v_slice = self.cache.cache_v[:, : min(1, self.cache.cache_v.shape[1]), :1, : min(8, self.cache.cache_v.shape[-1])]
-            self.output = torch.stack([k_slice, v_slice], dim=0).detach().float().clone()
-        if self.output is None:
-            raise RuntimeError("benchmark_fn() must produce output for verification")
+        self._mark_cache_output_ready()
 
     def capture_verification_payload(self) -> None:
+        self.output = self._build_verification_output()
+        if self._batch_size_tensor is None or self._seq_meta_tensor is None:
+            raise RuntimeError("setup() must initialize verification metadata tensors")
         self._set_verification_payload(
             inputs={
-                "batch_size": torch.tensor([self.batch_size], dtype=torch.int64, device="cpu"),
-                "seq_meta": torch.tensor(
-                    [self.prefill_seq, self.decode_seq, self.decode_steps], dtype=torch.int64, device="cpu"
-                ),
+                "batch_size": self._batch_size_tensor,
+                "seq_meta": self._seq_meta_tensor,
             },
             output=self.output,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()) if self.model is not None else 0,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": self.tensor_dtype == torch.bfloat16,

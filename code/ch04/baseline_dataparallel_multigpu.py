@@ -38,12 +38,15 @@ class BaselineDataParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.optimizer = None
         self.data = None
         self.target = None
+        self._gpu_data: Optional[torch.Tensor] = None
+        self._gpu_target: Optional[torch.Tensor] = None
         self.device_ids: list[int] = []
         self._last_input: Optional[torch.Tensor] = None
         self._last_target: Optional[torch.Tensor] = None
         self._verify_state: Optional[dict] = None
         self._verify_input: Optional[torch.Tensor] = None
         self._verify_target: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
         # Large input to make per-iteration H2D copies dominate.
         self.input_size = 4096
         self.batch_size = 4096
@@ -64,6 +67,7 @@ class BaselineDataParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         # Keep input tensors on CPU so DataParallel copies every iteration.
         model = SimpleNet(self.input_size).to(self.device)
+        self._payload_parameter_count = sum(p.numel() for p in model.parameters())
         # Use all visible GPUs for DataParallel scatter/gather.
         self.device_ids = list(range(torch.cuda.device_count()))
         self.model = nn.DataParallel(model, device_ids=self.device_ids, output_device=self.device_ids[0])
@@ -73,6 +77,8 @@ class BaselineDataParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         data_gen = torch.Generator().manual_seed(1234)
         self.data = torch.randn(self.batch_size, self.input_size, generator=data_gen)
         self.target = torch.randn(self.batch_size, 1, generator=data_gen)
+        self._gpu_data = torch.empty(self.batch_size, self.input_size, device=self.device, dtype=torch.float32)
+        self._gpu_target = torch.empty(self.batch_size, 1, device=self.device, dtype=torch.float32)
         self._verify_input = self.data.clone()
         self._verify_target = self.target.clone()
 
@@ -80,9 +86,13 @@ class BaselineDataParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
     
     def benchmark_fn(self) -> None:
         """Benchmark: DataParallel training step."""
+        assert self.data is not None and self.target is not None
+        assert self._gpu_data is not None and self._gpu_target is not None
         with self._nvtx_range("dataparallel"):
-            gpu_data = self.data.to(self.device, non_blocking=False)
-            gpu_target = self.target.to(self.device, non_blocking=False)
+            gpu_data = self._gpu_data
+            gpu_target = self._gpu_target
+            gpu_data.copy_(self.data, non_blocking=False)
+            gpu_target.copy_(self.target, non_blocking=False)
             self._last_input = gpu_data
             self._last_target = gpu_target
             output = self.model(gpu_data)
@@ -90,7 +100,7 @@ class BaselineDataParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
-        self.output = output.detach()
+        self.output = output.detach_()
 
     def capture_verification_payload(self) -> None:
         if (
@@ -107,12 +117,11 @@ class BaselineDataParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             verify_input = self._verify_input.to(self.device)
             verify_target = self._verify_target.to(self.device)
             output = verify_model(verify_input)
-        param_count = sum(p.numel() for p in verify_model.parameters())
         self._set_verification_payload(
             inputs={"data": verify_input, "target": verify_target},
             output=output,
             batch_size=int(self.batch_size),
-            parameter_count=param_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -129,6 +138,8 @@ class BaselineDataParallelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.optimizer = None
         self.data = None
         self.target = None
+        self._gpu_data = None
+        self._gpu_target = None
         self._verify_state = None
         self._verify_input = None
         self._verify_target = None

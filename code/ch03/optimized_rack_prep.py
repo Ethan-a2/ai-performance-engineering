@@ -16,15 +16,12 @@ from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (
     BaseBenchmark,
     BenchmarkConfig,
-    WorkloadMetadata,
 )
-from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 from ch03.grace_blackwell_topology import (
     NICInfo,
     cpulist_to_mask,
     discover_nics,
-    format_cpulist,
     recommended_cpuset,
     render_affinity_block,
 )
@@ -53,6 +50,7 @@ class OptimizedRackPrepBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.device_buffers: List[torch.Tensor] = []
         self.norm: Optional[nn.Module] = None
         self.copy_stream: Optional[torch.cuda.Stream] = None
+        self.copy_events: List[torch.cuda.Event] = []
         self.cur_slot = 0
         self.next_slot = 1
         self.nic_plan: List[NICInfo] = []
@@ -61,7 +59,9 @@ class OptimizedRackPrepBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.apply_actions: List[str] = []
         self.verify_report: Optional[dict] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self._last_slot: int = 0
+        self._payload_parameter_count = 0
         bytes_per_iter = self.seq_len * self.hidden_size * 4  # float32 bytes (matches baseline)
         # Register workload metadata in __init__ for compliance checks
         self.register_workload_metadata(
@@ -109,44 +109,60 @@ class OptimizedRackPrepBenchmark(VerificationPayloadMixin, BaseBenchmark):
             torch.empty_like(self.host_buffers[0], device=self.device),
             torch.empty_like(self.host_buffers[0], device=self.device),
         ]
+        self._verify_output_buffer = torch.empty_like(self.device_buffers[0])
         self.norm = nn.LayerNorm(self.hidden_size, device=self.device, dtype=torch.float32)
+        self._payload_parameter_count = sum(p.numel() for p in self.norm.parameters())
         self.copy_stream = torch.cuda.Stream(device=self.device)
+        self.copy_events = [torch.cuda.Event() for _ in self.device_buffers]
         self.cur_slot = 0
         self.next_slot = 1
-        self._start_copy(self.cur_slot)
-        torch.cuda.current_stream().wait_stream(self.copy_stream)
-        self._start_copy(self.next_slot)
+        current_stream = torch.cuda.current_stream()
+        self._start_copy(self.cur_slot, wait_stream=current_stream)
+        current_stream.wait_event(self.copy_events[self.cur_slot])
+        self._start_copy(self.next_slot, wait_stream=current_stream)
         
 
-    def _start_copy(self, slot: int) -> None:
+    def _start_copy(
+        self,
+        slot: int,
+        wait_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         if self.copy_stream is None:
             raise RuntimeError("Copy stream not initialized")
+        if not self.copy_events:
+            raise RuntimeError("Copy events not initialized")
+        producer_stream = wait_stream or torch.cuda.current_stream()
         with torch.cuda.stream(self.copy_stream):
+            self.copy_stream.wait_stream(producer_stream)
             self.device_buffers[slot].copy_(self.host_buffers[slot], non_blocking=True)
+            self.copy_events[slot].record(self.copy_stream)
 
     def benchmark_fn(self) -> None:
         assert self.norm is not None
         if self.copy_stream is None:
             raise RuntimeError("Copy stream not initialized")
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        torch.cuda.current_stream().wait_stream(self.copy_stream)
-        with nvtx_range("optimized_rack_prep", enable=enable_nvtx):
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_event(self.copy_events[self.cur_slot])
+        with torch.inference_mode(), self._nvtx_range("optimized_rack_prep"):
             self.output = self.norm(self.device_buffers[self.cur_slot])
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
         self._last_slot = self.cur_slot
-        self._start_copy(self.cur_slot)
+        self._start_copy(self.cur_slot, wait_stream=current_stream)
         self.cur_slot, self.next_slot = self.next_slot, self.cur_slot
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output before verification")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "host_batch": self.host_buffers[self._last_slot],
                 "device_batch": self.device_buffers[self._last_slot],
             },
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.host_buffers[self._last_slot].shape[0],
-            parameter_count=sum(p.numel() for p in self.norm.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -161,7 +177,9 @@ class OptimizedRackPrepBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.device_buffers = []
         self.norm = None
         self.output = None
+        self._verify_output_buffer = None
         self.copy_stream = None
+        self.copy_events = []
         self._last_slot = 0
         super().teardown()
 

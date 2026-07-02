@@ -32,6 +32,7 @@ class OptimizedWorkQueueBenchmark(VerificationPayloadMixin, BaseBenchmark):
             tokens_per_iteration=float(self.N * self.iterations),
         )
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
     
     def setup(self) -> None:
         """Setup: Initialize tensors and load CUDA extension."""
@@ -43,7 +44,7 @@ class OptimizedWorkQueueBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
         self.input_data = torch.linspace(0.0, 1.0, self.N, dtype=torch.float32, device=self.device)
-        self.output_data = torch.zeros(self.N, dtype=torch.float32, device=self.device)
+        self.output_data = torch.empty(self.N, dtype=torch.float32, device=self.device)
         torch.cuda.synchronize(self.device)
         self._extension.dynamic_work_queue(self.input_data, self.output_data, 1)
         torch.cuda.synchronize()
@@ -51,29 +52,26 @@ class OptimizedWorkQueueBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
         self.input_data = torch.linspace(0.0, 1.0, self.N, dtype=torch.float32, device=self.device)
-        self.output_data = torch.zeros(self.N, dtype=torch.float32, device=self.device)
+        self.output_data = torch.empty(self.N, dtype=torch.float32, device=self.device)
         self._verify_input = self.input_data.detach().clone()
+        self._verify_output_buffer = torch.empty_like(self.output_data)
         torch.cuda.synchronize()
     
     def benchmark_fn(self) -> None:
         """Benchmark: Dynamic work queue with atomics."""
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-
-        with nvtx_range("work_queue", enable=enable_nvtx):
+        with torch.inference_mode(), self._nvtx_range("work_queue"):
             # Call CUDA extension with dynamic work queue
             self._extension.dynamic_work_queue(self.input_data, self.output_data, self.iterations)
         if self._verify_input is None or self.output_data is None:
             raise RuntimeError("Verification input/output not initialized")
 
     def capture_verification_payload(self) -> None:
+        if self.output_data is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must produce output for verification")
+        self._verify_output_buffer.copy_(self.output_data)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output_data.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=0,
             precision_flags={
@@ -90,6 +88,8 @@ class OptimizedWorkQueueBenchmark(VerificationPayloadMixin, BaseBenchmark):
         """Teardown: Clean up resources."""
         self.input_data = None
         self.output_data = None
+        self._verify_input = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:

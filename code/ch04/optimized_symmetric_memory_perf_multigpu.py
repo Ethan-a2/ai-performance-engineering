@@ -6,26 +6,25 @@ Demonstrates the uplift from using direct GPU-to-GPU memory access vs NCCL colle
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import datetime
 import os
-
-from core.common.device_utils import resolve_local_rank
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
+from ch04.symmetric_memory_perf_common import build_square_verification_probe
+from core.benchmark.cuda_event_timing import max_elapsed_ms
+from core.benchmark.metrics import compute_memory_transfer_metrics
+from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.common.device_utils import resolve_local_rank
 from core.harness.benchmark_harness import (
     BaseBenchmark,
     BenchmarkConfig,
     LaunchVia,
     TorchrunLaunchSpec,
 )
-from core.benchmark.cuda_event_timing import max_elapsed_ms
-from core.benchmark.metrics import compute_memory_transfer_metrics
-from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.optimization.symmetric_memory_patch import (
     SymmetricMemoryHandle,
     create_symmetric_memory_handle,
@@ -77,10 +76,18 @@ class OptimizedSymmetricMemoryPerfBenchmark(VerificationPayloadMixin, BaseBenchm
         self._last_gbps = 0.0
         self._bytes_transferred = 0.0
         self._inner_iterations = 2000
-        self._pending_timing_pairs: List[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._inner_iteration_range = range(self._inner_iterations)
+        self._timing_pairs: List[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._empty_timing_pairs: List[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._pending_timing_pairs: List[tuple[torch.cuda.Event, torch.cuda.Event]] = self._empty_timing_pairs
+        self._stream_timing_pairs: List[tuple[torch.cuda.Stream, tuple[torch.cuda.Event, torch.cuda.Event]]] = []
+        self._timing_pair_count = 0
+        self._stream_timing_pair_count = 0
         self.register_workload_metadata(requests_per_iteration=1.0)
         self._verify_input: Optional[torch.Tensor] = None
         self._verify_output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._verify_numel = 0
         self._local_buffer: Optional[torch.Tensor] = None
         self._peer_buffer: Optional[torch.Tensor] = None
         self._prev_buffer: Optional[torch.Tensor] = None
@@ -114,11 +121,24 @@ class OptimizedSymmetricMemoryPerfBenchmark(VerificationPayloadMixin, BaseBenchm
         self._peer_buffer = self.handle.get_buffer(self.peer_rank)
         self._prev_buffer = self.handle.get_buffer((self.rank - 1) % self.world_size)
         self._recv_buffer = torch.empty_like(self._local_buffer)
+        self._verify_input, self._verify_numel = build_square_verification_probe(self._local_buffer)
+        self._verify_output_buffer = torch.empty_like(self._verify_input, dtype=torch.float32)
         if self._copy_streams is None:
             self._copy_streams = (
                 torch.cuda.Stream(device=device),
                 torch.cuda.Stream(device=device),
             )
+        self._timing_pairs = [
+            (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            for _ in range(2)
+        ]
+        self._stream_timing_pairs = list(zip(self._copy_streams, self._timing_pairs, strict=True))
+        self._timing_pair_count = len(self._timing_pairs)
+        self._stream_timing_pair_count = len(self._stream_timing_pairs)
+        self._inner_iteration_range = range(self._inner_iterations)
         
         torch.cuda.synchronize()
 
@@ -132,28 +152,27 @@ class OptimizedSymmetricMemoryPerfBenchmark(VerificationPayloadMixin, BaseBenchm
         ):
             raise RuntimeError("Tensors not initialized")
 
-        timing_pairs: List[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-        if self._copy_streams is None:
-            self._copy_streams = (
-                torch.cuda.Stream(device=self.device),
-                torch.cuda.Stream(device=self.device),
-            )
+        timing_pairs = self._timing_pairs
+        if (
+            self._copy_streams is None
+            or self._timing_pair_count < 2
+            or self._stream_timing_pair_count < 2
+        ):
+            raise RuntimeError("Timing events not initialized")
         send_stream, recv_stream = self._copy_streams
-        send_stream.wait_stream(torch.cuda.current_stream())
-        recv_stream.wait_stream(torch.cuda.current_stream())
-        for stream in (send_stream, recv_stream):
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream()
+        send_stream.wait_stream(current_stream)
+        recv_stream.wait_stream(current_stream)
+        for stream, (start_event, _) in self._stream_timing_pairs:
             with torch.cuda.stream(stream):
                 start_event.record()
-            timing_pairs.append((start_event, end_event))
-        for _ in range(self._inner_iterations):
+        for _ in self._inner_iteration_range:
             with torch.cuda.stream(send_stream):
                 self._peer_buffer.copy_(self._local_buffer, non_blocking=True)
             with torch.cuda.stream(recv_stream):
                 self._recv_buffer.copy_(self._prev_buffer, non_blocking=True)
-        torch.cuda.current_stream().wait_stream(send_stream)
-        torch.cuda.current_stream().wait_stream(recv_stream)
+        current_stream.wait_stream(send_stream)
+        current_stream.wait_stream(recv_stream)
         with torch.cuda.stream(send_stream):
             timing_pairs[0][1].record()
         with torch.cuda.stream(recv_stream):
@@ -166,7 +185,7 @@ class OptimizedSymmetricMemoryPerfBenchmark(VerificationPayloadMixin, BaseBenchm
         if not self._pending_timing_pairs:
             return None
         elapsed_ms_value = max_elapsed_ms(self._pending_timing_pairs)
-        self._pending_timing_pairs = []
+        self._pending_timing_pairs = self._empty_timing_pairs
         bytes_per_iter = self.size_mb * 1024 * 1024 * 2
         bytes_moved = bytes_per_iter * self._inner_iterations
         gbps = (bytes_moved / (elapsed_ms_value / 1000.0)) / 1e9 if elapsed_ms_value > 0 else 0.0
@@ -177,22 +196,18 @@ class OptimizedSymmetricMemoryPerfBenchmark(VerificationPayloadMixin, BaseBenchm
 
     def capture_verification_payload(self) -> None:
         self.finalize_iteration_metrics()
-        if self._local_buffer is None:
-            if self._verify_input is None:
-                torch.manual_seed(42)
-                torch.cuda.manual_seed_all(42)
-                self._verify_input = torch.randn(256, 256, device=self.device, dtype=torch.float32)
-            probe = self._verify_input
-            output = probe.detach().clone()
+        if self._verify_input is None or self._verify_output_buffer is None:
+            raise RuntimeError("Verification buffers not initialized")
+        probe = self._verify_input
+        if self._verify_output is not None:
+            output_source = self._verify_output[: self._verify_numel].view_as(self._verify_input).detach()
         else:
-            probe = self._local_buffer[: 256 * 256].view(256, 256)
-            if self._verify_output is not None:
-                output = self._verify_output[: 256 * 256].view(256, 256).detach().clone()
-            else:
-                output = probe.detach().clone()
+            output_source = probe
+        self._verify_output_buffer.copy_(output_source)
+
         self._set_verification_payload(
             inputs={"tensor": probe},
-            output=output,
+            output=self._verify_output_buffer,
             batch_size=int(probe.shape[0]),
             parameter_count=0,
             precision_flags={
@@ -225,7 +240,13 @@ class OptimizedSymmetricMemoryPerfBenchmark(VerificationPayloadMixin, BaseBenchm
         self._copy_streams = None
         self._buffer_events = None
         self._buffer_inflight = None
+        self._timing_pairs = []
+        self._pending_timing_pairs = self._empty_timing_pairs
+        self._stream_timing_pairs = []
+        self._timing_pair_count = 0
+        self._stream_timing_pair_count = 0
         self._verify_output = None
+        self._verify_output_buffer = None
         self._local_buffer = None
         self._peer_buffer = None
         self._prev_buffer = None
@@ -282,5 +303,3 @@ class OptimizedSymmetricMemoryPerfBenchmark(VerificationPayloadMixin, BaseBenchm
 def get_benchmark() -> BaseBenchmark:
     """Factory function for harness discovery."""
     return OptimizedSymmetricMemoryPerfBenchmark(size_mb=0.0625)
-
-

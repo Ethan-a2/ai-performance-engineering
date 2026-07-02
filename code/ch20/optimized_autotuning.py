@@ -34,7 +34,9 @@ class OptimizedAutotuningBenchmark(VerificationPayloadMixin, BaseBenchmark):
             tokens_per_iteration=float(tokens),
         )
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
 
     def setup(self) -> None:
         torch.manual_seed(42)
@@ -47,34 +49,41 @@ class OptimizedAutotuningBenchmark(VerificationPayloadMixin, BaseBenchmark):
             fullgraph=True,
             dynamic=False,
         )
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         self.inputs = torch.randn(self.batch, self.hidden_dim, device=self.device, dtype=torch.bfloat16)
         self._verify_input = self.inputs[0:1].clone()
+        self._verify_output_buffer = torch.empty_like(self._verify_input, dtype=torch.float32)
         for _ in range(AUTOTUNING_SETUP_PREWARM_ITERS):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self.inputs)
 
     def benchmark_fn(self) -> None:
         assert self.model is not None and self.inputs is not None
         with self._nvtx_range("optimized_autotuning"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self.inputs)
 
     def capture_verification_payload(self) -> None:
-        if self._verify_input is None or self.model is None:
+        if self._verify_input is None or self.model is None or self._verify_output_buffer is None:
             raise RuntimeError("setup() must prepare verify input before verification")
-        with torch.no_grad():
-            self.output = self.model(self._verify_input).float().clone()
+        with torch.inference_mode():
+            verify_output = self.model(self._verify_input)
+            self._verify_output_buffer.copy_(verify_output)
+            self.output = self._verify_output_buffer
         self._set_verification_payload(
             inputs={"verify_input": self._verify_input},
             output=self.output,
             batch_size=int(self._verify_input.shape[0]),
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(0.1, 1.0),
         )
 
     def teardown(self) -> None:
         self.model = None
         self.inputs = None
+        self._verify_input = None
+        self._verify_output_buffer = None
+        self.output = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

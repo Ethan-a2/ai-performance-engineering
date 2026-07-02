@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from time import perf_counter
 from pathlib import Path
+from time import perf_counter
 
 import torch
 import torch.distributed as dist
@@ -12,8 +12,8 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from core.benchmark.gpu_requirements import require_min_gpus
-from labs.train_distributed.training_utils.utils import get
 from labs.train_distributed.training_utils.torchrun_harness import TorchrunScriptBenchmark
+from labs.train_distributed.training_utils.utils import get
 
 
 def parse_args():
@@ -52,7 +52,7 @@ def main():
     model = _build_model(args.hidden_size, device)
     extra_param = None
     if args.extra_grad_mb > 0:
-        elem_bytes = torch.tensor([], dtype=torch.bfloat16).element_size()
+        elem_bytes = torch.finfo(torch.bfloat16).bits // 8
         numel = (args.extra_grad_mb * 1024 * 1024) // elem_bytes
         extra_param = torch.nn.Parameter(torch.zeros(numel, device=device, dtype=torch.bfloat16))
         model.register_parameter("extra_grad_payload", extra_param)
@@ -70,11 +70,13 @@ def main():
         weight_decay=0.05,
     )
 
-    warm_x = torch.randn(args.batch_size, args.hidden_size, device=device)
-    warm_y = torch.randn_like(warm_x)
+    x = torch.empty(args.batch_size, args.hidden_size, device=device)
+    y = torch.empty_like(x)
+    x.normal_()
+    y.normal_()
     optimizer.zero_grad(set_to_none=True)
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        warm_loss = nn.functional.mse_loss(ddp_model(warm_x), warm_y)
+        warm_loss = nn.functional.mse_loss(ddp_model(x), y)
     if extra_param is not None:
         warm_loss = warm_loss + extra_param.sum() * 0.0
     warm_loss.backward()
@@ -83,12 +85,13 @@ def main():
     torch.cuda.synchronize(device)
 
     total_tokens = 0
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
     start = perf_counter()
 
     for step in range(args.steps):
         optimizer.zero_grad(set_to_none=True)
-        x = torch.randn(args.batch_size, args.hidden_size, device=device)
-        y = torch.randn_like(x)
+        x.normal_()
+        y.normal_()
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             loss = nn.functional.mse_loss(ddp_model(x), y)
         if extra_param is not None:
@@ -98,8 +101,10 @@ def main():
         total_tokens += x.numel()
 
         if rank == 0 and step % 10 == 0:
+            loss_value_buffer[0].copy_(loss.detach())
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
             print(
-                f"[baseline-zero2] step {step}/{args.steps} loss={loss.item():.4f} "
+                f"[baseline-zero2] step {step}/{args.steps} loss={loss_value:.4f} "
                 f"tokens/step={x.numel():,}"
             )
 

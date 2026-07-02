@@ -20,6 +20,7 @@ from core.harness.benchmark_harness import (  # noqa: E402
     WorkloadMetadata,
 )
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 
 class BaselineDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -42,6 +43,8 @@ class BaselineDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.batch_size = 2
         self.prefill_len = 512
         self.hidden_dim = 256
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
         tokens = self.batch_size * (self.prefill_len + 1)  # include decode token
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
@@ -74,13 +77,16 @@ class BaselineDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         # This baseline does not separate prefill and decode phases
         self.model = nn.Sequential(
             nn.Linear(256, 512),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(512, 256),
         )
         self.model = self.model.to(self.device).eval()
         
         if self.is_distributed:
             self.model = nn.parallel.DistributedDataParallel(self.model)
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters()) * 2
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         
         # Simulate prefill (long context) and decode (single token) inputs
         self.prefill_input = torch.randn(self.batch_size, self.prefill_len, self.hidden_dim, device=self.device)
@@ -89,15 +95,8 @@ class BaselineDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
     
     def benchmark_fn(self) -> None:
         """Benchmark: Monolithic inference."""
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-
-        with nvtx_range("baseline_disaggregated_multigpu", enable=enable_nvtx):
-            with torch.no_grad():
+        with nvtx_range("baseline_disaggregated_multigpu", enable=self._enable_nvtx):
+            with torch.inference_mode():
                 # Baseline: Monolithic inference
                 # Prefill and decode phases share same resources across GPUs
                 # This causes interference - prefill blocks decode and vice versa
@@ -118,7 +117,7 @@ class BaselineDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 if self.is_distributed:
                     dist.all_reduce(decode_output, op=dist.ReduceOp.SUM)
                     decode_output = decode_output / self.world_size
-                self.output = decode_output.detach()
+                self.output = decode_output
                 
             # Baseline: No separation - both phases interfere with each other
                 # This leads to poor GPU utilization and latency spikes
@@ -126,13 +125,11 @@ class BaselineDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def capture_verification_payload(self) -> None:
         if self.prefill_input is None or self.decode_input is None or self.output is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        param_count = sum(p.numel() for p in self.model.parameters()) if self.model is not None else 0
-        param_count *= 2
         self._set_verification_payload(
             inputs={"prefill": self.prefill_input, "decode": self.decode_input},
             output=self.output.to(dtype=torch.float32),
             batch_size=int(self.batch_size),
-            parameter_count=param_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,

@@ -129,6 +129,8 @@ def load_custom_cuda_nvfp4_group_gemm(*, verbose: bool = False) -> object:
         "-lineinfo",
         "-gencode=arch=compute_100a,code=sm_100a",
         "-gencode=arch=compute_100a,code=compute_100a",
+        "-gencode=arch=compute_103a,code=sm_103a",
+        "-gencode=arch=compute_103a,code=compute_103a",
     ]
     # Compile-time tuning knobs (kept explicit to avoid global default drift).
     # These control constexprs in `custom_cuda_group_gemm_kernel.cu`; compile-config hashing in
@@ -368,11 +370,11 @@ def _pack_scale_tiles_for_tcgen05(
     n_tiles = int(sfb_inv_u8.size(0))
     k_tiles = (k_scales + 15) // 16
 
-    sfa_tiles = torch.zeros((m_tiles, k_tiles, 128, 16), dtype=torch.uint8, device=device)
+    sfa_tiles = torch.empty((m_tiles, k_tiles, 128, 16), dtype=torch.uint8, device=device)
     if sfb_k_major:
-        sfb_tiles = torch.zeros((k_tiles, n_tiles, 128, 16), dtype=torch.uint8, device=device)
+        sfb_tiles = torch.empty((k_tiles, n_tiles, 128, 16), dtype=torch.uint8, device=device)
     else:
-        sfb_tiles = torch.zeros((n_tiles, k_tiles, 128, 16), dtype=torch.uint8, device=device)
+        sfb_tiles = torch.empty((n_tiles, k_tiles, 128, 16), dtype=torch.uint8, device=device)
 
     if sfa_inv_u8.device != sfb_inv_u8.device:
         raise ValueError("Expected SFA/SFB scales to be on the same device")
@@ -399,6 +401,7 @@ def _pack_scale_tiles_for_tcgen05(
         16, device=device, dtype=torch.int32
     ).view(1, -1)
     scale_valid = (scale_idx < int(k_scales)).view(k_tiles, 4, 4).to(torch.uint8)  # 1 if scale exists else 0
+    src = torch.empty((4, 32, 4, 4), dtype=torch.uint8, device=device)
 
     for mt in range(m_tiles):
         valid_m = max(0, min(128, m - mt * 128))
@@ -406,9 +409,10 @@ def _pack_scale_tiles_for_tcgen05(
         for kt in range(k_tiles):
             kk_base = kt * 4
             seg_avail = max(0, min(4, kk_blocks - kk_base))
-            src = torch.zeros((4, 32, 4, 4), dtype=torch.uint8, device=device)
             if seg_avail:
                 src[:seg_avail].copy_(sfa_inv_u8[mt, kk_base : kk_base + seg_avail])
+            if seg_avail < 4:
+                src[seg_avail:].zero_()
 
             # Zero out invalid rows/cols in the MN tile.
             src *= m_mask.view(1, 32, 4, 1)
@@ -424,9 +428,10 @@ def _pack_scale_tiles_for_tcgen05(
         for kt in range(k_tiles):
             kk_base = kt * 4
             seg_avail = max(0, min(4, kk_blocks - kk_base))
-            src = torch.zeros((4, 32, 4, 4), dtype=torch.uint8, device=device)
             if seg_avail:
                 src[:seg_avail].copy_(sfb_inv_u8[nt, kk_base : kk_base + seg_avail])
+            if seg_avail < 4:
+                src[seg_avail:].zero_()
 
             src *= n_mask.view(1, 32, 4, 1)
             src *= scale_valid[kt].view(4, 1, 1, 4)
@@ -438,6 +443,37 @@ def _pack_scale_tiles_for_tcgen05(
                 sfb_tiles[nt, kt].copy_(src.contiguous().reshape(128, 16))
 
     return sfa_tiles.contiguous(), sfb_tiles.contiguous()
+
+
+def _fuse_grouped_ctx_tensor(grouped_ctxs: Sequence[dict[str, Any]], key: str) -> torch.Tensor:
+    first = grouped_ctxs[0][key]
+    total_rows = sum(int(ctx[key].shape[0]) for ctx in grouped_ctxs)
+    fused = first.new_empty((total_rows, *first.shape[1:]))
+    offset = 0
+    for grouped_ctx in grouped_ctxs:
+        tensor = grouped_ctx[key]
+        next_offset = offset + int(tensor.shape[0])
+        fused[offset:next_offset].copy_(tensor)
+        offset = next_offset
+    return fused
+
+
+def _fuse_cta_group_idx_map(grouped_ctxs: Sequence[dict[str, Any]]) -> torch.Tensor:
+    first = grouped_ctxs[0]["cta_group_idx_map"]
+    total_rows = sum(int(ctx["cta_group_idx_map"].shape[0]) for ctx in grouped_ctxs)
+    fused = first.new_empty((total_rows, *first.shape[1:]))
+    row_offset = 0
+    group_offset = 0
+    for grouped_ctx in grouped_ctxs:
+        cta_group_idx_map = grouped_ctx["cta_group_idx_map"]
+        next_row_offset = row_offset + int(cta_group_idx_map.shape[0])
+        fused_slice = fused[row_offset:next_row_offset]
+        fused_slice.copy_(cta_group_idx_map)
+        if group_offset:
+            fused_slice.add_(int(group_offset))
+        row_offset = next_row_offset
+        group_offset += int(grouped_ctx["a_ptrs"].numel())
+    return fused
 
 
 def prepare_custom_cuda(data_list: Sequence[input_t]) -> Optional[Sequence[tuple[Any, ...]]]:
@@ -487,7 +523,7 @@ def prepare_custom_cuda(data_list: Sequence[input_t]) -> Optional[Sequence[tuple
         # Extra B padding is not required for our current cta_group::2 bring-up modes.
         extra_b_rows = 0
 
-        for (a, b, c), (sfa_cpu, sfb_cpu), (sfa_reordered, sfb_reordered) in zip(
+        for (a, b, c), (sfa_cpu, _sfb_cpu), (sfa_reordered, sfb_reordered) in zip(
             abc_tensors, sfasfb_tensors, sfasfb_reordered_tensors
         ):
             if a.dim() != 3 or b.dim() != 3 or c.dim() != 3:
@@ -523,10 +559,14 @@ def prepare_custom_cuda(data_list: Sequence[input_t]) -> Optional[Sequence[tuple
                 n_padded_sf = ((n + 127) // 128) * 128
             n_padded_ab = n_padded_sf + extra_b_rows
 
-            a_pad = torch.zeros((m_padded, k_bytes), dtype=torch.uint8, device="cuda")
+            a_pad = torch.empty((m_padded, k_bytes), dtype=torch.uint8, device="cuda")
             a_pad[:m, :].copy_(a_u8)
-            b_pad = torch.zeros((n_padded_ab, k_bytes), dtype=torch.uint8, device="cuda")
+            if m_padded > m:
+                a_pad[m:, :].zero_()
+            b_pad = torch.empty((n_padded_ab, k_bytes), dtype=torch.uint8, device="cuda")
             b_pad[:n, :].copy_(b_u8)
+            if n_padded_ab > n:
+                b_pad[n:, :].zero_()
 
             # Scale factors: use the GPU MODE-reordered float8 tensors, but invert the permute
             # to get a contiguous rank-5 layout [mm, kk, 32, 4, 4] (l=1 dropped).
@@ -552,8 +592,9 @@ def prepare_custom_cuda(data_list: Sequence[input_t]) -> Optional[Sequence[tuple
             if m_tiles_tma < m_tiles_actual:
                 raise ValueError("Internal error: padded m_tiles is smaller than reordered tensor tiles")
             if m_tiles_tma != m_tiles_actual:
-                padded = torch.zeros((m_tiles_tma,) + tuple(sfa_inv_u8.shape[1:]), dtype=torch.uint8, device="cuda")
+                padded = torch.empty((m_tiles_tma,) + tuple(sfa_inv_u8.shape[1:]), dtype=torch.uint8, device="cuda")
                 padded[:m_tiles_actual].copy_(sfa_inv_u8)
+                padded[m_tiles_actual:].zero_()
                 sfa_inv_u8 = padded
 
             # Likewise, pad SFB's tile dimension so its tensormap height (based on padded N) matches
@@ -564,8 +605,9 @@ def prepare_custom_cuda(data_list: Sequence[input_t]) -> Optional[Sequence[tuple
             if n_tiles_tma < n_tiles_actual:
                 raise ValueError("Internal error: padded n_tiles is smaller than reordered tensor tiles")
             if n_tiles_tma != n_tiles_actual:
-                padded = torch.zeros((n_tiles_tma,) + tuple(sfb_inv_u8.shape[1:]), dtype=torch.uint8, device="cuda")
+                padded = torch.empty((n_tiles_tma,) + tuple(sfb_inv_u8.shape[1:]), dtype=torch.uint8, device="cuda")
                 padded[:n_tiles_actual].copy_(sfb_inv_u8)
+                padded[n_tiles_actual:].zero_()
                 sfb_inv_u8 = padded
 
             # For UnrollN=2 we keep K-major SFB packing so adjacent N tiles are contiguous
@@ -748,16 +790,11 @@ def prepare_custom_cuda(data_list: Sequence[input_t]) -> Optional[Sequence[tuple
             "cta_tile_n_map",
         )
         fused_grouped_ctx: dict[str, torch.Tensor | int] = {
-            key: torch.cat([ctx[key] for ctx in grouped_ctxs], dim=0).contiguous() for key in cat_keys
+            key: _fuse_grouped_ctx_tensor(grouped_ctxs, key) for key in cat_keys
         }
 
         # CTA->group map must be offset per input so each CTA points at the correct flattened group.
-        cta_group_idx_parts: list[torch.Tensor] = []
-        group_offset = 0
-        for grouped_ctx in grouped_ctxs:
-            cta_group_idx_parts.append(grouped_ctx["cta_group_idx_map"] + int(group_offset))
-            group_offset += int(grouped_ctx["a_ptrs"].numel())
-        fused_grouped_ctx["cta_group_idx_map"] = torch.cat(cta_group_idx_parts, dim=0).contiguous()
+        fused_grouped_ctx["cta_group_idx_map"] = _fuse_cta_group_idx_map(grouped_ctxs)
         fused_grouped_ctx["max_m"] = int(max(int(ctx["max_m"]) for ctx in grouped_ctxs))
         fused_grouped_ctx["max_n"] = int(max(int(ctx["max_n"]) for ctx in grouped_ctxs))
 

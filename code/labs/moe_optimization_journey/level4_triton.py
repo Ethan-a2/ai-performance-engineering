@@ -14,7 +14,6 @@ Expected speedup: 1.2-1.5x over Level 2
 
 from __future__ import annotations
 
-import time
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -32,7 +31,6 @@ except ImportError:
 
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
 from labs.moe_optimization_journey import MoEConfig, get_config
-
 
 if TRITON_AVAILABLE:
     @triton.autotune(
@@ -119,9 +117,108 @@ class GroupedMoEExperts(nn.Module):
         self.w1 = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
         self.w2 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
         self.w3 = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
+        self._expert_metadata_workspace: Optional[torch.Tensor] = None
+        self._expert_metadata_host: Optional[torch.Tensor] = None
+        self._sorted_output_buffer: Optional[torch.Tensor] = None
+        self._unsorted_output_buffer: Optional[torch.Tensor] = None
+        self._sorted_token_ids_buffer: Optional[torch.Tensor] = None
+        self._sorted_expert_ids_buffer: Optional[torch.Tensor] = None
+        self._sorted_x_buffer: Optional[torch.Tensor] = None
+        self._sorted_weight_buffer: Optional[torch.Tensor] = None
+        self._route_token_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+        self._sorted_weight_column_cache: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
         
         for w in [self.w1, self.w2, self.w3]:
             nn.init.kaiming_uniform_(w)
+
+    def _expert_metadata_buffers(self, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self._expert_metadata_workspace is None
+            or self._expert_metadata_workspace.device != device
+        ):
+            self._expert_metadata_workspace = torch.empty(
+                (2, self.num_experts),
+                dtype=torch.long,
+                device=device,
+            )
+            self._expert_metadata_host = torch.empty(
+                (2, self.num_experts),
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=device.type == "cuda",
+            )
+        assert self._expert_metadata_host is not None
+        return self._expert_metadata_workspace, self._expert_metadata_host
+
+    def _workspace(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        shape = tuple(int(dim) for dim in shape)
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        cached = getattr(self, name, None)
+        if (
+            not isinstance(cached, torch.Tensor)
+            or cached.device != device
+            or cached.dtype != dtype
+            or cached.numel() < numel
+        ):
+            cached = torch.empty(numel, device=device, dtype=dtype)
+            setattr(self, name, cached)
+        return cached[:numel].view(shape)
+
+    def _sorted_output_like(self, sorted_x: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled() and sorted_x.requires_grad:
+            return torch.empty_like(sorted_x)
+        shape = tuple(int(dim) for dim in sorted_x.shape)
+        numel = int(sorted_x.numel())
+        if (
+            self._sorted_output_buffer is None
+            or self._sorted_output_buffer.device != sorted_x.device
+            or self._sorted_output_buffer.dtype != sorted_x.dtype
+            or self._sorted_output_buffer.numel() < numel
+        ):
+            self._sorted_output_buffer = torch.empty(numel, device=sorted_x.device, dtype=sorted_x.dtype)
+        return self._sorted_output_buffer[:numel].view(shape)
+
+    def _unsorted_output_like(self, output: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled() and output.requires_grad:
+            return torch.empty_like(output)
+        shape = tuple(int(dim) for dim in output.shape)
+        numel = int(output.numel())
+        if (
+            self._unsorted_output_buffer is None
+            or self._unsorted_output_buffer.device != output.device
+            or self._unsorted_output_buffer.dtype != output.dtype
+            or self._unsorted_output_buffer.numel() < numel
+        ):
+            self._unsorted_output_buffer = torch.empty(numel, device=output.device, dtype=output.dtype)
+        return self._unsorted_output_buffer[:numel].view(shape)
+
+    def _sorted_weight_column(self, sorted_weights: torch.Tensor) -> torch.Tensor:
+        key = (int(sorted_weights.data_ptr()), int(sorted_weights.numel()), sorted_weights.device)
+        cached = self._sorted_weight_column_cache.get(key)
+        expected_shape = (int(sorted_weights.numel()), 1)
+        if cached is None or cached.device != sorted_weights.device or tuple(cached.shape) != expected_shape:
+            cached = sorted_weights.unsqueeze(-1)
+            self._sorted_weight_column_cache[key] = cached
+        return cached
+
+    def _route_token_ids(self, batch_seq: int, top_k: int, device: torch.device) -> torch.Tensor:
+        key = (int(batch_seq), int(top_k), str(device))
+        token_ids = self._route_token_cache.get(key)
+        if token_ids is None or token_ids.device != device:
+            token_ids = torch.arange(batch_seq * top_k, device=device, dtype=torch.int64)
+            if top_k != 1:
+                token_ids.div_(top_k, rounding_mode="floor")
+            self._route_token_cache[key] = token_ids
+        return token_ids
     
     def forward(
         self,
@@ -136,50 +233,101 @@ class GroupedMoEExperts(nn.Module):
         flat_indices = expert_indices.view(-1)  # [batch_seq * top_k]
         flat_weights = expert_weights.view(-1)  # [batch_seq * top_k]
         
-        # Expand input for all selected experts
-        x_repeated = x.unsqueeze(1).expand(-1, top_k, -1).reshape(-1, self.hidden_size)
-        
         # Sort tokens by expert for better memory coalescing
         sorted_indices = torch.argsort(flat_indices)
-        sorted_expert_ids = flat_indices[sorted_indices]
-        sorted_x = x_repeated[sorted_indices]
-        sorted_weights = flat_weights[sorted_indices]
+        route_token_ids = self._route_token_ids(batch_seq, top_k, x.device)
+        assignments = flat_indices.numel()
+        use_workspace = not (
+            torch.is_grad_enabled() and (x.requires_grad or expert_weights.requires_grad)
+        )
+        if use_workspace:
+            sorted_expert_ids = self._workspace(
+                "_sorted_expert_ids_buffer",
+                (assignments,),
+                device=flat_indices.device,
+                dtype=flat_indices.dtype,
+            )
+            torch.index_select(flat_indices, 0, sorted_indices, out=sorted_expert_ids)
+            sorted_token_ids = self._workspace(
+                "_sorted_token_ids_buffer",
+                (assignments,),
+                device=route_token_ids.device,
+                dtype=route_token_ids.dtype,
+            )
+            torch.index_select(route_token_ids, 0, sorted_indices, out=sorted_token_ids)
+            sorted_x = self._workspace(
+                "_sorted_x_buffer",
+                (assignments, self.hidden_size),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            torch.index_select(x, 0, sorted_token_ids, out=sorted_x)
+            sorted_weights = self._workspace(
+                "_sorted_weight_buffer",
+                (assignments,),
+                device=flat_weights.device,
+                dtype=flat_weights.dtype,
+            )
+            torch.index_select(flat_weights, 0, sorted_indices, out=sorted_weights)
+        else:
+            sorted_expert_ids = flat_indices[sorted_indices]
+            sorted_token_ids = route_token_ids.index_select(0, sorted_indices)
+            sorted_x = x.index_select(0, sorted_token_ids)
+            sorted_weights = flat_weights[sorted_indices]
         
         # Compute expert boundaries
         expert_counts = torch.bincount(sorted_expert_ids, minlength=self.num_experts)
-        expert_offsets = torch.cumsum(expert_counts, dim=0) - expert_counts
+        expert_metadata, expert_metadata_host = self._expert_metadata_buffers(expert_counts.device)
+        expert_offsets = expert_metadata[0]
+        torch.cumsum(expert_counts, dim=0, out=expert_offsets)
+        expert_offsets.sub_(expert_counts)
+        expert_metadata[1].copy_(expert_counts)
+        expert_metadata_host.copy_(expert_metadata, non_blocking=expert_counts.device.type == "cuda")
+        expert_offsets_cpu = expert_metadata_host[0]
+        expert_counts_cpu = expert_metadata_host[1]
         
         # Process each expert's tokens (grouped by expert for coalescing)
-        output = torch.zeros_like(sorted_x)
+        output = self._sorted_output_like(sorted_x)
         
         for expert_id in range(self.num_experts):
-            start = expert_offsets[expert_id].item()
-            count = expert_counts[expert_id].item()
+            count = int(expert_counts_cpu[expert_id])
             if count == 0:
                 continue
+            start = int(expert_offsets_cpu[expert_id])
             end = start + count
             
             expert_x = sorted_x[start:end]
             
             # SwiGLU: silu(x @ w1) * (x @ w3) @ w2
-            gate = F.silu(expert_x @ self.w1[expert_id])
+            gate = expert_x @ self.w1[expert_id]
+            F.silu(gate, inplace=True)
             up = expert_x @ self.w3[expert_id]
-            hidden = gate * up
-            expert_out = hidden @ self.w2[expert_id]
+            gate.mul_(up)
+            expert_out = gate @ self.w2[expert_id]
             
             output[start:end] = expert_out
         
         # Apply weights
-        output = output * sorted_weights.unsqueeze(-1)
+        if use_workspace:
+            sorted_weight_column = self._sorted_weight_column(sorted_weights)
+        else:
+            sorted_weight_column = sorted_weights.unsqueeze(-1)
+        output.mul_(sorted_weight_column)
         
-        # Unsort back to original order
-        unsort_indices = torch.argsort(sorted_indices)
-        output = output[unsort_indices]
+        # Unsort back to original order without launching a second argsort.
+        unsorted_output = self._unsorted_output_like(output)
+        unsorted_output.index_copy_(0, sorted_indices, output)
+        output = unsorted_output
         
-        # Sum over top-k experts
-        output = output.view(batch_seq, top_k, -1).sum(dim=1)
-        
-        return output
+        # Sum over top-k experts. In inference mode, reuse route slot 0 as the
+        # destination and avoid a separate generic reduction output.
+        output = output.view(batch_seq, top_k, -1)
+        if torch.is_grad_enabled() and output.requires_grad:
+            return output.sum(dim=1)
+        reduced = output[:, 0, :]
+        for route_idx in range(1, top_k):
+            reduced.add_(output[:, route_idx, :])
+        return reduced
 
 
 class TritonMoELayer(nn.Module):
@@ -201,9 +349,8 @@ class TritonMoELayer(nn.Module):
         
         # Route
         router_logits = self.gate(x_flat)
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        expert_weights, expert_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
+        top_logits, expert_indices = torch.topk(router_logits.float(), self.top_k, dim=-1)
+        expert_weights = F.softmax(top_logits, dim=-1)
         expert_weights = expert_weights.to(x.dtype)
         
         # Compute
@@ -270,9 +417,15 @@ class Level4Triton(VerificationPayloadMixin, BaseBenchmark):
         self.model: Optional[Any] = None
         self.input_ids: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         self.last_latency_ms: float = 0.0
         self.last_tokens_per_sec: float = 0.0
+        self._iteration_metrics: Dict[str, float] = {
+            "latency_ms": 0.0,
+            "tokens_per_sec": 0.0,
+        }
+        self._timing_events: Optional[Tuple[torch.cuda.Event, torch.cuda.Event]] = None
         self._pending_events: Optional[Tuple[torch.cuda.Event, torch.cuda.Event]] = None
         
         total_tokens = self.config.batch_size * self.config.seq_len
@@ -312,28 +465,45 @@ class Level4Triton(VerificationPayloadMixin, BaseBenchmark):
             (self.config.batch_size, self.config.seq_len),
             device=self.device,
         )
+        self._verify_output_buffer = torch.empty(
+            (self.config.batch_size, 1, min(8, self.config.vocab_size)),
+            device=self.device,
+            dtype=torch.float32,
+        )
         
         print("\nWarmup (compilation happens here)...")
         for i in range(self.config.warmup_iterations + 2):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self.input_ids)
             if i == 0:
                 print(f"    First run (compile): done")
         torch.cuda.synchronize()
+        self._timing_events = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         print("Ready")
+
+    def _get_timing_events(self) -> Tuple[torch.cuda.Event, torch.cuda.Event]:
+        if self._timing_events is None:
+            self._timing_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        return self._timing_events
     
     def benchmark_fn(self) -> None:
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
+        events = self._get_timing_events()
+        start_event, end_event = events
+        current_stream = torch.cuda.current_stream(self.device)
+        start_event.record(current_stream)
         
         with self._nvtx_range("level4_triton"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits = self.model(self.input_ids)
-        self.output = logits[:, :1, : min(8, logits.shape[-1])].detach().float().clone()
-        
-        end_event.record()
-        self._pending_events = (start_event, end_event)
+        end_event.record(current_stream)
+        self.output = logits
+        self._pending_events = events
         if self.input_ids is None or self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
@@ -345,15 +515,23 @@ class Level4Triton(VerificationPayloadMixin, BaseBenchmark):
         self.last_latency_ms = start_event.elapsed_time(end_event)
         total_tokens = self.config.batch_size * self.config.seq_len
         self.last_tokens_per_sec = total_tokens / max(self.last_latency_ms / 1000.0, 1e-9)
-        return {
-            "latency_ms": float(self.last_latency_ms),
-            "tokens_per_sec": float(self.last_tokens_per_sec),
-        }
+        metrics = self._iteration_metrics
+        metrics["latency_ms"] = float(self.last_latency_ms)
+        metrics["tokens_per_sec"] = float(self.last_tokens_per_sec)
+        return metrics
 
     def capture_verification_payload(self) -> None:
+        if self.input_ids is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input_ids": self.input_ids.detach()},
-            output=self.output,
+            output=self._verify_output_buffer,
             batch_size=self.config.batch_size,
             parameter_count=self.parameter_count,
             precision_flags={"bf16": True, "tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -364,6 +542,10 @@ class Level4Triton(VerificationPayloadMixin, BaseBenchmark):
         del self.model
         self.model = None
         self.input_ids = None
+        self.output = None
+        self._verify_output_buffer = None
+        self._timing_events = None
+        self._pending_events = None
         torch.cuda.empty_cache()
         super().teardown()
     
@@ -388,4 +570,3 @@ class Level4Triton(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return Level4Triton()
-

@@ -32,6 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from core.benchmark.utils import scalar_tensor_to_float
 from core.harness.arch_config import prefer_flash_sdpa
 
 import torch
@@ -114,10 +115,19 @@ class FP8Linear(nn.Module):
             "weight_scale",
             torch.zeros(out_features, 1, dtype=torch.float32, device=device),
         )
+        self.register_buffer(
+            "weight_scale_t",
+            torch.zeros(1, out_features, dtype=torch.float32, device=device),
+        )
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features, dtype=dtype, device=device), requires_grad=False)
+            self.register_buffer(
+                "bias_bf16",
+                torch.zeros(out_features, dtype=torch.bfloat16, device=device),
+            )
         else:
             self.register_parameter("bias", None)
+            self.register_buffer("bias_bf16", None)
 
     @staticmethod
     def _quantize_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -139,14 +149,17 @@ class FP8Linear(nn.Module):
         )
         fp8_weight, scale = cls._quantize_weight(linear.weight.detach().to(dtype))
         module.weight_fp8.copy_(fp8_weight)
-        module.weight_scale.copy_(scale.to(torch.float32))
+        weight_scale = scale.to(torch.float32)
+        module.weight_scale.copy_(weight_scale)
+        module.weight_scale_t.copy_(weight_scale.transpose(0, 1).contiguous())
         if linear.bias is not None and module.bias is not None:
             module.bias.data.copy_(linear.bias.detach().to(dtype))
+            module.bias_bf16.copy_(module.bias.detach().to(torch.bfloat16))
         return module
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
-        x2d = x.reshape(-1, self.in_features).contiguous()
+        x2d = x.reshape(-1, self.in_features)
 
         # Row-wise activation scaling
         act_abs = x2d.abs().amax(dim=1, keepdim=True)
@@ -154,17 +167,15 @@ class FP8Linear(nn.Module):
         x_fp8 = (x2d / act_scale.to(x.dtype)).clamp_(-448, 448).to(torch.float8_e4m3fn)
 
         # Column-wise weight scaling (already stored)
-        weight_scale = self.weight_scale.transpose(0, 1).contiguous()  # shape (1, out_features)
+        weight_scale = self.weight_scale_t  # shape (1, out_features)
         mat2 = self.weight_fp8.transpose(0, 1)  # shape (in_features, out_features)
 
-        bias = None
-        if self.bias is not None:
-            bias = self.bias.to(torch.bfloat16)
+        bias = self.bias_bf16 if self.bias_bf16 is not None else None
 
         out = torch._scaled_mm(
             x_fp8,
             mat2,
-            act_scale.contiguous(),
+            act_scale,
             weight_scale,
             bias=bias,
             out_dtype=torch.bfloat16,
@@ -205,6 +216,7 @@ class MultiheadAttentionBackend(nn.Module):
         self.attention_window = config.attention_window
         self.qkv = nn.Linear(config.d_model, 3 * config.d_model)
         self.out_proj = nn.Linear(config.d_model, config.d_model)
+        self._block_mask_cache = {}
 
     def _effective_backend(self, x: torch.Tensor) -> str:
         backend = self.backend
@@ -219,29 +231,39 @@ class MultiheadAttentionBackend(nn.Module):
                 backend = "sdpa"
         return backend
 
+    def _window_mask_fn(self, _b, _h, q_idx, kv_idx):
+        window = self.attention_window
+        causal = kv_idx <= q_idx
+        if window is not None:
+            in_window = (q_idx - kv_idx) < window
+            return causal & in_window
+        return causal
+
     def _window_mask(self, batch: int, q_len: int, kv_len: int, device: torch.device):
         if create_block_mask is None:
             return None
 
-        window = self.attention_window
-
-        def mask_fn(_b, _h, q_idx, kv_idx):
-            # Use tensor operations to avoid data-dependent control flow
-            # Causal mask: kv_idx <= q_idx
-            causal = kv_idx <= q_idx
-            if window is not None:
-                # Sliding window: (q_idx - kv_idx) < window
-                in_window = (q_idx - kv_idx) < window
-                return causal & in_window
-            return causal
-
-        return create_block_mask(mask_fn, B=batch, H=self.n_heads, Q_LEN=q_len, KV_LEN=kv_len, device=device)
+        cache_key = (int(batch), int(self.n_heads), int(q_len), int(kv_len), device, self.attention_window)
+        block_mask = self._block_mask_cache.get(cache_key)
+        if block_mask is None:
+            block_mask = create_block_mask(
+                self._window_mask_fn,
+                B=batch,
+                H=self.n_heads,
+                Q_LEN=q_len,
+                KV_LEN=kv_len,
+                device=device,
+            )
+            self._block_mask_cache[cache_key] = block_mask
+        return block_mask
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         qkv = self.qkv(x).reshape(batch, seq_len, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        query, key, value = qkv[0], qkv[1], qkv[2]
+        query, key, value = qkv.unbind(dim=2)
+        query = query.transpose(1, 2)
+        key = key.transpose(1, 2)
+        value = value.transpose(1, 2)
         backend = self._effective_backend(x)
 
         if backend == "flex":
@@ -315,8 +337,11 @@ class GPTModel(nn.Module):
             block = GPTBlock(config).to(device, dtype=dtype)
             self.blocks.append(block)
             self.block_devices.append(device)
+        self.block_device_groups = self._build_block_device_groups()
 
         final_device = self.block_devices[-1] if self.block_devices else devices[0]
+        self.final_device = final_device
+        self._return_output_to_first_device = final_device != devices[0]
         self.ln_f = nn.LayerNorm(config.d_model).to(final_device, dtype=dtype)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False).to(final_device, dtype=dtype)
 
@@ -336,20 +361,34 @@ class GPTModel(nn.Module):
                 torch.tensor(converted, device=devices[0]),
             )
 
+    def _build_block_device_groups(self) -> List[tuple[torch.device, int, int]]:
+        if not self.block_devices:
+            return []
+        groups: List[tuple[torch.device, int, int]] = []
+        start = 0
+        current_device = self.block_devices[0]
+        for idx, device in enumerate(self.block_devices[1:], start=1):
+            if device == current_device:
+                continue
+            groups.append((current_device, start, idx))
+            current_device = device
+            start = idx
+        groups.append((current_device, start, len(self.block_devices)))
+        return groups
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.device != self.devices[0]:
-            x = x.to(self.devices[0])
+            x = x.to(self.devices[0], non_blocking=True)
         x = self.embed(x)
-        for block, device in zip(self.blocks, self.block_devices):
+        for device, start, end in self.block_device_groups:
             if x.device != device:
-                x = x.to(device)
-            x = block(x)
-        if x.device != self.ln_f.weight.device:
-            x = x.to(self.ln_f.weight.device)
+                x = x.to(device, non_blocking=True)
+            for block in self.blocks[start:end]:
+                x = block(x)
         x = self.ln_f(x)
         x = self.lm_head(x)
-        if x.device != self.devices[0]:
-            x = x.to(self.devices[0])
+        if self._return_output_to_first_device:
+            x = x.to(self.devices[0], non_blocking=True)
         return x
 
 
@@ -397,7 +436,7 @@ def count_parameters(config: GPTConfig) -> float:
     return total
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def benchmark_model(
     model: nn.Module,
     inputs: torch.Tensor,
@@ -411,16 +450,16 @@ def benchmark_model(
         if dev.type == "cuda":
             torch.cuda.reset_peak_memory_stats(dev)
     ctx_factory = precision_ctx_factory or contextlib.nullcontext
-    for _ in range(warmup):
-        with ctx_factory():
+    with ctx_factory():
+        for _ in range(warmup):
             model(inputs)
     for dev in devices:
         if dev.type == "cuda":
             torch.cuda.synchronize(dev)
 
     start = time.perf_counter()
-    for _ in range(iters):
-        with ctx_factory():
+    with ctx_factory():
+        for _ in range(iters):
             model(inputs)
     for dev in devices:
         if dev.type == "cuda":
@@ -645,10 +684,10 @@ def validate_multi_gpu_equivalence(
 
     base_model.eval()
     multi_model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         ref = base_model(inputs)
         out = multi_model(inputs)
-    diff = torch.max(torch.abs(ref.to(devices[0]) - out.to(devices[0]))).item()
+    diff = scalar_tensor_to_float(torch.max(torch.abs(ref.to(devices[0]) - out.to(devices[0]))))
 
     del base_model
     del multi_model

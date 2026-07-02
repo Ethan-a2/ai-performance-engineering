@@ -18,7 +18,7 @@ class SimplePipeline(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim, hidden_dim * 2)
         self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.relu(self.fc1(x))
@@ -33,7 +33,9 @@ class BaselineEndToEndBandwidthBenchmark(VerificationPayloadMixin, BaseBenchmark
         super().__init__()
         self.model: Optional[nn.Module] = None
         self.inputs: Optional[list[torch.Tensor]] = None
-        self.outputs: Optional[list[torch.Tensor]] = None
+        self.stacked_inputs: Optional[torch.Tensor] = None
+        self.outputs: Optional[list[torch.Tensor | None]] = None
+        self._output_buffer: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self.batch_size = 32
         self.hidden_dim = 1024
@@ -43,49 +45,64 @@ class BaselineEndToEndBandwidthBenchmark(VerificationPayloadMixin, BaseBenchmark
             requests_per_iteration=float(self.batch_size * self.num_batches),
             tokens_per_iteration=float(tokens),
         )
+        self._payload_parameter_count = 0
     
     def setup(self) -> None:
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
         self.model = SimplePipeline(hidden_dim=self.hidden_dim).to(self.device, dtype=torch.float32).eval()
-        self.inputs = [
-            torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float32)
-            for _ in range(self.num_batches)
-        ]
-        self.outputs = []
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
+        self.stacked_inputs = torch.empty(
+            self.num_batches,
+            self.batch_size,
+            self.hidden_dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.inputs = list(self.stacked_inputs.unbind(0))
+        for batch_input in self.inputs:
+            batch_input.normal_()
+        self._output_buffer = torch.empty_like(self.stacked_inputs)
+        self.outputs = [None for _ in range(self.num_batches)]
         self.output = None
         for inp in self.inputs[:3]:
             _ = self.model(inp)
     
     def benchmark_fn(self) -> None:
-        assert self.model is not None and self.inputs is not None
+        assert self.model is not None and self.inputs is not None and self.outputs is not None
         with self._nvtx_range("baseline_end_to_end_bandwidth"):
-            self.outputs = []
-            with torch.no_grad():
-                for inp in self.inputs:
+            with torch.inference_mode():
+                for batch_idx, inp in enumerate(self.inputs):
                     out = self.model(inp)
-                    self.outputs.append(out)
-            if self.outputs:
-                self.output = torch.stack(self.outputs)
-            else:
-                self.output = None
+                    self.outputs[batch_idx] = out
 
     def capture_verification_payload(self) -> None:
-        if self.model is None or self.inputs is None or self.output is None:
+        if (
+            self.model is None
+            or self.stacked_inputs is None
+            or self.outputs is None
+            or self._output_buffer is None
+            or any(out is None for out in self.outputs)
+        ):
             raise RuntimeError("capture_verification_payload() requires completed benchmark run")
-        stacked_inputs = torch.stack(self.inputs)
+        outputs = [out for out in self.outputs if out is not None]
+        torch.stack(outputs, dim=0, out=self._output_buffer)
+        self.output = self._output_buffer.detach()
         self._set_verification_payload(
-            inputs={"inputs": stacked_inputs},
+            inputs={"inputs": self.stacked_inputs},
             output=self.output,
-            batch_size=int(stacked_inputs.shape[0]),
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            batch_size=int(self.stacked_inputs.shape[0]),
+            parameter_count=self._payload_parameter_count,
             output_tolerance=(0.1, 1.0),
         )
     
     def teardown(self) -> None:
         self.model = None
         self.inputs = None
+        self.stacked_inputs = None
         self.outputs = None
+        self._output_buffer = None
+        self.output = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:

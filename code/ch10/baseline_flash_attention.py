@@ -43,6 +43,7 @@ class BaselineFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             tokens_per_iteration=float(tokens),
         )
         self.output = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.register_workload_metadata(
             requests_per_iteration=float(self.batch_size),
             tokens_per_iteration=float(tokens),
@@ -74,15 +75,12 @@ class BaselineFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             dtype=torch.float16,
         )
         if self.use_causal:
-            self._causal_mask = torch.ones(
-                self.seq_len,
-                self.seq_len,
-                device=self.device,
-                dtype=torch.bool,
-            ).triu(diagonal=1)
+            pos = torch.arange(self.seq_len, device=self.device)
+            self._causal_mask = pos.unsqueeze(0) > pos.unsqueeze(1)
+        self._verify_output_buffer = torch.empty_like(self.input, dtype=torch.float32)
         
         # Warmup
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(3):
                 self._manual_attention(self.input, is_causal=self.use_causal)
     
@@ -106,7 +104,7 @@ class BaselineFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             # Apply a causal mask so the baseline matches the optimized SDPA path.
             if self._causal_mask is None:
                 raise RuntimeError("Causal mask missing - setup() must initialize it")
-            attn_weights = attn_weights.masked_fill(self._causal_mask, float("-inf"))
+            attn_weights.masked_fill_(self._causal_mask, float("-inf"))
         attn_weights = torch.softmax(attn_weights, dim=-1)
         
         # attn_weights @ V
@@ -119,15 +117,18 @@ class BaselineFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def benchmark_fn(self) -> None:
         """Benchmark: Standard attention without FlashAttention."""
         with self._nvtx_range("baseline_flash_attention"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 self.output = self._manual_attention(self.input, is_causal=self.use_causal)
         if self.output is None or self.input is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self.input},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             precision_flags={
                 "fp16": True,
@@ -147,6 +148,8 @@ class BaselineFlashAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.out_proj = None
         self.input = None
         self._causal_mask = None
+        self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
     
     def get_config(self) -> BenchmarkConfig:

@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import random
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -23,7 +22,7 @@ class LargeModel(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            x = torch.relu(layer(x))
+            x = torch.relu_(layer(x))
         return self.output(x)
 
 
@@ -38,6 +37,7 @@ class BaselineRoutingStaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.hidden_dim = 2048
         self.num_layers = 24
         self.requests_per_iteration = 512
+        self._request_range = range(self.requests_per_iteration)
         self.num_routes = 1024
         tokens = self.batch_size * self.hidden_dim * self.requests_per_iteration
         self._workload = WorkloadMetadata(
@@ -46,6 +46,7 @@ class BaselineRoutingStaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
         )
         self.output: Optional[torch.Tensor] = None
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.route_scores: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         self._verification_payload = None
@@ -70,6 +71,12 @@ class BaselineRoutingStaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
         self._verify_input = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=dtype)
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            10,
+            device=self.device,
+            dtype=torch.float32,
+        )
         # Static router still pays routing overhead (naive per-request argmax).
         self.route_scores = torch.zeros(
             self.requests_per_iteration,
@@ -78,31 +85,35 @@ class BaselineRoutingStaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
             dtype=dtype,
         )
         self.route_scores[:, 0] = 1.0  # always select "large"
+        self._request_range = range(self.requests_per_iteration)
         self._synchronize()
 
     def benchmark_fn(self) -> None:
         assert self.model is not None and self.inputs is not None
 
         with self._nvtx_range("routing"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 if self.route_scores is None:
                     raise RuntimeError("Routing scores not initialized")
-                for idx in range(self.requests_per_iteration):
+                for idx in self._request_range:
                     # Naive routing: per-request argmax (launch-heavy).
                     _ = torch.argmax(self.route_scores[idx])
             if self._verify_input is not None:
-                with torch.no_grad():
-                    self.output = self.model(self._verify_input).detach().float().clone()
+                with torch.inference_mode():
+                    self.output = self.model(self._verify_input)
         if self.output is None or self._verify_input is None:
             raise RuntimeError("benchmark_fn() must produce output")
-        dtype = self.output.dtype
+        dtype = torch.float32
         self._payload_dtype = dtype
 
     def capture_verification_payload(self) -> None:
         dtype = self._payload_dtype
+        if self.output is None or self._verify_input is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"verify_input": self._verify_input},
-            output=self.output,
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -117,6 +128,7 @@ class BaselineRoutingStaticBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.model = None
         self.inputs = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

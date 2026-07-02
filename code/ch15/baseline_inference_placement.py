@@ -6,13 +6,13 @@ from typing import Dict, Optional
 
 import torch
 
-from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig  # noqa: E402
 from ch15.placement_sim import (  # noqa: E402
     PlacementConfig,
     PlacementSimulator,
-    percentile,
+    percentiles,
 )
 from core.benchmark.verification_mixin import VerificationPayloadMixin  # noqa: E402
+from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig  # noqa: E402
 
 
 class _PlacementBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -24,8 +24,23 @@ class _PlacementBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.prefix = prefix
         self.sessions = 64
         self.simulator = PlacementSimulator()
-        self._summary: Dict[str, float] = {}
+        self._summary_keys = (
+            f"{prefix}.ttft_p50_ms",
+            f"{prefix}.ttft_p95_ms",
+            f"{prefix}.decode_p50_ms",
+            f"{prefix}.decode_p95_ms",
+            f"{prefix}.tokens_per_s_est",
+            f"{prefix}.cross_node_kv_moves",
+            f"{prefix}.cross_node_collectives",
+            f"{prefix}.prefill_collective_ms",
+            f"{prefix}.decode_collective_ms",
+            f"{prefix}.remote_expert_ms",
+        )
+        self._summary: Dict[str, float] = {key: 0.0 for key in self._summary_keys}
         self.output = None  # Simulation metrics as tensor
+        self._output_values: list[float] = [0.0] * 7
+        self._output_tensor: Optional[torch.Tensor] = None
+        self._output_values_ready = False
         self.register_workload_metadata(requests_per_iteration=float(self.sessions))
         self._verify_cfg = torch.tensor(
             [cfg.prefill_tp_size, cfg.decode_tp_size, cfg.decode_microbatch],
@@ -35,37 +50,49 @@ class _PlacementBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def setup(self) -> None:
         self._previous_default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.cfg.dtype)  # type: ignore[arg-type]
+        self._output_tensor = torch.empty(len(self._output_values), dtype=torch.float32)
+        self._output_values_ready = False
 
     def benchmark_fn(self) -> None:
         run = self.simulator.simulate(self.cfg, sessions=self.sessions, seed=17)
-        ttft_p50 = percentile(run.ttft_ms, 50)
-        ttft_p95 = percentile(run.ttft_ms, 95)
-        decode_p50 = percentile(run.decode_ms, 50)
-        decode_p95 = percentile(run.decode_ms, 95)
-        total_ms = sum(run.ttft_ms) + sum(run.decode_ms)
+        ttft_p50, ttft_p95 = percentiles(run.ttft_ms, (50, 95))
+        decode_p50, decode_p95 = percentiles(run.decode_ms, (50, 95))
+        total_ms = run.ttft_total_ms + run.decode_total_ms
         tput_tokens_s = run.tokens_processed / max(total_ms / 1000.0, 1e-6)
         self._total_tokens = int(run.tokens_processed)
         self._total_requests = int(run.sessions)
 
-        self._summary = {
-            f"{self.prefix}.ttft_p50_ms": ttft_p50,
-            f"{self.prefix}.ttft_p95_ms": ttft_p95,
-            f"{self.prefix}.decode_p50_ms": decode_p50,
-            f"{self.prefix}.decode_p95_ms": decode_p95,
-            f"{self.prefix}.tokens_per_s_est": tput_tokens_s,
-            f"{self.prefix}.cross_node_kv_moves": float(run.cross_node_kv_moves),
-            f"{self.prefix}.cross_node_collectives": float(run.cross_node_collectives),
-            f"{self.prefix}.prefill_collective_ms": run.prefill_collective_ms,
-            f"{self.prefix}.decode_collective_ms": run.decode_collective_ms,
-            f"{self.prefix}.remote_expert_ms": run.remote_expert_ms,
-        }
+        summary = self._summary
+        keys = self._summary_keys
+        summary[keys[0]] = ttft_p50
+        summary[keys[1]] = ttft_p95
+        summary[keys[2]] = decode_p50
+        summary[keys[3]] = decode_p95
+        summary[keys[4]] = tput_tokens_s
+        summary[keys[5]] = float(run.cross_node_kv_moves)
+        summary[keys[6]] = float(run.cross_node_collectives)
+        summary[keys[7]] = run.prefill_collective_ms
+        summary[keys[8]] = run.decode_collective_ms
+        summary[keys[9]] = run.remote_expert_ms
         # Capture simulation metrics as tensor for verification
-        self.output = torch.tensor([
-            ttft_p50, ttft_p95, decode_p50, decode_p95, tput_tokens_s,
-            float(run.cross_node_kv_moves), float(run.cross_node_collectives),
-        ], dtype=torch.float32)
+        self._output_values[0] = ttft_p50
+        self._output_values[1] = ttft_p95
+        self._output_values[2] = decode_p50
+        self._output_values[3] = decode_p95
+        self._output_values[4] = tput_tokens_s
+        self._output_values[5] = float(run.cross_node_kv_moves)
+        self._output_values[6] = float(run.cross_node_collectives)
+        self._output_values_ready = True
+        self.output = None
 
     def capture_verification_payload(self) -> None:
+        if not self._output_values_ready:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        if self._output_tensor is None:
+            raise RuntimeError("setup() must initialize verification tensors")
+        for idx, value in enumerate(self._output_values):
+            self._output_tensor[idx] = value
+        self.output = self._output_tensor
         self._set_verification_payload(
             inputs={"config": self._verify_cfg},
             output=self.output,
@@ -84,6 +111,8 @@ class _PlacementBenchmark(VerificationPayloadMixin, BaseBenchmark):
         previous = getattr(self, "_previous_default_dtype", None)
         if isinstance(previous, torch.dtype):
             torch.set_default_dtype(previous)
+        self._output_tensor = None
+        self._output_values_ready = False
         super().teardown()
 
     def get_config(self) -> Optional[BenchmarkConfig]:
@@ -127,4 +156,3 @@ class BaselineInferencePlacementBenchmark(_PlacementBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineInferencePlacementBenchmark()
-

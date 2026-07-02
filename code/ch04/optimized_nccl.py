@@ -14,12 +14,14 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from ch04.reduction_common import ReusableReductionMlp
 from core.harness.benchmark_harness import (  # noqa: E402
     BaseBenchmark,
     BenchmarkConfig,
     WorkloadMetadata,
 )
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 
 class OptimizedNcclBenchmark(VerificationPayloadMixin, BaseBenchmark):
@@ -37,8 +39,11 @@ class OptimizedNcclBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.input: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._output_buffer: Optional[torch.Tensor] = None
-        self._reduction_buffer: Optional[torch.Tensor] = None
+        self._model_shard_view: Optional[torch.Tensor] = None
+        self._reduced_rows = 0
         self._bytes_transferred: float = 0.0
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
         
         tokens = self.batch_size * self.hidden_dim
         self._workload = WorkloadMetadata(
@@ -48,64 +53,59 @@ class OptimizedNcclBenchmark(VerificationPayloadMixin, BaseBenchmark):
         # Reduction benchmark: fixed dimensions
 
     def setup(self) -> None:
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
+
         # Use same seed as baseline for deterministic verification
         torch.manual_seed(42)
         
-        # Build model with same architecture as baseline for fair comparison
-        self.model = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.inner_dim),
-            nn.ReLU(),
-            nn.Linear(self.inner_dim, self.hidden_dim),
-        ).to(self.device).eval()
+        # Build model with same architecture as baseline for fair comparison.
+        self.model = ReusableReductionMlp(self.hidden_dim, self.inner_dim).to(self.device).eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
         
         self.input = torch.randn(self.batch_size, self.hidden_dim, device=self.device)
-        shard_size = self.batch_size // self.num_shards
-        self._output_buffer = torch.zeros(shard_size, self.hidden_dim, device=self.device)
-        self._reduction_buffer = torch.zeros(shard_size, self.hidden_dim, device=self.device)
-        self._bytes_transferred = 0.0
+        if self.batch_size % self.num_shards != 0:
+            raise RuntimeError("Batch size must be divisible by num_shards")
+        self._reduced_rows = self.batch_size // self.num_shards
+        self._output_buffer = torch.empty(self._reduced_rows, self.hidden_dim, device=self.device)
+        self.model.prepare_forward_buffers(self.input)
+        with torch.inference_mode():
+            model_out = self.model.forward_prepared(self.input)
+        self._model_shard_view = model_out.view(self.num_shards, self._reduced_rows, self.hidden_dim)
+        element_size = self.input.element_size()
+        self._bytes_transferred = float(
+            (self.batch_size * self.hidden_dim + self._reduced_rows * self.hidden_dim)
+            * element_size
+        )
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
-        from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
         assert self.input is not None and self.model is not None
-        assert self._output_buffer is not None and self._reduction_buffer is not None
+        assert self._output_buffer is not None
         
-        with nvtx_range("optimized_nccl", enable=enable_nvtx):
+        with nvtx_range("optimized_nccl", enable=self._enable_nvtx):
             # Forward pass
-            with torch.no_grad():
-                out = self.model(self.input)
+            with torch.inference_mode():
+                self.model.forward_prepared(self.input)
             
-            # All-GPU reduction: chunk, reduce in-place, no CPU
-            shards = torch.chunk(out, chunks=self.num_shards, dim=0)
+            # All-GPU reduction over a strided shard view, no CPU or Python shard loop.
+            if self._model_shard_view is None:
+                raise RuntimeError("Model shard view not initialized")
+            torch.sum(self._model_shard_view, dim=0, out=self._output_buffer)
             
-            # In-place sum reduction (stays on GPU)
-            self._reduction_buffer.zero_()
-            for shard in shards:
-                self._reduction_buffer.add_(shard)
-            
-            # Average
-            self._output_buffer.copy_(self._reduction_buffer)
+            # Average in place; the sum already landed in the reusable output buffer.
             self._output_buffer.div_(self.num_shards)
             self.output = self._output_buffer
-            self._bytes_transferred = float(
-                out.numel() * out.element_size()
-                + self._reduction_buffer.numel() * self._reduction_buffer.element_size()
-                + self._output_buffer.numel() * self._output_buffer.element_size()
-            )
         
 
     def capture_verification_payload(self) -> None:
         if self.input is None or self.output is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        param_count = sum(p.numel() for p in self.model.parameters()) if self.model is not None else 0
         self._set_verification_payload(
             inputs={"input": self.input},
             output=self.output,
             batch_size=int(self.batch_size),
-            parameter_count=param_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -120,7 +120,8 @@ class OptimizedNcclBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.input = None
         self.output = None
         self._output_buffer = None
-        self._reduction_buffer = None
+        self._model_shard_view = None
+        self._reduced_rows = 0
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

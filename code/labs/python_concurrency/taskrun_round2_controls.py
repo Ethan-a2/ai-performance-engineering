@@ -22,7 +22,6 @@ import argparse
 import asyncio
 import json
 import random
-import statistics
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -155,6 +154,20 @@ def load_items(path: Path) -> list[WorkItem]:
     return items
 
 
+def _success_latency_percentiles(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+
+    values.sort()
+    midpoint = len(values) // 2
+    if len(values) % 2:
+        p50 = values[midpoint]
+    else:
+        p50 = (values[midpoint - 1] + values[midpoint]) / 2.0
+    p95 = values[max(0, int(0.95 * len(values)) - 1)]
+    return round(p50, 2), round(p95, 2)
+
+
 async def simulated_fetch(item: WorkItem) -> str:
     """Simulate I/O latency and probabilistic failure."""
 
@@ -269,23 +282,36 @@ async def worker(
 def summarize(results: list[Result]) -> dict[str, Any]:
     """Aggregate status counts and latency distribution."""
 
-    success_latencies = [r.latency_ms for r in results if r.status == SUCCESS]
+    success_latencies: list[float] = []
+    started = 0
+    success = 0
+    failed = 0
+    timed_out = 0
+    cancelled = 0
+    for result in results:
+        if result.attempts > 0:
+            started += 1
+        if result.status == SUCCESS:
+            success += 1
+            success_latencies.append(result.latency_ms)
+        elif result.status == FAILED:
+            failed += 1
+        elif result.status == TIMED_OUT:
+            timed_out += 1
+        elif result.status == CANCELLED:
+            cancelled += 1
+    p50_success_ms, p95_success_ms = _success_latency_percentiles(success_latencies)
 
     summary = {
         "queued": len(results),
-        "started": sum(1 for r in results if r.attempts > 0),
+        "started": started,
         "completed": len(results),
-        "success": sum(1 for r in results if r.status == SUCCESS),
-        "failed": sum(1 for r in results if r.status == FAILED),
-        "timed_out": sum(1 for r in results if r.status == TIMED_OUT),
-        "cancelled": sum(1 for r in results if r.status == CANCELLED),
-        "p50_success_ms": round(statistics.median(success_latencies), 2) if success_latencies else 0.0,
-        "p95_success_ms": round(
-            sorted(success_latencies)[max(0, int(0.95 * len(success_latencies)) - 1)],
-            2,
-        )
-        if success_latencies
-        else 0.0,
+        "success": success,
+        "failed": failed,
+        "timed_out": timed_out,
+        "cancelled": cancelled,
+        "p50_success_ms": p50_success_ms,
+        "p95_success_ms": p95_success_ms,
     }
     return summary
 

@@ -30,6 +30,7 @@ class BaselineCublasBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.A: Optional[torch.Tensor] = None
         self.B: Optional[torch.Tensor] = None
         self.C: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self._last_elapsed_ms: Optional[float] = None
         tokens = self.m * self.n
         self._workload = WorkloadMetadata(
@@ -47,7 +48,8 @@ class BaselineCublasBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         self.A = torch.randn(self.m, self.k, device=self.device, dtype=torch.float32)
         self.B = torch.randn(self.k, self.n, device=self.device, dtype=torch.float32)
-        self.C = None
+        self.C = torch.empty(self.m, self.n, device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty_like(self.C)
 
         # Mirror the optimized setup warmup so both paths hit cuBLAS/Lt
         # heuristics with the same pre-timed launch history.
@@ -56,17 +58,25 @@ class BaselineCublasBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def benchmark_fn(self) -> None:
         """Plain cuBLAS FP32 matmul."""
-        assert self.A is not None and self.B is not None
-        with self._nvtx_range("baseline_cublas_fp32"):
-            self.C = torch.matmul(self.A, self.B)
+        assert self.A is not None and self.B is not None and self.C is not None
+        with torch.inference_mode(), self._nvtx_range("baseline_cublas_fp32"):
+            torch.mm(self.A, self.B, out=self.C)
 
         if self.C is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if (
+            self.A is None
+            or self.B is None
+            or self.C is None
+            or self._verify_output_buffer is None
+        ):
+            raise RuntimeError("benchmark_fn() must be called before verification")
+        self._verify_output_buffer.copy_(self.C)
         self._set_verification_payload(
             inputs={"A": self.A, "B": self.B},
-            output=self.C.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.A.shape[0],
             parameter_count=0,
             precision_flags={
@@ -84,6 +94,7 @@ class BaselineCublasBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.A = None
         self.B = None
         self.C = None
+        self._verify_output_buffer = None
         self._last_elapsed_ms = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

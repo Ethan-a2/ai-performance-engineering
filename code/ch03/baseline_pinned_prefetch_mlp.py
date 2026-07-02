@@ -36,7 +36,9 @@ class BaselinePinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmark
         self.host_batches: List[torch.Tensor] = []
         self.targets: List[torch.Tensor] = []
         self.batch_idx = 0
+        self._batch_count = 0
         self.output: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
         # Training benchmarks don't support jitter check - outputs change due to weight updates
         # Register workload metadata in __init__ for compliance checks
         self.register_workload_metadata(
@@ -50,30 +52,28 @@ class BaselinePinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmark
         log_allocator_guidance("ch03/baseline_pinned_prefetch_mlp", optimized=False)
         self.model = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Linear(self.hidden_dim, self.output_dim),
         ).to(self.device)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-2)
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
 
         for _ in range(self.num_batches):
             self.host_batches.append(torch.randn(self.batch_size, self.input_dim, dtype=torch.float32))
             self.targets.append(torch.randn(self.batch_size, self.output_dim, dtype=torch.float32))
+        self._batch_count = self.num_batches
         
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
         assert self.model is not None and self.optimizer is not None
 
-        idx = self.batch_idx % len(self.host_batches)
+        idx = self.batch_idx % self._batch_count
         host_x = self.host_batches[idx]
         host_y = self.targets[idx]
         self.batch_idx += 1
 
-        with nvtx_range("baseline_pinned_prefetch_mlp", enable=enable_nvtx):
+        with self._nvtx_range("baseline_pinned_prefetch_mlp"):
             x = self.to_device(host_x)  # blocking copy (tensor not pinned)
             y = self.to_device(host_y)
             out = self.model(x)
@@ -83,7 +83,7 @@ class BaselinePinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmark
             self.optimizer.zero_grad(set_to_none=True)
         
         # Store output for verification
-        self.output = out.detach()
+        self.output = out.detach_()
         self._payload_x = x
         self._payload_y = y
 
@@ -94,7 +94,7 @@ class BaselinePinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmark
             inputs={"data": x, "target": y},
             output=self.output,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -109,6 +109,7 @@ class BaselinePinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmark
         self.optimizer = None
         self.host_batches = []
         self.targets = []
+        self._batch_count = 0
         self.output = None
         torch.cuda.empty_cache()
 
@@ -133,4 +134,3 @@ class BaselinePinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmark
 
 def get_benchmark() -> BaseBenchmark:
     return BaselinePinnedPrefetchMLPBenchmark()
-

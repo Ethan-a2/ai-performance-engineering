@@ -11,7 +11,6 @@ from pathlib import Path
 import argparse
 import os
 
-from core.common.device_utils import resolve_local_rank
 import time
 from typing import Optional
 
@@ -19,6 +18,8 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 
+from ch04.torchcomms_common import BufferedTorchcommsBlock
+from core.common.device_utils import resolve_local_rank
 from core.benchmark.gpu_requirements import require_min_gpus
 from core.benchmark.verification import PrecisionFlags
 from core.benchmark.verification_mixin import VerificationPayloadMixin
@@ -59,12 +60,8 @@ def _resolve_world_size() -> int:
     return world_size
 
 
-def _build_block(hidden: int, device: torch.device) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(hidden, hidden * 4),
-        nn.GELU(),
-        nn.Linear(hidden * 4, hidden),
-    ).to(device).eval()
+def _build_block(hidden: int, device: torch.device) -> nn.Module:
+    return BufferedTorchcommsBlock(hidden).to(device).eval()
 
 
 def _run_worker(iters: int, warmup: int, batch: int, hidden: int) -> None:
@@ -80,21 +77,25 @@ def _run_worker(iters: int, warmup: int, batch: int, hidden: int) -> None:
     aux_block = _build_block(hidden, device)
     inputs = torch.randn(batch, hidden, device=device)
     comm_payload = torch.randn(batch, hidden * _COMM_PAYLOAD_MULT, device=device)
+    comm_block.prepare_forward_buffers(inputs)
+    aux_block.prepare_forward_buffers(inputs)
     comm_stream = torch.cuda.Stream(device=device)
+    aux_pass_range = range(_AUX_PASSES)
     def _step() -> None:
-        with torch.no_grad():
-            comm_out = comm_block(inputs)
-            comm_stream.wait_stream(torch.cuda.current_stream())
+        with torch.inference_mode():
+            comm_out = comm_block.forward_prepared(inputs)
+            current_stream = torch.cuda.current_stream()
+            comm_stream.wait_stream(current_stream)
             with torch.cuda.stream(comm_stream):
                 work = dist.all_reduce(comm_out, op=dist.ReduceOp.AVG, async_op=True)
                 payload_work = dist.all_reduce(comm_payload, op=dist.ReduceOp.AVG, async_op=True)
             aux_out = inputs
-            for _ in range(_AUX_PASSES):
-                aux_out = aux_block(aux_out)
+            for _ in aux_pass_range:
+                aux_out = aux_block.forward_prepared(aux_out)
             work.wait()
             payload_work.wait()
-            torch.cuda.current_stream().wait_stream(comm_stream)
-            _ = comm_out + aux_out
+            current_stream.wait_stream(comm_stream)
+            comm_out.add_(aux_out)
 
     for _ in range(max(warmup, 0)):
         _step()
@@ -135,11 +136,13 @@ class OptimizedTorchcommsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         super().__init__()
         tokens = float(_DEFAULT_BATCH * _DEFAULT_HIDDEN)
         self.register_workload_metadata(requests_per_iteration=float(_DEFAULT_BATCH), tokens_per_iteration=tokens)
-        self._comm_block: Optional[nn.Sequential] = None
-        self._aux_block: Optional[nn.Sequential] = None
+        self._comm_block: Optional[nn.Module] = None
+        self._aux_block: Optional[nn.Module] = None
         self._input: Optional[torch.Tensor] = None
         self._output: Optional[torch.Tensor] = None
         self._world_size = 1
+        self._payload_parameter_count = 0
+        self._aux_pass_range = range(_AUX_PASSES)
 
     def setup(self) -> None:
         require_min_gpus(2, "optimized_torchcomms_multigpu.py")
@@ -148,33 +151,36 @@ class OptimizedTorchcommsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.manual_seed_all(42)
         self._comm_block = _build_block(_DEFAULT_HIDDEN, self.device)
         self._aux_block = _build_block(_DEFAULT_HIDDEN, self.device)
+        self._payload_parameter_count = sum(p.numel() for p in self._comm_block.parameters())
+        self._payload_parameter_count += sum(p.numel() for p in self._aux_block.parameters())
         self._input = torch.randn(
             _DEFAULT_BATCH,
             _DEFAULT_HIDDEN,
             device=self.device,
             dtype=torch.float32,
         )
+        self._comm_block.prepare_forward_buffers(self._input)
+        self._aux_block.prepare_forward_buffers(self._input)
 
     def benchmark_fn(self) -> None:
         if self._comm_block is None or self._aux_block is None or self._input is None:
             raise RuntimeError("setup() must run before benchmark_fn()")
-        with torch.no_grad():
-            comm_out = self._comm_block(self._input)
+        with torch.inference_mode():
+            comm_out = self._comm_block.forward_prepared(self._input)
             aux_out = self._input
-            for _ in range(_AUX_PASSES):
-                aux_out = self._aux_block(aux_out)
-            self._output = comm_out + aux_out
+            for _ in self._aux_pass_range:
+                aux_out = self._aux_block.forward_prepared(aux_out)
+            comm_out.add_(aux_out)
+            self._output = comm_out
 
     def capture_verification_payload(self) -> None:
         if self._output is None or self._input is None or self._comm_block is None or self._aux_block is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
-        param_count = sum(p.numel() for p in self._comm_block.parameters())
-        param_count += sum(p.numel() for p in self._aux_block.parameters())
         self._set_verification_payload(
             inputs={"input": self._input},
             output=self._output,
             batch_size=_DEFAULT_BATCH,
-            parameter_count=int(param_count),
+            parameter_count=self._payload_parameter_count,
             precision_flags=PrecisionFlags(tf32=False),
             output_tolerance=(1e-5, 1e-5),
             signature_overrides={
@@ -234,4 +240,3 @@ class OptimizedTorchcommsBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedTorchcommsBenchmark()
-

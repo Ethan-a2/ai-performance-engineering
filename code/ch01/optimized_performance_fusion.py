@@ -24,6 +24,7 @@ from ch01.performance_common import (
     build_training_mlp,
     capture_tf32_state,
     get_environment_custom_metrics,
+    preallocate_fused_microbatches,
     restore_tf32_state,
     seed_chapter1,
     set_tf32_state,
@@ -54,6 +55,7 @@ class OptimizedPerformanceFusionBenchmark(VerificationPayloadMixin, BaseBenchmar
         self.parameter_count = 0
         self._fused_batches = None
         self._fused_targets = None
+        self._fused_pairs = None
         self._tf32_state: tuple[bool, bool | None] | None = None
 
         samples = float(self.batch_size * self.num_microbatches)
@@ -77,7 +79,12 @@ class OptimizedPerformanceFusionBenchmark(VerificationPayloadMixin, BaseBenchmar
         ]
 
         self._verify_input = self.microbatches[0].clone()
-        self._verify_output = None
+        self._verify_output = torch.empty(
+            self._verify_input.shape[0],
+            10,
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-3)
         for _ in range(3):
@@ -89,18 +96,17 @@ class OptimizedPerformanceFusionBenchmark(VerificationPayloadMixin, BaseBenchmar
         self._synchronize()
         self.optimizer.zero_grad(set_to_none=True)
 
-        self._fused_batches = []
-        self._fused_targets = []
-        for start in range(0, len(self.microbatches), self.fusion):
-            batch = torch.cat(self.microbatches[start : start + self.fusion], dim=0)
-            target = torch.cat(self.targets[start : start + self.fusion], dim=0)
-            self._fused_batches.append(batch)
-            self._fused_targets.append(target)
+        self._fused_batches, self._fused_targets = preallocate_fused_microbatches(
+            self.microbatches,
+            self.targets,
+            self.fusion,
+        )
+        self._fused_pairs = tuple(zip(self._fused_batches, self._fused_targets, strict=True))
 
     def benchmark_fn(self) -> None:
-        assert self.model is not None and self._fused_batches is not None and self._fused_targets is not None
+        assert self.model is not None and self._fused_pairs is not None
         with self._nvtx_range("optimized_performance_fusion"):
-            for data, target in zip(self._fused_batches, self._fused_targets):
+            for data, target in self._fused_pairs:
                 self.optimizer.zero_grad(set_to_none=True)
                 logits = self.model(data)
                 loss = torch.nn.functional.cross_entropy(logits, target)
@@ -108,11 +114,12 @@ class OptimizedPerformanceFusionBenchmark(VerificationPayloadMixin, BaseBenchmar
                 self.optimizer.step()
 
     def capture_verification_payload(self) -> None:
-        if self.model is None or self._verify_input is None:
+        if self.model is None or self._verify_input is None or self._verify_output is None:
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
         model_dtype = next(self.model.parameters()).dtype
         with torch.no_grad():
-            self._verify_output = self.model(self._verify_input).detach().clone()
+            verify_output = self.model(self._verify_input)
+            self._verify_output.copy_(verify_output)
         self._set_verification_payload(
             inputs={"verify_input": self._verify_input},
             output=self._verify_output,
@@ -131,6 +138,9 @@ class OptimizedPerformanceFusionBenchmark(VerificationPayloadMixin, BaseBenchmar
         del self.model, self.microbatches, self.targets, self.optimizer
         self._fused_batches = None
         self._fused_targets = None
+        self._fused_pairs = None
+        self._verify_input = None
+        self._verify_output = None
         restore_tf32_state(self._tf32_state)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -159,4 +169,3 @@ class OptimizedPerformanceFusionBenchmark(VerificationPayloadMixin, BaseBenchmar
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedPerformanceFusionBenchmark()
-

@@ -16,7 +16,6 @@ import torch
 import triton
 import triton.language as tl
 import triton.testing
-from typing import Tuple
 from triton.runtime import _allocation as triton_allocation
 
 
@@ -414,15 +413,18 @@ def benchmark_tma_vs_standard(
         C_bias = tma_gemm_bias_silu(A, B, bias)
         C_ref = torch.matmul(A_fp32, B_fp32) + bias.float()
         C_ref = torch.nn.functional.silu(C_ref)
-        max_bias_diff = torch.abs(C_bias - C_ref).max().item()
 
         print(f"  TMA GEMM:      {tma_gemm_time*1e3:.2f} ms ({tma_tflops:.2f} TFLOPS)")
         print(f"  PyTorch GEMM:  {torch_gemm_time*1e3:.2f} ms ({torch_tflops:.2f} TFLOPS)")
         print(f"  Speedup:       {speedup_gemm:.2f}x")
         print(f"  TMA GEMM + SiLU/bias: {tma_bias_time*1e3:.2f} ms ({tma_bias_tflops:.2f} TFLOPS)")
+        error_stats = torch.empty(2, device=C_tma.device, dtype=torch.float32)
+        error_stats[0].copy_(torch.abs(C_bias - C_ref).max())
+        error_stats[1].copy_(torch.abs(C_tma - C_torch).max())
+        error_stats_host = error_stats.detach().cpu()
+        max_bias_diff = float(error_stats_host[0])
+        max_diff = float(error_stats_host[1])
         print(f"  Max Difference (bias+SiLU): {max_bias_diff:.2e}")
-
-        max_diff = torch.abs(C_tma - C_torch).max().item()
         print(f"  Max Difference: {max_diff:.2e}")
 
         results[size] = {
@@ -440,16 +442,27 @@ def benchmark_tma_vs_standard(
     print("\n" + "="*70)
     print("SUMMARY")
     print("="*70)
-    avg_copy_speedup = sum(r['copy_speedup'] for r in results.values()) / len(results)
-    avg_gemm_speedup = sum(r['gemm_speedup'] for r in results.values()) / len(results)
-    max_bw = max(r['copy_bandwidth_tma'] for r in results.values())
-    max_tflops = max(r['gemm_tflops_tma'] for r in results.values())
+    summary_count = 0
+    copy_speedup_total = 0.0
+    gemm_speedup_total = 0.0
+    max_bw = 0.0
+    max_tflops = 0.0
+    all_tests_passed = True
+    for r in results.values():
+        summary_count += 1
+        copy_speedup_total += r['copy_speedup']
+        gemm_speedup_total += r['gemm_speedup']
+        max_bw = max(max_bw, r['copy_bandwidth_tma'])
+        max_tflops = max(max_tflops, r['gemm_tflops_tma'])
+        all_tests_passed = all_tests_passed and r['correctness']
+    avg_copy_speedup = copy_speedup_total / summary_count if summary_count else 0.0
+    avg_gemm_speedup = gemm_speedup_total / summary_count if summary_count else 0.0
     
     print(f"Average Copy Speedup:  {avg_copy_speedup:.2f}x")
     print(f"Average GEMM Speedup:  {avg_gemm_speedup:.2f}x")
     print(f"Peak Bandwidth:        {max_bw:.2f} TB/s")
     print(f"Peak TFLOPS:           {max_tflops:.2f}")
-    print(f"All Tests Passed:      {'YES' if all(r['correctness'] for r in results.values()) else 'NO'}")
+    print(f"All Tests Passed:      {'YES' if all_tests_passed else 'NO'}")
     
     if is_blackwell:
         hbm3e_peak = 7.8  # TB/s for B200

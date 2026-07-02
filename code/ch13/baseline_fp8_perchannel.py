@@ -6,8 +6,6 @@ which is simpler but less accurate than per-channel scaling.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -56,10 +54,13 @@ class FP8PerTensorLinear(nn.Module):
         
         # Simulated FP8 GEMM
         output_q = torch.nn.functional.linear(x_q, weight_q, bias=None)
-        output = (output_q * input_scale * weight_scale).to(x.dtype)
+        output = output_q
+        output.mul_(input_scale)
+        output.mul_(weight_scale)
+        output = output.to(x.dtype)
         
         if self.bias is not None:
-            output = output + self.bias
+            output.add_(self.bias)
         
         return output
 
@@ -79,6 +80,7 @@ class BaselineFP8PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._last = 0.0
         self._error_sum = 0.0
         self._verify_input: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         
         tokens = self.batch_size * self.seq_len
@@ -109,7 +111,7 @@ class BaselineFP8PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         ).to(self.device, self.dtype).eval()
         
         # Copy weights
-        with torch.no_grad():
+        with torch.inference_mode():
             self.ref_model.weight.copy_(self.model.weight)
             if self.model.bias is not None:
                 self.ref_model.bias.copy_(self.model.bias)
@@ -120,16 +122,23 @@ class BaselineFP8PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
             device=self.device, dtype=self.dtype
         )
         self._verify_input = self.x.detach().clone()
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            min(128, self.seq_len),
+            self.out_features,
+            device=self.device,
+            dtype=torch.float32,
+        )
         
         # Warmup
         for _ in range(3):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self.x)
         torch.cuda.synchronize(self.device)
 
     def benchmark_fn(self) -> None:
         """Benchmark: Per-tensor FP8 forward pass."""
-        with torch.no_grad():
+        with torch.inference_mode():
             self.output = self.model(self.x)
         if self._verify_input is None:
             raise RuntimeError("Verification input not initialized")
@@ -137,12 +146,18 @@ class BaselineFP8PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._payload_dtype = dtype
 
     def capture_verification_payload(self) -> None:
-        if self.output is None:
+        if self.output is None or self._verify_input is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            :,
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         dtype = self._payload_dtype
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.detach().clone(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -159,6 +174,9 @@ class BaselineFP8PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model = None
         self.ref_model = None
         self.x = None
+        self.output = None
+        self._verify_input = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -195,4 +213,3 @@ class BaselineFP8PerChannelBenchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> BaseBenchmark:
     """Factory function for benchmark discovery."""
     return BaselineFP8PerChannelBenchmark()
-

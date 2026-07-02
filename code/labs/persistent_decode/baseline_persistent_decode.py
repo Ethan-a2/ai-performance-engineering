@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
@@ -25,6 +27,14 @@ class BaselinePersistentDecodeBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.options = get_decode_options()
         self.inputs = None
         self.output: Optional[torch.Tensor] = None
+        self._product_buffer: Optional[torch.Tensor] = None
+        self._dot_buffer: Optional[torch.Tensor] = None
+        self._decode_step_views: tuple[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            ...,
+        ] = ()
+        self._output_view: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         batch, seq_len, head_dim = resolve_shapes()
         self.seq_len = seq_len
         self.batch = batch
@@ -38,41 +48,80 @@ class BaselinePersistentDecodeBenchmark(VerificationPayloadMixin, BaseBenchmark)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
         self.inputs = build_inputs(self.device)
+        self.batch = int(self.inputs.q.shape[0])
+        self.seq_len = int(self.inputs.q.shape[1])
         self.head_dim = self.inputs.q.shape[-1]
         self.hidden_dim = self.head_dim
+        self._product_buffer = torch.empty(
+            self.batch,
+            self.head_dim,
+            device=self.inputs.q.device,
+            dtype=self.inputs.q.dtype,
+        )
+        self._dot_buffer = torch.empty(
+            self.batch,
+            1,
+            device=self.inputs.q.device,
+            dtype=self.inputs.q.dtype,
+        )
+        self._verify_output_buffer = torch.empty(
+            1,
+            min(8, self.seq_len),
+            self.head_dim,
+            device=self.inputs.out.device,
+            dtype=torch.float32,
+        )
+        self._decode_step_views = tuple(
+            zip(
+                self.inputs.q.unbind(1),
+                self.inputs.k.unbind(1),
+                self.inputs.v.unbind(1),
+                self.inputs.out.unbind(1),
+                strict=True,
+            )
+        )
+        self._output_view = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])]
         self._synchronize()
 
-    def _decode_step(self, t: int) -> None:
-        assert self.inputs is not None
+    def _decode_step(
+        self,
+        q_t: torch.Tensor,
+        k_t: torch.Tensor,
+        v_t: torch.Tensor,
+        out_t: torch.Tensor,
+    ) -> None:
+        assert self._product_buffer is not None
+        assert self._dot_buffer is not None
         # Compute a simple dot per sequence for timestep t, then scale V.
-        q_t = self.inputs.q[:, t, :]  # [batch, head_dim]
-        k_t = self.inputs.k[:, t, :]
-        v_t = self.inputs.v[:, t, :]
+        product = self._product_buffer
+        dot = self._dot_buffer
 
-        dot = (q_t * k_t).sum(dim=-1, keepdim=True)  # [batch, 1]
-        self.inputs.out[:, t, :] = v_t * dot
+        torch.mul(q_t, k_t, out=product)
+        torch.sum(product, dim=-1, keepdim=True, out=dot)
+        torch.mul(v_t, dot, out=out_t)
 
     def benchmark_fn(self) -> None:
-        if self.inputs is None:
+        if self.inputs is None or self._output_view is None or not self._decode_step_views:
             raise RuntimeError("Inputs not initialized")
 
-        with self._nvtx_range("baseline_per_token"):
-            for t in range(self.seq_len):
-                self._decode_step(t)
-            if self.inputs is not None:
-                # Capture a slice of the output tensor
-                self.output = self.inputs.out[:1, : min(8, self.inputs.out.shape[1])].detach()
+        with torch.inference_mode(), self._nvtx_range("baseline_per_token"):
+            for q_t, k_t, v_t, out_t in self._decode_step_views:
+                self._decode_step(q_t, k_t, v_t, out_t)
+            self.output = self._output_view
         if self.inputs is None or self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
+        if self.inputs is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "q": self.inputs.q.detach(),
                 "k": self.inputs.k.detach(),
                 "v": self.inputs.v.detach(),
             },
-            output=self.output.float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch,
             parameter_count=0,
             precision_flags={
@@ -87,6 +136,11 @@ class BaselinePersistentDecodeBenchmark(VerificationPayloadMixin, BaseBenchmark)
         torch.cuda.empty_cache()
         self.inputs = None
         self.output = None
+        self._product_buffer = None
+        self._dot_buffer = None
+        self._decode_step_views = ()
+        self._output_view = None
+        self._verify_output_buffer = None
 
     def get_config(self) -> BenchmarkConfig:
         # Keep iterations small; focus on relative speedups and profiling

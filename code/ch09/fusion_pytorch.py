@@ -1,9 +1,9 @@
+import math
+
 import torch
-import os
+
 from core.utils.architecture_runtime import (
     get_arch_config,
-    get_architecture,
-    get_architecture_info,
 )
 
 _ARCH_CFG = get_arch_config()
@@ -13,10 +13,11 @@ Chapter 9: Kernel Efficiency & Arithmetic Intensity Examples
 
 Kernel fusion demonstrations targeting Blackwell GPUs."""
 
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-import time
-import numpy as np
+
+GELU_TANH_SCALE = math.sqrt(2.0 / math.pi)
 
 # Custom fused activation functions
 class FusedGELU(nn.Module):
@@ -27,7 +28,7 @@ class FusedGELU(nn.Module):
     def forward(self, x):
         # Standard GELU: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
         return 0.5 * x * (1.0 + torch.tanh(
-            torch.sqrt(torch.tensor(2.0 / torch.pi)) * (x + 0.044715 * torch.pow(x, 3))
+            GELU_TANH_SCALE * (x + 0.044715 * torch.pow(x, 3))
         ))
 
 class FusedLayerNormGELU(nn.Module):
@@ -44,11 +45,12 @@ class FusedLayerNormGELU(nn.Module):
         mean = x.mean(-1, keepdim=True)
         var = x.var(-1, keepdim=True, unbiased=False)
         normalized = (x - mean) / torch.sqrt(var + self.eps)
-        scaled = normalized * self.weight + self.bias
+        normalized.mul_(self.weight).add_(self.bias)
+        scaled = normalized
         
         # Apply GELU activation
         return 0.5 * scaled * (1.0 + torch.tanh(
-            torch.sqrt(torch.tensor(2.0 / torch.pi)) * (scaled + 0.044715 * torch.pow(scaled, 3))
+            GELU_TANH_SCALE * (scaled + 0.044715 * torch.pow(scaled, 3))
         ))
 
 class FusedLinearBiasGELU(nn.Module):
@@ -179,19 +181,20 @@ def benchmark_fusion():
     iterations = 100
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream(device)
     
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(iterations):
         result_unfused = unfused_operations(x, weight, bias)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     unfused_time = start_event.elapsed_time(end_event) / iterations
     
     # Benchmark fused operations using CUDA Events
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(iterations):
         result_fused = fused_operations(x, weight, bias, ln_weight, ln_bias)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     fused_time = start_event.elapsed_time(end_event) / iterations
     
@@ -213,18 +216,18 @@ def benchmark_fusion():
     
     # Unfused attention using CUDA Events
     attn_iterations = iterations // 10  # Fewer iterations for complex operation
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(attn_iterations):
         result_attn_unfused = attention.forward_unfused(x)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     attn_unfused_time = start_event.elapsed_time(end_event) / attn_iterations
     
     # Fused attention using CUDA Events
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(attn_iterations):
         result_attn_fused = attention.forward_fused(x)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     attn_fused_time = start_event.elapsed_time(end_event) / attn_iterations
     
@@ -250,10 +253,10 @@ def benchmark_fusion():
     torch.cuda.synchronize()
     
     # Benchmark custom modules using CUDA Events
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(iterations):
         result_custom = fused_ln_gelu_compiled(x)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     custom_time = start_event.elapsed_time(end_event) / iterations
     
@@ -325,34 +328,35 @@ def demonstrate_torch_compile_fusion():
     # Create CUDA Events for benchmarking
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream(device)
     
     # Elementwise benchmark using CUDA Events
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(iterations):
         unfused_elementwise(x)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     unfused_elem_time = start_event.elapsed_time(end_event) / iterations
     
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(iterations):
         fused_elementwise(x)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     fused_elem_time = start_event.elapsed_time(end_event) / iterations
     
     # Reduction/broadcast benchmark using CUDA Events
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(iterations):
         unfused_reduction_broadcast(x)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     unfused_rb_time = start_event.elapsed_time(end_event) / iterations
     
-    start_event.record()
+    start_event.record(current_stream)
     for _ in range(iterations):
         fused_reduction_broadcast(x)
-    end_event.record()
+    end_event.record(current_stream)
     end_event.synchronize()
     fused_rb_time = start_event.elapsed_time(end_event) / iterations
     

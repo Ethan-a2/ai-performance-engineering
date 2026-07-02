@@ -13,6 +13,7 @@ serving harness (vLLM, SGLang, TensorRT-LLM).
 
 from __future__ import annotations
 
+import heapq
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ class GPUState:
     is_decode: bool
     hourly_cost: float
     metrics: GPUMetrics
+    numa_node: Optional[int] = None
     last_raw_metrics: Dict[str, float] = field(default_factory=dict)
 
     def update_metrics(self, raw: Dict[str, float]) -> None:
@@ -107,6 +109,7 @@ class SequenceInfo:
     kv_gpus: Set[str]
     expected_tokens_remaining: Optional[int] = None
     priority: int = 0
+    numa_node: Optional[int] = None
 
 
 # -------------------------
@@ -198,6 +201,7 @@ class Router:
         is_prefill: bool,
         is_decode: bool,
         hourly_cost: float = 1.0,
+        numa_node: Optional[int] = None,
     ) -> None:
         """Register a GPU in one or both pools."""
         if gpu_id in self._gpus:
@@ -205,6 +209,7 @@ class Router:
             st.is_prefill = is_prefill
             st.is_decode = is_decode
             st.hourly_cost = hourly_cost
+            st.numa_node = numa_node
             return
 
         metrics = GPUMetrics(
@@ -220,6 +225,7 @@ class Router:
             is_decode=is_decode,
             hourly_cost=hourly_cost,
             metrics=metrics,
+            numa_node=numa_node,
         )
 
     # Metrics ingestion
@@ -252,25 +258,29 @@ class Router:
     # Routing
     def choose_prefill_gpu(self) -> Optional[str]:
         """Pick a GPU for a new prefill request."""
-        cands = [g for g in self._gpus.values() if g.is_prefill]
-        if not cands:
-            return None
-        return max(cands, key=self._score_prefill_gpu).gpu_id
+        best_score = float("-inf")
+        best_gpu = None
+        for gpu in self._gpus.values():
+            if not gpu.is_prefill:
+                continue
+            score = self._score_prefill_gpu(gpu)
+            if score > best_score:
+                best_score = score
+                best_gpu = gpu.gpu_id
+        return best_gpu
 
     def choose_decode_gpu(self, seq: SequenceInfo) -> Optional[str]:
         """Pick a GPU for decode, preferring KV-local placements."""
-        cands = [g for g in self._gpus.values() if g.is_decode]
-        if not cands:
-            return None
-
         best_score = float("-inf")
         best_gpu = None
-        for g in cands:
-            kv_local = g.gpu_id in seq.kv_gpus
-            score = self._score_decode_gpu(g, kv_local=kv_local)
+        for gpu in self._gpus.values():
+            if not gpu.is_decode:
+                continue
+            kv_local = gpu.gpu_id in seq.kv_gpus
+            score = self._score_decode_gpu(gpu, kv_local=kv_local)
             if score > best_score:
                 best_score = score
-                best_gpu = g.gpu_id
+                best_gpu = gpu.gpu_id
         return best_gpu
 
     # Migration helpers
@@ -295,12 +305,12 @@ class Router:
         """
         Suggest (seq_id, src_gpu, dst_gpu) moves when decode scores are imbalanced.
         """
-        decode_gpus = [g for g in self._gpus.values() if g.is_decode]
-        if len(decode_gpus) < 2:
-            return []
-
-        scores = {g.gpu_id: self._score_decode_gpu(g) for g in decode_gpus}
-        if not scores:
+        scores = {
+            gpu.gpu_id: self._score_decode_gpu(gpu)
+            for gpu in self._gpus.values()
+            if gpu.is_decode
+        }
+        if len(scores) < 2:
             return []
 
         best = max(scores, key=scores.get)
@@ -320,18 +330,17 @@ class Router:
 
         # Move low-priority, long sequences first from lowest-scoring GPUs.
         migrations: List[Tuple[str, str, str]] = []
-        for src in sorted(scores.keys(), key=scores.get):
+        active_source_ids = [gpu_id for gpu_id in by_gpu if gpu_id in scores]
+        for src in heapq.nsmallest(len(active_source_ids), active_source_ids, key=scores.get):
             if budget <= 0:
                 break
-            if src not in by_gpu:
-                continue
-            seqs = sorted(
-                by_gpu[src],
-                key=lambda s: (s.priority, -(s.expected_tokens_remaining or 0)),
-            )
-            for seq in seqs:
-                if budget <= 0:
-                    break
+            seq_heap = [
+                (s.priority, -(s.expected_tokens_remaining or 0), order, s)
+                for order, s in enumerate(by_gpu[src])
+            ]
+            heapq.heapify(seq_heap)
+            while seq_heap and budget > 0:
+                _, _, _, seq = heapq.heappop(seq_heap)
                 dst = self._choose_migration_target(seq, scores)
                 if dst is None or dst == src:
                     continue

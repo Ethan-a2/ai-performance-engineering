@@ -5,9 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-import statistics
 import sys
-import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
@@ -130,17 +128,30 @@ def benchmark_schedule(
     torch.cuda.synchronize()
 
     times_ms: List[float] = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
     for _ in range(max(1, iterations)):
-        torch.cuda.synchronize()
-        start = time.perf_counter()
+        start_event.record(current_stream)
         runner()
-        torch.cuda.synchronize()
-        times_ms.append((time.perf_counter() - start) * 1e3)
+        end_event.record(current_stream)
+        end_event.synchronize()
+        times_ms.append(start_event.elapsed_time(end_event))
 
-    mean_ms = statistics.mean(times_ms)
-    median_ms = statistics.median(times_ms)
-    min_ms = min(times_ms)
-    max_ms = max(times_ms)
+    sample_count = len(times_ms)
+    total_ms = 0.0
+    for time_ms in times_ms:
+        total_ms += time_ms
+
+    times_ms.sort()
+    midpoint = sample_count // 2
+    if sample_count % 2:
+        median_ms = times_ms[midpoint]
+    else:
+        median_ms = (times_ms[midpoint - 1] + times_ms[midpoint]) / 2.0
+    mean_ms = total_ms / sample_count
+    min_ms = times_ms[0]
+    max_ms = times_ms[-1]
 
     total_flops = 2.0 * size_m * size_n * size_k
     tflops = (total_flops / (mean_ms / 1e3)) / 1e12

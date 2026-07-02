@@ -27,10 +27,11 @@ REQUIREMENTS:
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
 
 from ch14.triton_persistent_batched import matmul_persistent_batched
 from core.benchmark.verification_mixin import VerificationPayloadMixin
@@ -39,7 +40,6 @@ from core.harness.benchmark_harness import (
     BenchmarkConfig,
     WorkloadMetadata,
 )
-
 
 #============================================================================
 # Standard (Non-Persistent) GEMM Kernel
@@ -386,30 +386,31 @@ def benchmark_kernels():
         # Benchmark standard
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream(device)
         
-        start.record()
+        start.record(current_stream)
         for _ in range(20):
             _ = matmul_standard(a, b)
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         
         ms_standard = start.elapsed_time(end) / 20
         
         # Benchmark persistent
-        start.record()
+        start.record(current_stream)
         for _ in range(20):
             _ = matmul_persistent(a, b, num_sms)
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         
         ms_persistent = start.elapsed_time(end) / 20
         
         # Benchmark atomic
-        start.record()
+        start.record(current_stream)
         for _ in range(20):
             _ = matmul_persistent_atomic(a, b, num_sms)
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         
         ms_atomic = start.elapsed_time(end) / 20
         
@@ -434,9 +435,14 @@ def benchmark_kernels():
     c_pers = matmul_persistent(a, b, num_sms)
     c_atom = matmul_persistent_atomic(a, b, num_sms)
     
-    std_err = (c_std - ref).abs().max().item()
-    pers_err = (c_pers - ref).abs().max().item()
-    atom_err = (c_atom - ref).abs().max().item()
+    error_stats = torch.empty(3, device=ref.device, dtype=torch.float32)
+    error_stats[0].copy_((c_std - ref).abs().max())
+    error_stats[1].copy_((c_pers - ref).abs().max())
+    error_stats[2].copy_((c_atom - ref).abs().max())
+    error_stats_host = error_stats.detach().cpu()
+    std_err = float(error_stats_host[0])
+    pers_err = float(error_stats_host[1])
+    atom_err = float(error_stats_host[2])
     
     print(f"Standard max error: {std_err:.6f}")
     print(f"Persistent max error: {pers_err:.6f}")
@@ -496,7 +502,6 @@ class TritonPersistentDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def benchmark_fn(self) -> None:
         """Benchmark: Persistent GEMM kernel."""
         self.output = matmul_persistent_batched(self.a, self.b, self.num_sms, out=self._output_buffer)
-        self._last = float(self.output.sum())
         if self.output is None or self.a is None or self.b is None:
             raise RuntimeError("benchmark_fn() must produce output")
 
@@ -547,4 +552,3 @@ class TritonPersistentDemoBenchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> BaseBenchmark:
     """Factory function for benchmark discovery."""
     return TritonPersistentDemoBenchmark()
-

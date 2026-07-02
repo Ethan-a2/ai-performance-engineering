@@ -12,9 +12,9 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
-from core.harness.arch_config import prefer_sdpa_backends
 from core.benchmark.cuda_event_timing import elapsed_ms
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.harness.arch_config import prefer_sdpa_backends
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
 from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
@@ -46,13 +46,23 @@ class OptimizedDecodeAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self._k_version: Optional[int] = None
         self._v_version: Optional[int] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         tokens = self.batch * self.kv_seq
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch),
             tokens_per_iteration=float(tokens),
         )
-        self._history: Dict[str, List[float]] = {"latency_ms": []}
+        self._payload_meta: Optional[torch.Tensor] = None
+        self._timing_pair: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
         self._pending_timing_pair: Optional[tuple[torch.cuda.Event, torch.cuda.Event]] = None
+        self._enable_nvtx = False
+        self._latency_total_ms = 0.0
+        self._latency_count = 0
+        self._latency_metric_values = [0.0]
+        self._iteration_metric_payload: Dict[str, List[float]] = {
+            "decode_ms": self._latency_metric_values,
+        }
+        self._verification_payload = None
 
     def setup(self) -> None:
         if not torch.cuda.is_available():
@@ -61,6 +71,8 @@ class OptimizedDecodeAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark)
         # Optimization: Enable TF32 for faster matmuls
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
 
         # Verification inputs remain FP32 so workload signatures match the baseline.
         self.q = torch.randn(self.batch, self.num_heads, 1, self.head_dim, device=self.device, dtype=torch.float32)
@@ -78,9 +90,33 @@ class OptimizedDecodeAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self._refresh_bf16_cache(force=True)
         torch.cuda.synchronize(self.device)
         self.output = None
+        self._verify_output_buffer = torch.empty(
+            (self.batch, 1, self.num_heads * self.head_dim),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._latency_total_ms = 0.0
+        self._latency_count = 0
+        self._payload_meta = torch.tensor(
+            [self.batch, self.kv_seq, self.num_heads, self.head_dim],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self._timing_pair = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+
+    def _get_timing_pair(self) -> tuple[torch.cuda.Event, torch.cuda.Event]:
+        if self._timing_pair is None:
+            self._timing_pair = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        return self._timing_pair
 
     def _refresh_bf16_cache(self, *, force: bool = False) -> None:
-        if any(t is None for t in (self.q, self.k, self.v)):
+        if self.q is None or self.k is None or self.v is None:
             raise RuntimeError("Decode tensors missing")
 
         for source_name, cache_name, version_name in (
@@ -97,39 +133,33 @@ class OptimizedDecodeAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark)
                 setattr(self, version_name, current_version)
 
     def benchmark_fn(self) -> Dict[str, List[float]]:
-        if any(t is None for t in (self.q, self.k, self.v)):
+        if self.q is None or self.k is None or self.v is None:
             raise RuntimeError("Decode tensors missing")
-        if any(t is None for t in (self._q_bf16, self._k_bf16, self._v_bf16)):
+        if self._q_bf16 is None or self._k_bf16 is None or self._v_bf16 is None:
             raise RuntimeError("BF16 decode tensors missing")
 
         # Verification re-runs can perturb the FP32 source tensors in place. Refresh the
         # BF16 mirrors only for that path so steady-state measurements stay cache-only.
-        if getattr(self, "_verification_payload", None) is not None:
+        if self._verification_payload is not None:
             self._refresh_bf16_cache()
 
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        with nvtx_range("moe_cuda_decode_optimized", enable=enable_nvtx):
+        with nvtx_range("moe_cuda_decode_optimized", enable=self._enable_nvtx):
             with torch.inference_mode():
-                start_event = torch.cuda.Event(enable_timing=True)
-                end_event = torch.cuda.Event(enable_timing=True)
-                start_event.record()
+                timing_pair = self._get_timing_pair()
+                start_event, end_event = timing_pair
+                current_stream = torch.cuda.current_stream(self.device)
+                start_event.record(current_stream)
                 q = self._q_bf16
                 k = self._k_bf16
                 v = self._v_bf16
                 with prefer_sdpa_backends():
                     attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-                attn_out = attn.transpose(1, 2).reshape(self.batch, 1, self.num_heads * self.head_dim)
-                end_event.record()
-                self._pending_timing_pair = (start_event, end_event)
-                self.output = attn_out.detach().float().clone()
+                attn_out = attn.transpose(1, 2).reshape(attn.shape[0], attn.shape[2], -1)
+                end_event.record(current_stream)
+                self._pending_timing_pair = timing_pair
+                self.output = attn_out
         if self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
-        meta = torch.tensor(
-            [self.batch, self.kv_seq, self.num_heads, self.head_dim],
-            dtype=torch.int64,
-            device="cpu",
-        )
-        self._payload_meta = meta
         return None
 
     def finalize_iteration_metrics(self) -> Optional[Dict[str, List[float]]]:
@@ -137,15 +167,20 @@ class OptimizedDecodeAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark)
             return None
         latency_ms = elapsed_ms(self._pending_timing_pair)
         self._pending_timing_pair = None
-        self._history["latency_ms"].append(latency_ms)
-        return {"decode_ms": [latency_ms]}
+        self._latency_total_ms += latency_ms
+        self._latency_count += 1
+        self._latency_metric_values[0] = latency_ms
+        return self._iteration_metric_payload
 
     def capture_verification_payload(self) -> None:
         self.finalize_iteration_metrics()
         meta = self._payload_meta
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"meta": meta, "q": self.q, "k": self.k, "v": self.v},
-            output=self.output,
+            output=self._verify_output_buffer,
             batch_size=self.batch,
             parameter_count=0,
             precision_flags={"tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -163,6 +198,12 @@ class OptimizedDecodeAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self._k_version = None
         self._v_version = None
         self.output = None
+        self._verify_output_buffer = None
+        self._payload_meta = None
+        self._timing_pair = None
+        self._pending_timing_pair = None
+        self._latency_total_ms = 0.0
+        self._latency_count = 0
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -173,10 +214,10 @@ class OptimizedDecodeAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark)
 
     def get_custom_metrics(self) -> Optional[Dict[str, float]]:
         self.finalize_iteration_metrics()
-        if not self._history["latency_ms"]:
+        if self._latency_count <= 0:
             return None
         return {
-            "decode.mean_ms": float(sum(self._history["latency_ms"]) / len(self._history["latency_ms"]))
+            "decode.mean_ms": float(self._latency_total_ms / self._latency_count)
         }
 
     def validate_result(self) -> Optional[str]:

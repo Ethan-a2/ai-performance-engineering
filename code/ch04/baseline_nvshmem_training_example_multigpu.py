@@ -29,6 +29,9 @@ class NVSHMEMTrainingExampleMultiGPU(VerificationPayloadMixin, BaseBenchmark):
     def __init__(self) -> None:
         super().__init__()
         self.register_workload_metadata(requests_per_iteration=1.0)
+        self._benchmark_argv: list[str] = []
+        self._original_argv: Optional[list[str]] = None
+        self._original_env: dict[str, Optional[str]] = {}
         self._verify_input: Optional[torch.Tensor] = None
 
     def setup(self) -> None:
@@ -38,37 +41,45 @@ class NVSHMEMTrainingExampleMultiGPU(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("SKIPPED: nvshmem_training_example requires NVSHMEM or SymmetricMemory support")
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        self._benchmark_argv = [
+            sys.argv[0],
+            "--demo",
+            "pipeline",
+            "--batch-size",
+            "2",
+            "--seq-len",
+            "256",
+            "--dim",
+            "384",
+            "--steps",
+            "240",
+        ]
+        self._original_argv = sys.argv
+        self._original_env = {
+            "AISP_NVSHMEM_PIPELINE_REUSE_BUFFERS": os.environ.get("AISP_NVSHMEM_PIPELINE_REUSE_BUFFERS"),
+        }
+        os.environ["AISP_NVSHMEM_PIPELINE_REUSE_BUFFERS"] = "0"
+        sys.argv = self._benchmark_argv
         self._verify_input = torch.randn(64, 64, device=self.device, dtype=torch.float32)
 
     def benchmark_fn(self) -> None:
-        original_argv = sys.argv[:]
-        original_reuse = os.environ.get("AISP_NVSHMEM_PIPELINE_REUSE_BUFFERS")
-        try:
-            os.environ["AISP_NVSHMEM_PIPELINE_REUSE_BUFFERS"] = "0"
-            sys.argv = [
-                original_argv[0],
-                "--demo",
-                "pipeline",
-                "--batch-size",
-                "2",
-                "--seq-len",
-                "256",
-                "--dim",
-                "384",
-                "--steps",
-                "240",
-            ]
-            nvshmem_train_main()
-        finally:
-            sys.argv = original_argv
-            if original_reuse is None:
-                os.environ.pop("AISP_NVSHMEM_PIPELINE_REUSE_BUFFERS", None)
-            else:
-                os.environ["AISP_NVSHMEM_PIPELINE_REUSE_BUFFERS"] = original_reuse
+        if not self._benchmark_argv:
+            raise RuntimeError("setup() must initialize benchmark argv before benchmark_fn()")
+        nvshmem_train_main()
 
     def teardown(self) -> None:
         if dist.is_initialized():
             dist.destroy_process_group()
+        if self._original_argv is not None:
+            sys.argv = self._original_argv
+            self._original_argv = None
+        for key, value in self._original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self._original_env = {}
+        self._benchmark_argv = []
         torch.cuda.empty_cache()
 
     def capture_verification_payload(self) -> None:

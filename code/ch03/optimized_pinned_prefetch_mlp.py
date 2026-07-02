@@ -7,7 +7,6 @@ as baseline for fair verification comparison.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import List, Optional
 
 import torch
@@ -25,6 +24,7 @@ class Prefetcher:
         self.device = device
         self.host_batches = host_batches
         self.targets = targets
+        self.batch_count = len(host_batches)
         self.copy_stream = torch.cuda.Stream()
         self.buffers = [
             torch.empty_like(host_batches[0], device=device, dtype=host_batches[0].dtype),
@@ -40,19 +40,22 @@ class Prefetcher:
         self._inflight = False
         self._prefetch()
 
-    def _prefetch(self) -> None:
-        host_idx = self.batch_idx % len(self.host_batches)
+    def _prefetch(self, wait_stream: Optional[torch.cuda.Stream] = None) -> None:
+        host_idx = self.batch_idx % self.batch_count
         self.batch_idx += 1
         with torch.cuda.stream(self.copy_stream):
+            if wait_stream is not None:
+                self.copy_stream.wait_stream(wait_stream)
             self.buffers[self.next_slot].copy_(self.host_batches[host_idx], non_blocking=True)
             self.target_bufs[self.next_slot].copy_(self.targets[host_idx], non_blocking=True)
         self._inflight = True
 
     def next(self) -> tuple[torch.Tensor, torch.Tensor]:
-        torch.cuda.current_stream().wait_stream(self.copy_stream)
+        current_stream = torch.cuda.current_stream()
+        current_stream.wait_stream(self.copy_stream)
         if self._inflight:
             self.cur_slot, self.next_slot = self.next_slot, self.cur_slot
-            self._prefetch()
+            self._prefetch(wait_stream=current_stream)
         return self.buffers[self.cur_slot], self.target_bufs[self.cur_slot]
 
 
@@ -69,6 +72,7 @@ class OptimizedPinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmar
         self.output: Optional[torch.Tensor] = None
         self._payload_inputs: Optional[torch.Tensor] = None
         self._payload_targets: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
         # Training benchmarks don't support jitter check - outputs change due to weight updates
         # Larger transfers to make H2D optimization measurable on high-bandwidth GPUs
         # The prefetcher benefit is proportional to (H2D time / compute time)
@@ -92,10 +96,11 @@ class OptimizedPinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmar
         # Use same model architecture as baseline for fair comparison
         self.model = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
-            nn.ReLU(),  # Same activation as baseline
+            nn.ReLU(inplace=True),  # Same activation as baseline
             nn.Linear(self.hidden_dim, self.output_dim),
         ).to(self.device)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-2)
+        self._payload_parameter_count = sum(p.numel() for p in self.model.parameters())
 
         # Use pinned memory for efficient async H2D transfer (the optimization)
         for _ in range(self.num_batches):
@@ -106,10 +111,6 @@ class OptimizedPinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmar
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
         assert (
             self.model is not None
             and self.optimizer is not None
@@ -117,7 +118,7 @@ class OptimizedPinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmar
         )
 
         inputs, targets = self.prefetcher.next()
-        with nvtx_range("optimized_pinned_prefetch_mlp", enable=enable_nvtx):
+        with self._nvtx_range("optimized_pinned_prefetch_mlp"):
             out = self.model(inputs)
             loss = torch.nn.functional.mse_loss(out, targets)
             self.optimizer.zero_grad(set_to_none=True)
@@ -125,7 +126,7 @@ class OptimizedPinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmar
             self.optimizer.step()
         
         # Store output for verification
-        self.output = out.detach()
+        self.output = out.detach_()
         self._payload_inputs = inputs
         self._payload_targets = targets
 
@@ -136,7 +137,7 @@ class OptimizedPinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmar
             inputs={"data": self._payload_inputs, "target": self._payload_targets},
             output=self.output,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -183,4 +184,3 @@ class OptimizedPinnedPrefetchMLPBenchmark(VerificationPayloadMixin, BaseBenchmar
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedPinnedPrefetchMLPBenchmark()
-

@@ -43,6 +43,8 @@ class OptimizedPieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._verify_input: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._payload_verify_tokens: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._enable_nvtx = False
 
         self._workload = WorkloadMetadata(
             requests_per_iteration=1.0,
@@ -56,6 +58,8 @@ class OptimizedPieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def setup(self) -> None:
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         self.model = RegionalPieceGraph(
             hidden_dim=self.hidden_dim_val,
             n_layers=self.n_layers_val,
@@ -71,6 +75,7 @@ class OptimizedPieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
             device=self.device,
             dtype=torch.float16,
         )
+        self._verify_output_buffer = torch.empty_like(self._verify_input, dtype=torch.float32)
         self._capture_piece_graphs()
 
     def _capture_piece_graphs(self) -> None:
@@ -123,13 +128,11 @@ class OptimizedPieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         seq_len = self.seq_len
         (head_graph, head_input, head_output), (tail_graph, tail_input, tail_output) = self.graph_cache[seq_len]
 
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
         head_input.copy_(self._verify_input)
-        with nvtx_range("piece_graph_head", enable=enable_nvtx):
+        with nvtx_range("piece_graph_head", enable=self._enable_nvtx):
             head_graph.replay()
         tail_input.copy_(head_output)
-        with nvtx_range("piece_graph_tail", enable=enable_nvtx):
+        with nvtx_range("piece_graph_tail", enable=self._enable_nvtx):
             tail_graph.replay()
         self.output = tail_output
         self._payload_verify_tokens = self._verify_input
@@ -138,11 +141,12 @@ class OptimizedPieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         verify_tokens = self._payload_verify_tokens
         if verify_tokens is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
-        if self.output is None:
+        if self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": verify_tokens},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=verify_tokens.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -158,6 +162,7 @@ class OptimizedPieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model = None
         self._verify_input = None
         self._payload_verify_tokens = None
+        self._verify_output_buffer = None
         self.graph_cache.clear()
         torch.cuda.empty_cache()
 
@@ -190,4 +195,3 @@ class OptimizedPieceGraphsBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedPieceGraphsBenchmark()
-

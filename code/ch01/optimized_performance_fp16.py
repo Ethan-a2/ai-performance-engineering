@@ -58,8 +58,14 @@ class OptimizedPerformanceFP16Benchmark(VerificationPayloadMixin, BaseBenchmark)
         self.targets = None
         self.optimizer = None
         self._verify_input = None
+        self._verify_model_input = None
         self._verify_output = None
         self.parameter_count = 0
+        self._microbatch_groups = None
+        self._target_groups = None
+        self._group_sizes = None
+        self._training_groups = None
+        self._model_dtype = torch.float32
         self._tf32_state: tuple[bool, bool | None] | None = None
         self.register_workload_metadata(
             samples_per_iteration=PERFORMANCE_FP16_WORKLOAD.samples_per_iteration,
@@ -77,6 +83,7 @@ class OptimizedPerformanceFP16Benchmark(VerificationPayloadMixin, BaseBenchmark)
         else:
             dtype = torch.float32
         self.model = self.model.to(self.device).eval()
+        self._model_dtype = dtype
         self.parameter_count = sum(p.numel() for p in self.model.parameters())
 
         self.microbatches = [
@@ -90,7 +97,8 @@ class OptimizedPerformanceFP16Benchmark(VerificationPayloadMixin, BaseBenchmark)
 
         # Match baseline input signature: verification inputs are FP32.
         self._verify_input = self.microbatches[0].float().clone()
-        self._verify_output = None
+        self._verify_model_input = self._verify_input.to(dtype=dtype, device=self.device)
+        self._verify_output = torch.empty(self._verify_input.shape[0], 10, device=self.device, dtype=torch.float32)
 
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=1e-3)
         for _ in range(3):
@@ -101,39 +109,56 @@ class OptimizedPerformanceFP16Benchmark(VerificationPayloadMixin, BaseBenchmark)
             self.optimizer.step()
         self._synchronize()
         self.optimizer.zero_grad(set_to_none=True)
+        self._microbatch_groups = []
+        self._target_groups = []
+        self._group_sizes = []
+        self._training_groups = []
+        for start in range(0, len(self.microbatches), self.fusion):
+            data_group = tuple(self.microbatches[start : start + self.fusion])
+            target_group = tuple(self.targets[start : start + self.fusion])
+            paired_group = tuple(zip(data_group, target_group, strict=True))
+            group_size = len(data_group)
+            self._microbatch_groups.append(data_group)
+            self._target_groups.append(target_group)
+            self._group_sizes.append(group_size)
+            self._training_groups.append((paired_group, group_size))
 
     def benchmark_fn(self) -> None:
-        assert self.model is not None and self.microbatches is not None and self.targets is not None
+        assert (
+            self.model is not None
+            and self._microbatch_groups is not None
+            and self._target_groups is not None
+            and self._group_sizes is not None
+            and self._training_groups is not None
+        )
         with self._nvtx_range("optimized_performance_fp16"):
             # Keep the baseline's microbatch grouping intact; the only timed change is precision.
-            total = len(self.microbatches)
-            for start in range(0, total, self.fusion):
-                group_data = self.microbatches[start : start + self.fusion]
-                group_targets = self.targets[start : start + self.fusion]
-                group_size = max(1, len(group_data))
+            for paired_group, group_size in self._training_groups:
                 self.optimizer.zero_grad(set_to_none=True)
-                for data, target in zip(group_data, group_targets):
+                for data, target in paired_group:
                     logits = self.model(data)
                     loss = torch.nn.functional.cross_entropy(logits, target)
                     (loss / group_size).backward()
                 self.optimizer.step()
 
     def capture_verification_payload(self) -> None:
-        if self.model is None or self._verify_input is None:
+        if (
+            self.model is None
+            or self._verify_input is None
+            or self._verify_model_input is None
+            or self._verify_output is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
-        with torch.no_grad():
-            model_params = list(self.model.parameters())
-            verify_input = self._verify_input
-            if model_params:
-                verify_input = verify_input.to(dtype=model_params[0].dtype, device=self.device)
-            self._verify_output = self.model(verify_input).float().clone()
+        with torch.inference_mode():
+            verify_output = self.model(self._verify_model_input)
+            self._verify_output.copy_(verify_output)
         self._set_verification_payload(
             inputs={"verify_input": self._verify_input},
             output=self._verify_output,
             batch_size=self._verify_input.shape[0],
             parameter_count=int(self.parameter_count),
             precision_flags={
-                "fp16": bool(model_params) and model_params[0].dtype == torch.float16,
+                "fp16": self._model_dtype == torch.float16,
                 "bf16": False,
                 "fp8": False,
                 "tf32": torch.cuda.is_available() and bool(torch.backends.cuda.matmul.allow_tf32),
@@ -143,6 +168,14 @@ class OptimizedPerformanceFP16Benchmark(VerificationPayloadMixin, BaseBenchmark)
 
     def teardown(self) -> None:
         del self.model, self.microbatches, self.targets, self.optimizer
+        self._microbatch_groups = None
+        self._target_groups = None
+        self._group_sizes = None
+        self._training_groups = None
+        self._verify_input = None
+        self._verify_model_input = None
+        self._verify_output = None
+        self._model_dtype = torch.float32
         restore_tf32_state(self._tf32_state)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

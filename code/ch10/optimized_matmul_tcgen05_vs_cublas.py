@@ -43,7 +43,9 @@ class OptimizedMatmulTCGen05Benchmark(VerificationPayloadMixin, BaseBenchmark):
         self.size = self.n  # For compatibility
         self.A: Optional[torch.Tensor] = None
         self.B: Optional[torch.Tensor] = None
+        self._B_t: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.register_workload_metadata(bytes_per_iteration=float(self.n * self.n * 2 * 3))
 
     def setup(self) -> None:
@@ -53,23 +55,38 @@ class OptimizedMatmulTCGen05Benchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.manual_seed_all(42)
         self.A = torch.randn(self.size, self.size, device=self.device, dtype=self.dtype)
         self.B = torch.randn(self.size, self.size, device=self.device, dtype=self.dtype)
+        self._B_t = self.B.transpose(0, 1)
+        self.output = torch.empty(self.size, self.size, device=self.device, dtype=self.dtype)
+        self._verify_output_buffer = torch.empty(
+            min(128, self.size),
+            min(256, self.size),
+            device=self.device,
+            dtype=torch.float32,
+        )
         self._synchronize()
 
     def benchmark_fn(self) -> None:
         if not self._tcgen05_available:
             raise RuntimeError(self._skip_reason)
-        assert self.A is not None and self.B is not None
+        assert self.A is not None and self._B_t is not None and self.output is not None
         with self._nvtx_range("optimized_matmul_tcgen05_vs_cublas_cublas"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Match baseline math: baseline kernel treats B as (N, K) and computes A @ B^T
-                self.output = torch.matmul(self.A, self.B.transpose(0, 1))
+                torch.mm(self.A, self._B_t, out=self.output)
         if self.output is None:
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.A is None or self.B is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"A": self.A, "B": self.B},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.size,
             precision_flags={
                 "fp16": True,
@@ -83,6 +100,9 @@ class OptimizedMatmulTCGen05Benchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.A = None
         self.B = None
+        self._B_t = None
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

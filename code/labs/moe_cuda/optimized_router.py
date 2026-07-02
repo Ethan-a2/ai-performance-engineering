@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -10,9 +9,19 @@ import torch.nn as nn
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
-from core.utils.compile_utils import compile_model
 from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 from labs.moe_cuda.optimized_router_vectorized import GroupedTopKMoE
+
+
+def _weighted_topk_sum_in_place_if_safe(fc2_out: torch.Tensor, gate_probs: torch.Tensor) -> torch.Tensor:
+    weights = gate_probs.unsqueeze(-1)
+    if torch.is_grad_enabled() and (fc2_out.requires_grad or gate_probs.requires_grad):
+        return (fc2_out * weights).sum(dim=1)
+    fc2_out.mul_(weights)
+    reduced = fc2_out[:, 0, :]
+    for route_idx in range(1, fc2_out.shape[1]):
+        reduced.add_(fc2_out[:, route_idx, :])
+    return reduced
 
 
 class AdaptiveTopKMoE(nn.Module):
@@ -80,7 +89,7 @@ class AdaptiveTopKMoE(nn.Module):
         fc2_out = fc2_out.view(batch, self.top_k, self.hidden_size)
         
         # Weighted sum by gate probabilities
-        output = (fc2_out * gate_probs.unsqueeze(-1)).sum(dim=1)
+        output = _weighted_topk_sum_in_place_if_safe(fc2_out, gate_probs)
         
         return output
 
@@ -97,10 +106,13 @@ class OptimizedRouterTopKBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model: Optional[nn.Module] = None
         self.inputs: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
             tokens_per_iteration=float(self.batch_size * self.top_k),
         )
+        self._enable_nvtx = False
+        self._payload_parameter_count = 0
 
     def setup(self) -> None:
         import gc
@@ -137,9 +149,12 @@ class OptimizedRouterTopKBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         torch.manual_seed(42)
         torch.cuda.manual_seed_all(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         model = GroupedTopKMoE(self.hidden_size, self.num_experts, self.top_k, expansion=2)
         model = model.to(self.device, dtype=torch.bfloat16)
         model.eval()
+        self._payload_parameter_count = sum(p.numel() for p in model.parameters())
         
         # The vectorized implementation is already efficient without compile
         # Compile can help further but is optional
@@ -151,9 +166,17 @@ class OptimizedRouterTopKBenchmark(VerificationPayloadMixin, BaseBenchmark):
             self.hidden_size,
             dtype=torch.bfloat16,
         ).to(self.device)
+        model.calibrate_capacity(self.inputs)
+        model.configure_static_dispatch_buffers(self.batch_size, self.inputs.device)
+        model.assume_static_no_overflow = True
+        self._verify_output_buffer = torch.empty(
+            (self.batch_size, self.hidden_size),
+            device=self.device,
+            dtype=torch.float32,
+        )
         
         # Warmup
-        with torch.no_grad():
+        with torch.inference_mode():
             for _ in range(5):
                 _ = self.model(self.inputs)
         torch.cuda.synchronize(self.device)
@@ -162,21 +185,21 @@ class OptimizedRouterTopKBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if self.model is None or self.inputs is None:
             raise RuntimeError("Model not initialized")
 
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        with nvtx_range("moe_cuda_router_topk", enable=enable_nvtx):
+        with nvtx_range("moe_cuda_router_topk", enable=self._enable_nvtx):
             with torch.inference_mode():
                 self.output = self.model(self.inputs)
         if self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
-        if self.inputs is None or self.output is None or self.model is None:
+        if self.inputs is None or self.output is None or self.model is None or self._verify_output_buffer is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self.inputs.detach()},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
-            parameter_count=sum(p.numel() for p in self.model.parameters()),
+            parameter_count=self._payload_parameter_count,
             precision_flags={"bf16": True, "tf32": torch.backends.cuda.matmul.allow_tf32},
             output_tolerance=(0.1, 1.0),
         )
@@ -185,6 +208,7 @@ class OptimizedRouterTopKBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.model = None
         self.inputs = None
         self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:

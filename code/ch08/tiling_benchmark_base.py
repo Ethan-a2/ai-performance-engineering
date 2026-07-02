@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.benchmark.utils import scalar_tensor_to_float
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
 from core.utils.extension_loader_template import load_cuda_extension
 
@@ -37,6 +38,7 @@ class TilingBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         self.matrix_b: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._output_buffer: Optional[torch.Tensor] = None
+        self._inner_iteration_range = range(self.inner_iterations)
         self.register_workload_metadata(requests_per_iteration=float(self.inner_iterations))
 
     def _resolve_device(self) -> torch.device:
@@ -76,17 +78,12 @@ class TilingBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
 
     def benchmark_fn(self) -> None:
         """Run the core kernel with NVTX labeling."""
-        from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
         if self._output_buffer is None:
             raise RuntimeError("setup() must initialize the output buffer")
         self.output = self._output_buffer
 
-        with nvtx_range(self.nvtx_label, enable=enable_nvtx):
-            for _ in range(self.inner_iterations):
+        with torch.inference_mode(), self._nvtx_range(self.nvtx_label):
+            for _ in self._inner_iteration_range:
                 self._invoke_kernel()
 
     def capture_verification_payload(self) -> None:
@@ -131,7 +128,7 @@ class TilingBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
             reference = torch.matmul(self.matrix_a, self.matrix_b)
         torch.cuda.synchronize()
 
-        max_error = torch.max(torch.abs(self.output - reference)).item()
+        max_error = scalar_tensor_to_float(torch.max(torch.abs(self.output - reference)))
         # Large GEMMs accumulate floating-point error quickly; tolerate small
         # absolute differences that stem from reordering in the tiled kernel.
         if max_error > 1e-1:

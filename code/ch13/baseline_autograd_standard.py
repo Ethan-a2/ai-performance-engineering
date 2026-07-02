@@ -19,7 +19,7 @@ class SimpleModel(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim, hidden_dim * 2)
         self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.relu = nn.ReLU()
+        self.relu = nn.ReLU(inplace=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.relu(self.fc1(x))
@@ -46,6 +46,8 @@ class BaselineAutogradStandardBenchmark(VerificationPayloadMixin, BaseBenchmark)
             tokens_per_iteration=float(tokens),
         )
         self.output = None
+        self.output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.register_workload_metadata(
             requests_per_iteration=1.0,
             tokens_per_iteration=float(tokens),
@@ -59,6 +61,8 @@ class BaselineAutogradStandardBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.model = SimpleModel(hidden_dim=self.hidden_dim).to(self.device).half().train()
         self.inputs = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float16)
         self.targets = torch.randn(self.batch_size, self.hidden_dim, device=self.device, dtype=torch.float16)
+        self.output_buffer = torch.empty_like(self.inputs)
+        self._verify_output_buffer = torch.empty_like(self.inputs, dtype=torch.float32)
         self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
         self.criterion = nn.MSELoss()
 
@@ -75,15 +79,22 @@ class BaselineAutogradStandardBenchmark(VerificationPayloadMixin, BaseBenchmark)
         assert self.model is not None and self.optimizer is not None and self.criterion is not None
         self.optimizer.zero_grad(set_to_none=False)
         outputs = self.model(batch)
-        if capture_output:
-            self.output = outputs.detach().clone()
+        if capture_output and self.output_buffer is not None:
+            self.output_buffer.copy_(outputs)
+            self.output = self.output_buffer
         loss = self.criterion(outputs, target)
         loss.backward()
         self.optimizer.step()
     
     def benchmark_fn(self) -> None:
         """Function to benchmark - standard autograd."""
-        if any(v is None for v in (self.model, self.inputs, self.targets, self.optimizer, self.criterion)):
+        if (
+            self.model is None
+            or self.inputs is None
+            or self.targets is None
+            or self.optimizer is None
+            or self.criterion is None
+        ):
             raise RuntimeError("Benchmark not configured")
 
         with self._nvtx_range("baseline_autograd_standard"):
@@ -92,9 +103,12 @@ class BaselineAutogradStandardBenchmark(VerificationPayloadMixin, BaseBenchmark)
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self.inputs, "targets": self.targets},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             precision_flags={
                 "fp16": True,
@@ -113,6 +127,9 @@ class BaselineAutogradStandardBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.targets = None
         self.optimizer = None
         self.criterion = None
+        self.output = None
+        self.output_buffer = None
+        self._verify_output_buffer = None
         super().teardown()
     
     def get_config(self) -> BenchmarkConfig:

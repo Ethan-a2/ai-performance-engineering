@@ -9,9 +9,10 @@ systems with Nsight Systems, Nsight Compute, and the PyTorch profiler.
 from __future__ import annotations
 
 import csv
-import os
+import heapq
 import re
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -189,10 +190,10 @@ class NsightSystemsProfiler:
         kernel_regex: Optional[str],
         top_k: int,
     ) -> List[Dict[str, str]]:
-        rows = kernel_rows
+        rows: Iterable[Dict[str, str]] = kernel_rows
         if kernel_regex:
             pattern = re.compile(kernel_regex)
-            rows = [row for row in rows if pattern.search(row.get("Name", ""))]
+            rows = (row for row in kernel_rows if pattern.search(row.get("Name", "")))
 
         def parse_pct(row: Dict[str, str]) -> float:
             value = row.get("Time (%)") or row.get("Time (%) [sum]", "0")
@@ -201,7 +202,7 @@ class NsightSystemsProfiler:
             except ValueError:
                 return 0.0
 
-        return sorted(rows, key=parse_pct, reverse=True)[:top_k]
+        return heapq.nlargest(top_k, rows, key=parse_pct)
 
     @staticmethod
     def _print_nsys_summary(summary: Dict[str, Any], kernel_regex: Optional[str]) -> None:
@@ -319,7 +320,7 @@ def complete_profiling_workflow(
     print("=" * 80)
 
     def run_model() -> None:
-        with torch.no_grad():
+        with torch.inference_mode():
             model(input_tensor)
 
     print("\nStep 1: PyTorch Profiler")
@@ -476,7 +477,7 @@ if __name__ == "__main__":
     x = torch.randn(32, 1024, device=exec_device)
 
     def run_model() -> None:
-        with torch.no_grad():
+        with torch.inference_mode():
             model(x)
 
     profile_with_pytorch_profiler(run_model, output_dir="./example_profiling")

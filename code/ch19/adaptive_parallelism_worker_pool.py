@@ -18,16 +18,12 @@ Usage:
     result = pool_manager.inference(prompt="...", max_tokens=100)
 """
 
-import torch
-import torch.distributed as dist
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
 import threading
 import queue
 import time
-import psutil
-from collections import deque
 
 
 class ParallelismStrategy(Enum):
@@ -73,6 +69,19 @@ class GPUMetrics:
     memory_util: float  # 0-100%
     temperature: float
     
+
+def _count_whitespace_separated_tokens(text: str) -> int:
+    """Count split-like tokens without allocating a list of substrings."""
+    count = 0
+    in_token = False
+    for char in text:
+        if char.isspace():
+            in_token = False
+        elif not in_token:
+            count += 1
+            in_token = True
+    return count
+
 
 class WorkerPool:
     """
@@ -178,14 +187,14 @@ class WorkerPool:
         except queue.Empty:
             pass
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         
         # Simulate inference (in production, would call actual model)
         # For demonstration, we just sleep based on estimated latency
         estimated_latency = self.get_estimated_latency(request)
         time.sleep(estimated_latency / 1000.0)
         
-        actual_latency = (time.time() - start_time) * 1000.0
+        actual_latency = (time.perf_counter() - start_time) * 1000.0
         
         with self.lock:
             self.active_requests -= 1
@@ -380,40 +389,51 @@ class AdaptiveParallelismManager:
         else:
             preferred_strategy = ParallelismStrategy.TENSOR_PARALLEL
         
-        candidate_pools = [pool for pool in self.pools if pool.can_handle(request)]
-        if not candidate_pools:
-            candidate_pools = self.pools
-        
-        latency_estimates: List[Tuple[WorkerPool, float]] = []
-        for pool in candidate_pools:
+        best_pool: Optional[WorkerPool] = None
+        best_key: Optional[Tuple[int, int, float, float]] = None
+        best_sla_pool: Optional[WorkerPool] = None
+        best_sla_key: Optional[Tuple[int, float, int, float]] = None
+
+        def consider_pool(pool: WorkerPool) -> None:
+            nonlocal best_pool, best_key, best_sla_pool, best_sla_key
             estimated = pool.get_estimated_latency(request)
-            latency_estimates.append((pool, estimated))
-        
-        if sla_latency is not None and latency_estimates:
-            meeting_sla = [
-                (pool, est) for pool, est in latency_estimates if est <= sla_latency
-            ]
-            if meeting_sla:
-                meeting_sla.sort(
-                    key=lambda item: (
-                        0 if item[0].config.strategy == preferred_strategy else 1,
-                        abs(item[1] - min(sla_latency, item[0].config.target_latency_ms)),
-                        item[0].request_queue.qsize(),
-                        item[1]
-                    )
-                )
-                return meeting_sla[0][0]
-        
-        if latency_estimates:
-            latency_estimates.sort(
-                key=lambda item: (
-                    0 if item[0].config.strategy == preferred_strategy else 1,
-                    item[0].request_queue.qsize(),
-                    abs(item[1] - item[0].config.target_latency_ms),
-                    item[1]
-                )
+            strategy_rank = 0 if pool.config.strategy == preferred_strategy else 1
+            queue_size = pool.request_queue.qsize()
+            key = (
+                strategy_rank,
+                queue_size,
+                abs(estimated - pool.config.target_latency_ms),
+                estimated
             )
-            return latency_estimates[0][0]
+            if best_key is None or key < best_key:
+                best_pool = pool
+                best_key = key
+
+            if sla_latency is not None and estimated <= sla_latency:
+                sla_key = (
+                    strategy_rank,
+                    abs(estimated - min(sla_latency, pool.config.target_latency_ms)),
+                    queue_size,
+                    estimated
+                )
+                if best_sla_key is None or sla_key < best_sla_key:
+                    best_sla_pool = pool
+                    best_sla_key = sla_key
+
+        candidate_found = False
+        for pool in self.pools:
+            if pool.can_handle(request):
+                candidate_found = True
+                consider_pool(pool)
+
+        if not candidate_found:
+            for pool in self.pools:
+                consider_pool(pool)
+
+        if best_sla_pool is not None:
+            return best_sla_pool
+        if best_pool is not None:
+            return best_pool
         
         return self.pools[0]
     
@@ -437,14 +457,15 @@ class AdaptiveParallelismManager:
             Inference result
         """
         # Create request
+        now = time.time()
         request = InferenceRequest(
-            request_id=f"req_{time.time()}",
+            request_id=f"req_{now}",
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
-            seq_len=len(prompt.split()),  # Rough approximation
+            seq_len=_count_whitespace_separated_tokens(prompt),  # Rough approximation
             sla_latency_ms=sla_latency_ms,
-            arrival_time=time.time()
+            arrival_time=now
         )
         
         # Choose worker pool
@@ -543,21 +564,28 @@ if __name__ == '__main__':
     # Test 3: Multiple concurrent short requests
     print("\n3. Multiple concurrent requests (simulating high QPS):")
     import concurrent.futures
+    completed = 0
+    latency_total_ms = 0.0
+    strategies_used = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = []
-        for i in range(8):
-            future = executor.submit(
+        futures = (
+            executor.submit(
                 manager.inference,
                 prompt=f"Query {i}: " * 10,
                 max_tokens=50
             )
-            futures.append(future)
-        
-        results = [f.result() for f in futures]
+            for i in range(8)
+        )
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            completed += 1
+            latency_total_ms += result['latency_ms']
+            strategies_used.add(result['worker_pool'])
     
-    print(f"   Completed {len(results)} requests")
-    print(f"   Average latency: {sum(r['latency_ms'] for r in results) / len(results):.1f} ms")
-    print(f"   Strategies used: {set(r['worker_pool'] for r in results)}")
+    average_latency_ms = latency_total_ms / completed if completed else 0.0
+    print(f"   Completed {completed} requests")
+    print(f"   Average latency: {average_latency_ms:.1f} ms")
+    print(f"   Strategies used: {strategies_used}")
     
     # Print cluster statistics
     print("\n" + "=" * 70)

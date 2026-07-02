@@ -90,7 +90,7 @@ def triton_multi_gpu_operation(tensors: list[torch.Tensor]) -> torch.Tensor:
     n_elements = tensors[0].numel()
     
     # Allocate output on each GPU
-    outputs = [torch.zeros(1, device=t.device, dtype=t.dtype) for t in tensors]
+    outputs = [torch.empty(1, device=t.device, dtype=t.dtype) for t in tensors]
     
     # Launch kernel on each GPU
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
@@ -197,10 +197,14 @@ def triton_nvshmem_example():
     
     # Run the conceptual example
     results = triton_multi_gpu_operation(tensors)
+    result_host = torch.cat(
+        [result.detach().to(device=tensors[0].device, non_blocking=True) for result in results]
+    ).cpu()
+    result_values = [float(result_host[idx]) for idx in range(result_host.numel())]
     
     print(f" Launched kernels on {n_gpus} GPUs")
     print(f"  Input size: {tensors[0].numel()} elements per GPU")
-    print(f"  Results computed: {[r.item() for r in results]}")
+    print(f"  Results computed: {result_values}")
     
     print("\n" + "=" * 80)
     print("Key Takeaways:")

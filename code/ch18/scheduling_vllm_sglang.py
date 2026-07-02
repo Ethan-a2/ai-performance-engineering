@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import random
 from collections import deque
-from pathlib import Path
 from typing import Deque, Dict, Optional
 
 import torch
@@ -24,12 +23,31 @@ class SchedulingBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self._history: Dict[str, float] = {}
         self.request_lengths: list[int] = []
         self.output: Optional[torch.Tensor] = None
+        self._output_values: list[float] = [0.0, 0.0]
+        self._output_tensor: Optional[torch.Tensor] = None
+        self._request_lengths_tensor: Optional[torch.Tensor] = None
+        self._output_ready = False
+        self._result_metrics: Dict[str, int] = {"served_tokens": 0, "batched_tokens": 0}
+        self._enable_nvtx = False
 
     def setup(self) -> None:
         random.seed(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         self.queue.clear()
         self.request_lengths = [random.randint(4, 32) for _ in range(8)]
+        if (
+            self._request_lengths_tensor is None
+            or self._request_lengths_tensor.numel() != len(self.request_lengths)
+        ):
+            self._request_lengths_tensor = torch.empty(len(self.request_lengths), dtype=torch.int64)
+        for idx, tokens in enumerate(self.request_lengths):
+            self._request_lengths_tensor[idx] = tokens
+        if self._output_tensor is None:
+            self._output_tensor = torch.empty(len(self._output_values), dtype=torch.float32)
         self.output = None
+        self._output_ready = False
+        self._history.clear()
 
     def _enqueue_requests(self) -> None:
         for tokens in self.request_lengths:
@@ -41,8 +59,7 @@ class SchedulingBenchmark(VerificationPayloadMixin, BaseBenchmark):
         return accepted
 
     def benchmark_fn(self) -> Optional[dict]:
-        enable_nvtx = get_nvtx_enabled(self.get_config())
-        with nvtx_range("scheduling_vllm_sglang", enable=enable_nvtx):
+        with nvtx_range("scheduling_vllm_sglang", enable=self._enable_nvtx):
             if not self.queue:
                 self._enqueue_requests()
             batch_tokens = 0
@@ -53,15 +70,24 @@ class SchedulingBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 served += self._serve_batch(tokens)
         self._history["served_tokens"] = served
         self._history["batched_tokens"] = batch_tokens
-        self.output = torch.tensor([served, batch_tokens], dtype=torch.float32)
-        return {"served_tokens": served, "batched_tokens": batch_tokens}
+        self._output_values[0] = float(served)
+        self._output_values[1] = float(batch_tokens)
+        self._output_ready = True
+        self._result_metrics["served_tokens"] = served
+        self._result_metrics["batched_tokens"] = batch_tokens
+        return self._result_metrics
 
     def capture_verification_payload(self) -> None:
-        if self.output is None:
+        if not self._output_ready:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        if self._output_tensor is None or self._request_lengths_tensor is None:
+            raise RuntimeError("setup() must initialize verification tensors")
+        for idx, value in enumerate(self._output_values):
+            self._output_tensor[idx] = value
+        self.output = self._output_tensor
         self._set_verification_payload(
             inputs={
-                "request_lengths": torch.tensor(self.request_lengths, dtype=torch.int64),
+                "request_lengths": self._request_lengths_tensor,
             },
             output=self.output,
             batch_size=1,

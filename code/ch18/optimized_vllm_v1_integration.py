@@ -15,7 +15,7 @@ import gc
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -167,6 +167,25 @@ class OptimizedVLLMV1Integration:
         self.use_vllm = True
         self.enable_chunked_prefill = enable_chunked_prefill
         self._runtime_mode = "cuda_graphs"
+        self._token_id_preview: List[int] = []
+        self._result_payload: Dict[str, Any] = {
+            "mean_latency_ms": 0.0,
+            "throughput_tokens_per_sec": 0.0,
+            "total_tokens": 0,
+            "token_ids": self._token_id_preview,
+            "runtime_mode": self._runtime_mode,
+        }
+
+    def _store_token_preview(self, token_ids: Sequence[int]) -> List[int]:
+        preview_count = min(16, len(token_ids))
+        preview = self._token_id_preview
+        if len(preview) < preview_count:
+            preview.extend([0] * (preview_count - len(preview)))
+        elif len(preview) > preview_count:
+            del preview[preview_count:]
+        for index in range(preview_count):
+            preview[index] = int(token_ids[index])
+        return preview
 
     def _new_llm(self) -> "LLM":
         return LLM(
@@ -268,7 +287,7 @@ class OptimizedVLLMV1Integration:
             seed=42,
         )
     
-    def run(self) -> Dict[str, float]:
+    def run(self) -> Dict[str, Any]:
         """Execute optimized vLLM inference."""
         torch.cuda.synchronize()
         start = time.perf_counter()
@@ -284,20 +303,20 @@ class OptimizedVLLMV1Integration:
         # Calculate metrics
         total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
         first_ids = outputs[0].outputs[0].token_ids if outputs else []
-        token_ids = list(first_ids[:16])
+        token_ids = self._store_token_preview(first_ids)
         throughput = total_tokens / elapsed
         mean_latency_ms = (elapsed / len(self.prompts)) * 1000
         
-        logger.info(f"Throughput: {throughput:.2f} tokens/sec")
-        logger.info(f"Mean latency: {mean_latency_ms:.2f} ms")
-        
-        return {
-            "mean_latency_ms": mean_latency_ms,
-            "throughput_tokens_per_sec": throughput,
-            "total_tokens": total_tokens,
-            "token_ids": token_ids,
-            "runtime_mode": self._runtime_mode,
-        }
+        logger.info("Throughput: %.2f tokens/sec", throughput)
+        logger.info("Mean latency: %.2f ms", mean_latency_ms)
+
+        metrics = self._result_payload
+        metrics["mean_latency_ms"] = mean_latency_ms
+        metrics["throughput_tokens_per_sec"] = throughput
+        metrics["total_tokens"] = total_tokens
+        metrics["token_ids"] = token_ids
+        metrics["runtime_mode"] = self._runtime_mode
+        return metrics
     
     def cleanup(self):
         """Clean up resources."""
@@ -327,6 +346,9 @@ class OptimizedVLLMV1IntegrationBenchmark(VerificationPayloadMixin, BaseBenchmar
         self._metrics: Dict[str, Any] = {}
         self.output: Optional[torch.Tensor] = None
         self._last_token_ids: Optional[torch.Tensor] = None
+        self._token_id_buffer: Optional[torch.Tensor] = None
+        self._batch_size_tensor: Optional[torch.Tensor] = None
+        self._max_tokens_tensor: Optional[torch.Tensor] = None
         self._verification_payload = None
         self.register_workload_metadata(requests_per_iteration=8.0)
 
@@ -335,6 +357,20 @@ class OptimizedVLLMV1IntegrationBenchmark(VerificationPayloadMixin, BaseBenchmar
         self._metrics = {}
         self.output = None
         self._last_token_ids = None
+        self._token_id_buffer = None
+        self._batch_size_tensor = torch.empty((), dtype=torch.int64)
+        self._max_tokens_tensor = torch.empty((), dtype=torch.int64)
+        self._batch_size_tensor.fill_(int(self.runner.batch_size))
+        self._max_tokens_tensor.fill_(int(self.runner.max_tokens))
+
+    def _materialize_token_ids(self, token_ids: Sequence[int]) -> torch.Tensor:
+        num_ids = len(token_ids)
+        if self._token_id_buffer is None or self._token_id_buffer.numel() < num_ids:
+            self._token_id_buffer = torch.empty(num_ids, dtype=torch.int32)
+        token_view = self._token_id_buffer.narrow(0, 0, num_ids)
+        for index, token_id in enumerate(token_ids):
+            token_view[index] = int(token_id)
+        return token_view
 
     def benchmark_fn(self) -> None:
         """Entry point used by the harness warmup/iteration loops."""
@@ -342,16 +378,18 @@ class OptimizedVLLMV1IntegrationBenchmark(VerificationPayloadMixin, BaseBenchmar
         token_ids = self._metrics.get("token_ids")
         if token_ids is None:
             raise RuntimeError("Runner did not return token_ids for verification")
-        self._last_token_ids = torch.as_tensor(token_ids, dtype=torch.int32)
+        self._last_token_ids = self._materialize_token_ids(token_ids)
         self.output = self._last_token_ids
 
     def capture_verification_payload(self) -> None:
         if self._last_token_ids is None:
             raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        if self._batch_size_tensor is None or self._max_tokens_tensor is None:
+            raise RuntimeError("setup() must initialize verification metadata tensors")
         self._set_verification_payload(
             inputs={
-                "batch_size": torch.tensor(self.runner.batch_size),
-                "max_tokens": torch.tensor(self.runner.max_tokens),
+                "batch_size": self._batch_size_tensor,
+                "max_tokens": self._max_tokens_tensor,
             },
             output=self.output,
             batch_size=self.runner.batch_size,
@@ -362,6 +400,8 @@ class OptimizedVLLMV1IntegrationBenchmark(VerificationPayloadMixin, BaseBenchmar
 
     def teardown(self) -> None:
         self.runner.cleanup()
+        self._batch_size_tensor = None
+        self._max_tokens_tensor = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

@@ -9,17 +9,25 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ch13.kv_cache_workload import get_workload
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
-from ch13.kv_cache_workload import get_workload
 
 WORKLOAD = get_workload()
+
+
+@dataclass(slots=True)
+class _PagedLayerEntry:
+    pages: int
+    buffer: tuple[torch.Tensor, torch.Tensor]
+    length: int = 0
 
 
 class PagedKVCache:
@@ -43,13 +51,21 @@ class PagedKVCache:
         self.dtype = dtype
         self.device = device
         self.buffer_pool: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = defaultdict(list)
-        self.allocations: dict[str, list[dict[str, object]]] = {}
+        self.allocations: dict[str, list[_PagedLayerEntry]] = {}
+        self._empty = torch.empty(
+            0,
+            self.batch_size,
+            self.num_heads,
+            self.head_dim,
+            dtype=self.dtype,
+            device=self.device,
+        )
     
     def _acquire_buffer(self, pages: int) -> tuple[torch.Tensor, torch.Tensor]:
         if self.buffer_pool[pages]:
             return self.buffer_pool[pages].pop()
         length = pages * self.page_size
-        k_buf = torch.zeros(
+        k_buf = torch.empty(
             length,
             self.batch_size,
             self.num_heads,
@@ -57,54 +73,47 @@ class PagedKVCache:
             dtype=self.dtype,
             device=self.device,
         )
-        v_buf = torch.zeros_like(k_buf)
+        v_buf = torch.empty_like(k_buf)
         return k_buf, v_buf
     
     def _release_buffer(self, pages: int, buffer: tuple[torch.Tensor, torch.Tensor]) -> None:
-        k_buf, v_buf = buffer
-        k_buf.zero_()
-        v_buf.zero_()
+        # Entry lengths define the valid prefix; pooled slabs do not need a
+        # full clear before reuse.
         self.buffer_pool[pages].append(buffer)
     
     def allocate(self, request_id: str, seq_len: int) -> None:
         if request_id in self.allocations:
             return
         pages = max(1, math.ceil(seq_len / self.page_size))
-        per_layer: list[dict[str, object]] = []
+        per_layer: list[_PagedLayerEntry] = []
         for _ in range(self.num_layers):
-            per_layer.append(
-                {
-                    "pages": pages,
-                    "buffer": self._acquire_buffer(pages),
-                    "length": 0,
-                }
-            )
+            per_layer.append(_PagedLayerEntry(pages=pages, buffer=self._acquire_buffer(pages)))
         self.allocations[request_id] = per_layer
     
-    def _ensure_capacity(self, entry: dict[str, object], target_pos: int) -> None:
-        pages = int(entry["pages"])  # type: ignore[index]
+    def _ensure_capacity(self, entry: _PagedLayerEntry, target_pos: int) -> None:
+        pages = entry.pages
         capacity = pages * self.page_size
         if target_pos < capacity:
             return
         new_pages = max(pages * 2, math.ceil((target_pos + 1) / self.page_size))
         new_buffer = self._acquire_buffer(new_pages)
-        old_buffer = entry["buffer"]  # type: ignore[index]
-        valid = min(int(entry["length"]), capacity)  # type: ignore[index]
+        old_buffer = entry.buffer
+        valid = min(entry.length, capacity)
         new_buffer[0][:valid].copy_(old_buffer[0][:valid])
         new_buffer[1][:valid].copy_(old_buffer[1][:valid])
-        self._release_buffer(pages, old_buffer)  # type: ignore[arg-type]
-        entry["buffer"] = new_buffer
-        entry["pages"] = new_pages
+        self._release_buffer(pages, old_buffer)
+        entry.buffer = new_buffer
+        entry.pages = new_pages
     
     def append(self, request_id: str, layer_idx: int, k: torch.Tensor, v: torch.Tensor, pos: int) -> None:
         if request_id not in self.allocations:
             self.allocate(request_id, pos + self.page_size)
         entry = self.allocations[request_id][layer_idx]
         self._ensure_capacity(entry, pos)
-        buffer_k, buffer_v = entry["buffer"]  # type: ignore[assignment]
-        buffer_k[pos:pos+1].copy_(k.unsqueeze(0))
-        buffer_v[pos:pos+1].copy_(v.unsqueeze(0))
-        entry["length"] = max(int(entry["length"]), pos + 1)  # type: ignore[index]
+        buffer_k, buffer_v = entry.buffer
+        buffer_k[pos].copy_(k)
+        buffer_v[pos].copy_(v)
+        entry.length = max(entry.length, pos + 1)
     
     def append_block(
         self,
@@ -119,42 +128,26 @@ class PagedKVCache:
             self.allocate(request_id, start_pos + block)
         entry = self.allocations[request_id][layer_idx]
         self._ensure_capacity(entry, start_pos + block - 1)
-        buffer_k, buffer_v = entry["buffer"]  # type: ignore[assignment]
+        buffer_k, buffer_v = entry.buffer
         buffer_k[start_pos:start_pos + block].copy_(k_block)
         buffer_v[start_pos:start_pos + block].copy_(v_block)
-        entry["length"] = max(int(entry["length"]), start_pos + block)  # type: ignore[index]
+        entry.length = max(entry.length, start_pos + block)
     
     def get(self, request_id: str, layer_idx: int, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
         if request_id not in self.allocations:
-            empty = torch.zeros(
-                0,
-                self.batch_size,
-                self.num_heads,
-                self.head_dim,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            return empty, empty
+            return self._empty, self._empty
         entry = self.allocations[request_id][layer_idx]
-        valid_end = min(end, int(entry["length"]))  # type: ignore[index]
+        valid_end = min(end, entry.length)
         if start >= valid_end:
-            empty = torch.zeros(
-                0,
-                self.batch_size,
-                self.num_heads,
-                self.head_dim,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            return empty, empty
-        buffer_k, buffer_v = entry["buffer"]  # type: ignore[assignment]
+            return self._empty, self._empty
+        buffer_k, buffer_v = entry.buffer
         return buffer_k[start:valid_end], buffer_v[start:valid_end]
     
     def free(self, request_id: str) -> None:
         if request_id not in self.allocations:
             return
         for entry in self.allocations.pop(request_id):
-            self._release_buffer(entry["pages"], entry["buffer"])  # type: ignore[arg-type]
+            self._release_buffer(entry.pages, entry.buffer)
 
 
 class PagedAttentionLayer(nn.Module):
@@ -162,10 +155,40 @@ class PagedAttentionLayer(nn.Module):
     
     def __init__(self, hidden_dim: int, num_heads: int, head_dim: int, dtype: torch.dtype = torch.float16):
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.qkv = nn.Linear(hidden_dim, hidden_dim * 3, dtype=dtype)
         self.proj = nn.Linear(hidden_dim, hidden_dim, dtype=dtype)
+        self._qkv_buffer: Optional[torch.Tensor] = None
+        self._qkv_weight_t: Optional[torch.Tensor] = None
+
+    def prepare_inference(self) -> None:
+        self._qkv_weight_t = self.qkv.weight.t()
+
+    def _qkv_buffer_for(self, x: torch.Tensor) -> torch.Tensor:
+        rows = int(x.size(0) * x.size(1))
+        width = self.hidden_dim * 3
+        if (
+            self._qkv_buffer is None
+            or self._qkv_buffer.device != x.device
+            or self._qkv_buffer.dtype != x.dtype
+            or self._qkv_buffer.size(0) < rows
+        ):
+            self._qkv_buffer = torch.empty(rows, width, device=x.device, dtype=x.dtype)
+        return self._qkv_buffer[:rows]
+
+    def _project_qkv(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            return self.qkv(x)
+        if self._qkv_weight_t is None:
+            self.prepare_inference()
+        x_2d = x.reshape(x.size(0) * x.size(1), self.hidden_dim)
+        qkv_2d = self._qkv_buffer_for(x)
+        qkv = torch.matmul(x_2d, self._qkv_weight_t, out=qkv_2d)
+        if self.qkv.bias is not None:
+            qkv.add_(self.qkv.bias)
+        return qkv.view(x.size(0), x.size(1), self.hidden_dim * 3)
     
     def forward(
         self,
@@ -176,7 +199,7 @@ class PagedAttentionLayer(nn.Module):
         cache_pos: int,
     ) -> torch.Tensor:
         batch_size, seq_len, hidden_dim = x.shape
-        qkv = self.qkv(x)
+        qkv = self._project_qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -189,7 +212,11 @@ class PagedAttentionLayer(nn.Module):
         cached_v = cached_v.permute(1, 2, 0, 3)
 
         attn_out = F.scaled_dot_product_attention(q, cached_k, cached_v, dropout_p=0.0, is_causal=False)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_dim)
+        attn_out = attn_out.transpose(1, 2)
+        if seq_len == 1:
+            attn_out = attn_out.view(batch_size, seq_len, hidden_dim)
+        else:
+            attn_out = attn_out.contiguous().view(batch_size, seq_len, hidden_dim)
         return self.proj(attn_out)
 
 
@@ -201,6 +228,14 @@ class OptimizedKVCachePagedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.layers = None
         self.kv_cache = None
         self.inputs = None
+        self._input_count = 0
+        self._request_ids: list[str] = []
+        self._input_token_views: list[list[torch.Tensor]] = []
+        self._input_token_steps: list[list[tuple[int, torch.Tensor]]] = []
+        self._request_token_groups: list[tuple[str, int, list[tuple[int, torch.Tensor]]]] = []
+        self._request_group_counts: tuple[int, int, int] = (0, 0, 0)
+        self._expected_request_group_counts: tuple[int, int, int] = (0, 0, 0)
+        self._layer_groups: list[tuple[int, nn.Module]] = []
         self.workload = WORKLOAD
         self.page_size = self.workload.page_size
         self.num_layers = self.workload.num_layers
@@ -216,6 +251,7 @@ class OptimizedKVCachePagedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         )
         self.output = None
         self._verify_input = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count = 0
         self.register_workload_metadata(
             requests_per_iteration=float(len(self.sequence_lengths)),
@@ -234,6 +270,9 @@ class OptimizedKVCachePagedBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 for _ in range(self.num_layers)
             ]
         ).to(self.device).eval()
+        for layer in self.layers:
+            layer.prepare_inference()
+        self._layer_groups = list(enumerate(self.layers))
         self.parameter_count = sum(p.numel() for p in self.layers.parameters())
         
         self.kv_cache = PagedKVCache(
@@ -250,6 +289,42 @@ class OptimizedKVCachePagedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         for seq_len in self.sequence_lengths:
             x = torch.randn(self.batch_size, seq_len, self.hidden_dim, device=self.device, dtype=self.workload.dtype)
             self.inputs.append(x)
+        self._input_count = len(self.inputs)
+        self._verify_output_buffer = torch.empty(
+            self.batch_size,
+            1,
+            self.hidden_dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self._request_ids = [f"req_{seq_idx}" for seq_idx in range(len(self.inputs))]
+        self._input_token_views = [
+            list(x.split(1, dim=1))
+            for x in self.inputs
+        ]
+        self._input_token_steps = [
+            list(enumerate(token_views))
+            for token_views in self._input_token_views
+        ]
+        self._request_token_groups = [
+            (request_id, len(token_views), token_steps)
+            for request_id, token_views, token_steps in zip(
+                self._request_ids,
+                self._input_token_views,
+                self._input_token_steps,
+                strict=True,
+            )
+        ]
+        self._request_group_counts = (
+            len(self._request_ids),
+            len(self._input_token_views),
+            len(self._request_token_groups),
+        )
+        self._expected_request_group_counts = (
+            self._input_count,
+            self._input_count,
+            self._input_count,
+        )
         if self.inputs:
             self._verify_input = self.inputs[0].detach().clone()
         
@@ -259,27 +334,33 @@ class OptimizedKVCachePagedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         """Benchmark token-by-token decode with paged cache allocation."""
         if self.layers is None or self.kv_cache is None or self.inputs is None:
             raise RuntimeError("Benchmark not configured")
+        if self._request_group_counts != self._expected_request_group_counts:
+            raise RuntimeError("Request token groups not initialized")
+        if not self._layer_groups:
+            raise RuntimeError("Layer groups not initialized")
 
-        with self._nvtx_range("kv_cache_naive"):
-            for seq_idx, x in enumerate(self.inputs):
-                request_id = f"req_{seq_idx}"
-                seq_len = x.size(1)
+        with torch.inference_mode(), self._nvtx_range("kv_cache_naive"):
+            for request_id, seq_len, token_steps in self._request_token_groups:
                 self.kv_cache.allocate(request_id, seq_len)
 
-                for pos in range(seq_len):
-                    hidden = x[:, pos:pos + 1, :]
-                    for layer_idx, layer in enumerate(self.layers):
+                for pos, token_view in token_steps:
+                    hidden = token_view
+                    for layer_idx, layer in self._layer_groups:
                         hidden = layer(hidden, self.kv_cache, request_id, layer_idx, pos)
 
                 self.kv_cache.free(request_id)
-            self.output = hidden.detach().clone()
+            self.output = hidden
         if self._verify_input is None:
             raise RuntimeError("Verification input not initialized")
 
     def capture_verification_payload(self) -> None:
+        if self._verify_input is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("Verification input/output not initialized")
+        with torch.inference_mode():
+            self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input": self._verify_input},
-            output=self.output.float(),
+            output=self._verify_output_buffer,
             batch_size=self._verify_input.shape[0],
             parameter_count=self.parameter_count,
             precision_flags={
@@ -297,6 +378,17 @@ class OptimizedKVCachePagedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.layers = None
         self.kv_cache = None
         self.inputs = None
+        self._input_count = 0
+        self._request_ids = []
+        self._input_token_views = []
+        self._input_token_steps = []
+        self._request_token_groups = []
+        self._request_group_counts = (0, 0, 0)
+        self._expected_request_group_counts = (0, 0, 0)
+        self._layer_groups = []
+        self.output = None
+        self._verify_input = None
+        self._verify_output_buffer = None
         super().teardown()
     
     def get_config(self) -> BenchmarkConfig:

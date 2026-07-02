@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Baseline: coherent-memory transfer path without placement optimizations."""
 
-from pathlib import Path
 from typing import Any, Dict, Optional
 import time
 
@@ -47,13 +46,16 @@ class BaselineGraceCoherentMemory:
             return False
         
         try:
+            import platform
             props = torch.cuda.get_device_properties(0)
-            # GB200/GB300 has compute capability 12.1
-            if props.major == 12 and props.minor == 1:
-                # Additional check for Grace CPU (ARM architecture)
-                import platform
-                if platform.machine() in ['aarch64', 'arm64']:
-                    return True
+            is_arm_host = platform.machine() in ('aarch64', 'arm64')
+            # Grace-Blackwell coherent memory needs a Grace (ARM) host paired with
+            # a Blackwell-class GPU. GB200/GB300 GPUs report CC 10.x (B200=10.0,
+            # B300=10.3); GB10 reports CC 12.x. A non-Grace (x86) B200/B300 host has
+            # no NVLink-C2C coherent fabric, so the ARM host check is the
+            # discriminator. The old CC==12.1 check wrongly skipped real GB300.
+            if is_arm_host and props.major >= 10:
+                return True
         except Exception as e:
             logger.debug(f"Grace-Blackwell detection failed: {e}")
         
@@ -115,6 +117,8 @@ class GraceCoherentMemoryBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.elapsed_s: Optional[float] = None
         self.bandwidth_gb_s: Optional[float] = None
         self.size_mb = size_mb
+        self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
     def setup(self) -> None:
         # Seed FIRST for deterministic verification
@@ -122,6 +126,7 @@ class GraceCoherentMemoryBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.manual_seed_all(42)
         
         self._impl.setup()
+        self._verify_output_buffer = torch.empty_like(self._impl.cpu_data[:1000])
         self.register_workload_metadata(
             requests_per_iteration=self._workload.requests_per_iteration,
             bytes_per_iteration=self._workload.bytes_per_iteration,
@@ -135,13 +140,17 @@ class GraceCoherentMemoryBenchmark(VerificationPayloadMixin, BaseBenchmark):
         elapsed = self._impl.run_step()
         self.elapsed_s = elapsed
         self.bandwidth_gb_s = (self._impl.size_mb / 1024) * 2 / elapsed
-
-        # Use the post-transfer host-visible view so verification compares the
-        # same observable result across pageable and staged-copy strategies.
-        verify_output = self._impl.cpu_data[:1000].detach().cpu().clone()
-        self.output = verify_output
+        self.output = None
 
     def capture_verification_payload(self) -> None:
+        # Use the post-transfer host-visible view so verification compares the
+        # same observable result across pageable and staged-copy strategies.
+        if self.output is None:
+            if self._verify_output_buffer is None:
+                raise RuntimeError("setup() must be called before verification")
+            output_slice = self._impl.cpu_data[: self._verify_output_buffer.numel()].detach()
+            self._verify_output_buffer.copy_(output_slice)
+            self.output = self._verify_output_buffer
         self._set_verification_payload(
             inputs={
                 "cpu_data": self._impl.cpu_data,
@@ -161,6 +170,8 @@ class GraceCoherentMemoryBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def teardown(self) -> None:
         self._impl.cleanup()
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

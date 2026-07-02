@@ -47,6 +47,8 @@ class FlashAttention4BenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         self._selected_provider: Optional[str] = None
         self._prev_matmul_allow_tf32: Optional[bool] = None
         self._prev_cudnn_allow_tf32: Optional[bool] = None
+        self._sparsity_ratio = 1.0
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         tokens = self.config.batch * self.config.seq_len
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.config.batch),
@@ -66,6 +68,13 @@ class FlashAttention4BenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.inputs = build_reference_inputs(self.config, device=self.device, include_block_mask=True)
+        self._verify_output_buffer = torch.empty(
+            (1, 1, min(128, self.config.seq_len), min(16, self.config.head_dim)),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if self.inputs.dense_mask is not None:
+            self._sparsity_ratio = float(self.inputs.dense_mask.float().mean())
         self._prepare_benchmark()
         runtime_config = self.get_config()
         claim_type = resolve_flashattention4_claim_type(
@@ -105,17 +114,17 @@ class FlashAttention4BenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
-        if self.inputs is None or self.output is None:
+        if self.inputs is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("setup() and benchmark_fn() must run first")
-        verify_output = (
-            self.output[:1, :1, : min(128, self.output.shape[2]), : min(16, self.output.shape[3])]
-            .detach()
-            .cpu()
-            .clone()
-        )
-        sparsity_ratio = 1.0
-        if self.inputs.dense_mask is not None:
-            sparsity_ratio = float(self.inputs.dense_mask.float().mean().item())
+        verify_output = self._verify_output_buffer
+        output_slice = self.output[
+            :1,
+            :1,
+            : min(self.output.shape[2], verify_output.shape[2]),
+            : min(self.output.shape[3], verify_output.shape[3]),
+        ].detach()
+        verify_output = verify_output[:, :, : output_slice.shape[2], : output_slice.shape[3]]
+        verify_output.copy_(output_slice, non_blocking=False)
         self._set_verification_payload(
             inputs={
                 "q": self.inputs.q.detach(),
@@ -131,13 +140,15 @@ class FlashAttention4BenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
                 "tf32": False,
             },
             output_tolerance=(5e-2, 5e-1),
-            signature_overrides={"sparsity_ratio": sparsity_ratio},
+            signature_overrides={"sparsity_ratio": self._sparsity_ratio},
         )
 
     def teardown(self) -> None:
         self.inputs = None
         self.output = None
+        self._verify_output_buffer = None
         self._selected_provider = None
+        self._sparsity_ratio = 1.0
         if self._prev_matmul_allow_tf32 is not None:
             torch.backends.cuda.matmul.allow_tf32 = self._prev_matmul_allow_tf32
         if self._prev_cudnn_allow_tf32 is not None:
@@ -319,11 +330,20 @@ class OptimizedBestAvailableAttentionBenchmarkBase(FlashAttention4BenchmarkBase)
 
         metrics["flashattention4.selection_candidates"] = float(len(self._candidate_median_ms))
         metrics["flashattention4.selection_failures"] = float(len(self._candidate_errors))
-        ordered = sorted(self._candidate_median_ms.items(), key=lambda item: (item[1], item[0]))
-        if len(ordered) > 1:
-            metrics["flashattention4.best_margin_ms"] = ordered[1][1] - ordered[0][1]
-        for provider, median_ms in ordered:
+        best_provider: Optional[str] = None
+        second_provider: Optional[str] = None
+        best_ms = float("inf")
+        second_ms = float("inf")
+        for provider, median_ms in self._candidate_median_ms.items():
             metrics[f"flashattention4.selection_ms.{provider}"] = median_ms
+            candidate_key = (median_ms, provider)
+            if best_provider is None or candidate_key < (best_ms, best_provider):
+                second_provider, second_ms = best_provider, best_ms
+                best_provider, best_ms = provider, median_ms
+            elif second_provider is None or candidate_key < (second_ms, second_provider):
+                second_provider, second_ms = provider, median_ms
+        if second_provider is not None:
+            metrics["flashattention4.best_margin_ms"] = second_ms - best_ms
         for provider in self._candidate_errors:
             metrics[f"flashattention4.failed.{provider}"] = 1.0
         return metrics

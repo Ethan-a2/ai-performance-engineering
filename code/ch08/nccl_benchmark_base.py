@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 
+from core.benchmark.utils import scalar_tensor_to_float
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
 from core.utils.extension_loader_template import load_cuda_extension
 
@@ -47,11 +48,7 @@ class NcclBenchmarkBase(BaseBenchmark):
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        with nvtx_range(self.nvtx_label, enable=enable_nvtx):
+        with torch.inference_mode(), self._nvtx_range(self.nvtx_label):
             self._invoke_kernel()
 
     def teardown(self) -> None:
@@ -68,7 +65,7 @@ class NcclBenchmarkBase(BaseBenchmark):
         assert self.output is not None
         reference = self.device_chunks.sum(dim=0)
         torch.cuda.synchronize()
-        max_error = torch.max(torch.abs(reference - self.output)).item()
+        max_error = scalar_tensor_to_float(torch.max(torch.abs(reference - self.output)))
         if max_error > 1e-3:
             raise RuntimeError(f"NCCL reduction validation failed (max error={max_error:.4f})")
 

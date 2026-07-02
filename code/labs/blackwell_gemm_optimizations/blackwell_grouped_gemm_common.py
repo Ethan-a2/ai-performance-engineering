@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import math
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.benchmark.utils import scalar_tensor_to_float
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig, WorkloadMetadata
 
 from labs.blackwell_gemm_optimizations.blackwell_grouped_gemm_autotune import (
@@ -66,6 +67,7 @@ class GroupedGemmState:
     expert_weights: torch.Tensor
     flat_padded_indices: torch.Tensor
     padded_route_weights: torch.Tensor
+    padded_route_weight_factors: torch.Tensor
     counts: torch.Tensor
     counts_cpu: tuple[int, ...]
     max_count: int
@@ -117,26 +119,36 @@ def _build_assignments(
     if workload.histogram == "balanced":
         return token_ids % workload.num_experts
 
-    weights = torch.linspace(
-        1.85,
-        0.35,
-        steps=workload.num_experts,
-        device=device,
-        dtype=torch.float32,
+    counts_cpu = _assignment_counts_cpu(workload)
+    expert_ids = torch.arange(workload.num_experts, device=device, dtype=torch.long)
+    repeats = torch.tensor(counts_cpu, device=device, dtype=torch.long)
+    return torch.repeat_interleave(
+        expert_ids,
+        repeats,
+        output_size=workload.num_tokens,
     )
-    normalized = weights / weights.sum()
-    counts = torch.floor(normalized * workload.num_tokens).to(torch.long)
-    remainder = int(workload.num_tokens - int(counts.sum().item()))
-    if remainder > 0:
-        counts[:remainder] += 1
-    assignments = []
-    for expert_id, count in enumerate(counts.tolist()):
-        if count <= 0:
-            continue
-        assignments.append(
-            torch.full((count,), expert_id, device=device, dtype=torch.long)
+
+
+def _assignment_counts_cpu(workload: BlackwellGroupedGemmWorkload) -> tuple[int, ...]:
+    if workload.histogram == "balanced":
+        tokens_per_expert, remainder = divmod(
+            workload.num_tokens,
+            workload.num_experts,
         )
-    return torch.cat(assignments, dim=0)
+        return tuple(
+            tokens_per_expert + int(expert_id < remainder)
+            for expert_id in range(workload.num_experts)
+        )
+
+    step = (0.35 - 1.85) / (workload.num_experts - 1)
+    weights = [1.85 + step * expert_id for expert_id in range(workload.num_experts)]
+    weight_sum = sum(weights)
+    counts = [math.floor(weight / weight_sum * workload.num_tokens) for weight in weights]
+    remainder = workload.num_tokens - sum(counts)
+    if remainder > 0:
+        for expert_id in range(remainder):
+            counts[expert_id] += 1
+    return tuple(counts)
 
 
 def _build_route_weights(
@@ -200,8 +212,8 @@ def build_state(
     assignments = _build_assignments(workload, device)
     route_weights = _build_route_weights(workload, assignments)
 
-    counts = torch.bincount(assignments, minlength=workload.num_experts).to(torch.int32)
-    counts_cpu = tuple(int(v) for v in counts.detach().cpu().tolist())
+    counts_cpu = _assignment_counts_cpu(workload)
+    counts = torch.tensor(counts_cpu, device=device, dtype=torch.int32)
     max_count = int(max(counts_cpu, default=0))
     sentinel = workload.num_tokens
 
@@ -216,21 +228,32 @@ def build_state(
         device=device,
         dtype=torch.float32,
     )
-    for expert_id in range(workload.num_experts):
-        token_ids = torch.nonzero(assignments == expert_id, as_tuple=False).flatten()
-        count = int(token_ids.numel())
-        if count == 0:
-            continue
-        padded_indices[expert_id, :count] = token_ids
-        padded_route_weights[expert_id, :count] = route_weights.index_select(0, token_ids)
+    sorted_token_ids = torch.argsort(assignments, stable=True)
+    sorted_experts = assignments.index_select(0, sorted_token_ids)
+    counts_long = counts.to(torch.long)
+    cumulative_counts = torch.cumsum(counts_long, dim=0)
+    expert_starts = torch.empty_like(cumulative_counts)
+    expert_starts[0] = 0
+    expert_starts[1:] = cumulative_counts[:-1]
+    packed_offsets = torch.arange(
+        workload.num_tokens,
+        device=device,
+        dtype=torch.long,
+    ) - expert_starts.index_select(0, sorted_experts)
+    padded_indices[sorted_experts, packed_offsets] = sorted_token_ids
+    padded_route_weights[sorted_experts, packed_offsets] = route_weights.index_select(
+        0,
+        sorted_token_ids,
+    )
 
-    zero_row = torch.zeros(
-        1,
+    x_with_padding = torch.empty(
+        workload.num_tokens + 1,
         workload.hidden_dim,
         device=device,
         dtype=workload.dtype,
     )
-    x_with_padding = torch.cat([x, zero_row], dim=0).contiguous()
+    x_with_padding[: workload.num_tokens].copy_(x)
+    x_with_padding[workload.num_tokens].zero_()
     flat_padded_indices = padded_indices.reshape(-1).contiguous()
     gathered = torch.index_select(x_with_padding, 0, flat_padded_indices).view(
         workload.num_experts,
@@ -241,6 +264,7 @@ def build_state(
         gathered.to(torch.float32),
         expert_weights.to(torch.float32),
     )
+    padded_route_weight_factors = padded_route_weights.unsqueeze(-1).to(workload.dtype)
     reference *= padded_route_weights.unsqueeze(-1)
     reference = reference.to(workload.dtype).contiguous()
 
@@ -250,6 +274,7 @@ def build_state(
         expert_weights=expert_weights,
         flat_padded_indices=flat_padded_indices,
         padded_route_weights=padded_route_weights.contiguous(),
+        padded_route_weight_factors=padded_route_weight_factors.contiguous(),
         counts=counts.contiguous(),
         counts_cpu=counts_cpu,
         max_count=max_count,
@@ -270,8 +295,11 @@ def require_blackwell_grouped_gemm_support(device: torch.device) -> None:
 def _gather_packed_tokens(
     state: GroupedGemmState,
     out_flat: torch.Tensor,
+    out_view: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     torch.index_select(state.x_with_padding, 0, state.flat_padded_indices, out=out_flat)
+    if out_view is not None:
+        return out_view
     return out_flat.view(
         state.counts.shape[0],
         state.max_count,
@@ -285,9 +313,10 @@ def run_variant(
     variant: str,
     packed_tokens_flat: torch.Tensor,
     output_buffer: torch.Tensor,
+    packed_tokens_view: torch.Tensor | None = None,
     experimental: str | None = None,
 ) -> VariantResult:
-    packed_tokens = _gather_packed_tokens(state, packed_tokens_flat)
+    packed_tokens = _gather_packed_tokens(state, packed_tokens_flat, packed_tokens_view)
     schedule_name = experimental if experimental is not None else variant
     schedule = resolve_schedule(schedule_name)
 
@@ -316,6 +345,7 @@ def run_variant(
             state.counts,
             output_buffer,
             schedule,
+            state.padded_route_weight_factors,
         )
     return VariantResult(output=output, schedule=schedule)
 
@@ -333,7 +363,10 @@ class BlackwellGroupedGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.state: Optional[GroupedGemmState] = None
         self.output: Optional[torch.Tensor] = None
         self._flat_packed_tokens: Optional[torch.Tensor] = None
+        self._packed_tokens_view: Optional[torch.Tensor] = None
         self._output_buffer: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._verification_shape_tensor: Optional[torch.Tensor] = None
         self._workload_metadata = WorkloadMetadata(
             requests_per_iteration=float(self.workload.num_tokens),
             tokens_per_iteration=float(self.workload.num_tokens),
@@ -366,12 +399,34 @@ class BlackwellGroupedGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
             device=device,
             dtype=self.workload.dtype,
         )
+        self._packed_tokens_view = self._flat_packed_tokens.view(
+            self.workload.num_experts,
+            self.state.max_count,
+            self.workload.hidden_dim,
+        )
         self._output_buffer = torch.empty(
             self.workload.num_experts,
             self.state.max_count,
             self.workload.expert_ffn_dim,
             device=device,
             dtype=self.workload.dtype,
+        )
+        self._verify_output_buffer = torch.empty(
+            min(2, self.workload.num_experts),
+            min(16, self.state.max_count),
+            min(32, self.workload.expert_ffn_dim),
+            device=device,
+            dtype=self.workload.dtype,
+        )
+        self._verification_shape_tensor = torch.tensor(
+            [
+                self.workload.num_tokens,
+                self.workload.num_experts,
+                self.workload.hidden_dim,
+                self.workload.expert_ffn_dim,
+            ],
+            device="cpu",
+            dtype=torch.int64,
         )
         schedule = resolve_schedule(self.variant)
         grouped_units = grouped_work_unit_count(
@@ -405,13 +460,19 @@ class BlackwellGroupedGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.synchronize(device)
 
     def benchmark_fn(self) -> None:
-        if self.state is None or self._flat_packed_tokens is None or self._output_buffer is None:
+        if (
+            self.state is None
+            or self._flat_packed_tokens is None
+            or self._packed_tokens_view is None
+            or self._output_buffer is None
+        ):
             raise RuntimeError("setup() must run before benchmark_fn()")
-        with self._nvtx_range(self.label):
+        with torch.inference_mode(), self._nvtx_range(self.label):
             result = run_variant(
                 self.state,
                 variant=self.variant,
                 packed_tokens_flat=self._flat_packed_tokens,
+                packed_tokens_view=self._packed_tokens_view,
                 output_buffer=self._output_buffer,
             )
             self.output = result.output
@@ -419,21 +480,17 @@ class BlackwellGroupedGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def capture_verification_payload(self) -> None:
         if self.state is None or self.output is None:
             raise RuntimeError("benchmark_fn() must produce output before verification capture")
-        verification = self.output[: min(2, self.output.shape[0]), : min(16, self.output.shape[1]), : min(32, self.output.shape[2])]
+        if self._verify_output_buffer is None or self._verification_shape_tensor is None:
+            raise RuntimeError("setup() must initialize verification buffers")
+        verification_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ]
+        self._verify_output_buffer.copy_(verification_slice)
         self._set_verification_payload(
-            inputs={
-                "shape": torch.tensor(
-                    [
-                        self.workload.num_tokens,
-                        self.workload.num_experts,
-                        self.workload.hidden_dim,
-                        self.workload.expert_ffn_dim,
-                    ],
-                    device="cpu",
-                    dtype=torch.int64,
-                )
-            },
-            output=verification,
+            inputs={"shape": self._verification_shape_tensor},
+            output=self._verify_output_buffer,
             batch_size=self.workload.num_tokens,
             parameter_count=int(self.state.expert_weights.numel()),
             precision_flags={
@@ -448,7 +505,10 @@ class BlackwellGroupedGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.state = None
         self.output = None
         self._flat_packed_tokens = None
+        self._packed_tokens_view = None
         self._output_buffer = None
+        self._verify_output_buffer = None
+        self._verification_shape_tensor = None
         torch.cuda.empty_cache()
         super().teardown()
 
@@ -481,7 +541,7 @@ class BlackwellGroupedGemmBenchmark(VerificationPayloadMixin, BaseBenchmark):
         if not torch.isfinite(self.output).all():
             return "Output contains non-finite values"
         diff = (self.output.float() - self.state.reference_output.float()).abs()
-        max_diff = float(diff.max().item())
+        max_diff = scalar_tensor_to_float(diff.max())
         if max_diff > 0.35:
             return f"Grouped GEMM output drifted from reference (max_abs_diff={max_diff:.4f})"
         return None

@@ -38,13 +38,12 @@ def resolve_dtype(dtype: torch.dtype | str) -> torch.dtype:
 def dtype_bytes(dtype: torch.dtype | str) -> int:
     """Return element size (bytes) for the dtype."""
     dt = resolve_dtype(dtype)
-    if dt == torch.float32:
-        return 4
-    if dt in (torch.float16, torch.bfloat16):
-        return 2
-    if dt == torch.float64:
-        return 8
-    return torch.tensor([], dtype=dt).element_size()
+    try:
+        return torch.finfo(dt).bits // 8
+    except TypeError:
+        if dt == torch.bool:
+            return 1
+        return torch.iinfo(dt).bits // 8
 
 
 def allocate_kv_cache(
@@ -55,7 +54,7 @@ def allocate_kv_cache(
     device: torch.device,
 ) -> torch.Tensor:
     """Allocate KV cache-sized tensor."""
-    return torch.zeros(batch, total_tokens, hidden_size, dtype=dtype, device=device)
+    return torch.empty(batch, total_tokens, hidden_size, dtype=dtype, device=device)
 
 
 def env_override_int(name: str, default: int) -> int:
@@ -170,6 +169,41 @@ class MoEFeedForward(nn.Module):
         self.router_noise = router_noise
         self.capacity_factor = capacity_factor
         self.num_experts = num_experts
+        self._topk_scores: Optional[torch.Tensor] = None
+        self._topk_indices: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _scaled_expert_output(expert_out: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        weights = weights.to(expert_out.dtype)
+        if torch.is_grad_enabled() and expert_out.requires_grad:
+            return expert_out * weights
+        expert_out.mul_(weights)
+        return expert_out
+
+    def _topk_route_scores(
+        self,
+        logits: torch.Tensor,
+        *,
+        reusable: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if torch.is_grad_enabled() or not reusable:
+            top_logits, top_indices = torch.topk(logits, k=self.top_k, dim=-1)
+            top_scores = torch.exp(top_logits - torch.logsumexp(logits, dim=-1, keepdim=True))
+            return top_scores, top_indices
+
+        output_shape = (logits.shape[0], self.top_k)
+        if (
+            self._topk_scores is None
+            or self._topk_indices is None
+            or self._topk_scores.device != logits.device
+            or self._topk_scores.dtype != logits.dtype
+            or tuple(self._topk_scores.shape) != output_shape
+        ):
+            self._topk_scores = torch.empty(output_shape, dtype=logits.dtype, device=logits.device)
+            self._topk_indices = torch.empty(output_shape, dtype=torch.long, device=logits.device)
+        torch.topk(logits, k=self.top_k, dim=-1, out=(self._topk_scores, self._topk_indices))
+        self._topk_scores.sub_(torch.logsumexp(logits, dim=-1, keepdim=True)).exp_()
+        return self._topk_scores, self._topk_indices
 
     def forward(self, x: torch.Tensor, *, collect_router_stats: bool = False) -> torch.Tensor | Tuple[torch.Tensor, Optional[dict]]:
         batch, seq, hidden = x.shape
@@ -177,12 +211,13 @@ class MoEFeedForward(nn.Module):
         logits = self.router(flat)
         if self.router_noise > 0:
             logits = logits + torch.randn_like(logits) * self.router_noise
-        probs = torch.softmax(logits, dim=-1)
         router_entropy = None
         if collect_router_stats:
             with torch.no_grad():
-                router_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
-        top_scores, top_indices = torch.topk(probs, k=self.top_k, dim=-1)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                probs = log_probs.exp()
+                router_entropy = -(probs * log_probs).sum(dim=-1).mean()
+        top_scores, top_indices = self._topk_route_scores(logits, reusable=not collect_router_stats)
         drop_mask = None
         overflow_mask = None
         expert_counts = None
@@ -193,7 +228,7 @@ class MoEFeedForward(nn.Module):
             expert_counts = torch.bincount(top_indices.reshape(-1), minlength=self.num_experts)
             overloaded = expert_counts > capacity
             drop_mask = overloaded[top_indices]
-            top_scores = top_scores * (~drop_mask).float()
+            top_scores.masked_fill_(drop_mask, 0.0)
             overflow_mask = drop_mask.any(dim=-1)
         combined = torch.zeros_like(flat)
 
@@ -209,8 +244,7 @@ class MoEFeedForward(nn.Module):
                     selected_weights = weights.index_select(0, indices)
                     if selected_weights.dim() == 1:
                         selected_weights = selected_weights.unsqueeze(-1)
-                    selected_weights = selected_weights.to(expert_out.dtype)
-                    combined.index_add_(0, indices, expert_out * selected_weights)
+                    combined.index_add_(0, indices, self._scaled_expert_output(expert_out, selected_weights))
         combined = combined.view(batch, seq, hidden)
         if collect_router_stats:
             stats = {
@@ -241,12 +275,13 @@ class MoEFeedForwardNoHostSync(MoEFeedForward):
         logits = self.router(flat)
         if self.router_noise > 0:
             logits = logits + torch.randn_like(logits) * self.router_noise
-        probs = torch.softmax(logits, dim=-1)
         router_entropy = None
         if collect_router_stats:
             with torch.no_grad():
-                router_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
-        top_scores, top_indices = torch.topk(probs, k=self.top_k, dim=-1)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                probs = log_probs.exp()
+                router_entropy = -(probs * log_probs).sum(dim=-1).mean()
+        top_scores, top_indices = self._topk_route_scores(logits, reusable=not collect_router_stats)
 
         drop_mask = None
         overflow_mask = None
@@ -258,11 +293,12 @@ class MoEFeedForwardNoHostSync(MoEFeedForward):
             expert_counts = torch.bincount(top_indices.reshape(-1), minlength=self.num_experts)
             overloaded = expert_counts > capacity
             drop_mask = overloaded[top_indices]
-            # Avoid host sync from `if drop_mask.any()`; applying a no-op mask is fine.
-            top_scores = top_scores * (~drop_mask).float()
+            # Avoid materializing a float mask; zeroing a false drop mask is a no-op.
+            top_scores.masked_fill_(drop_mask, 0.0)
             overflow_mask = drop_mask.any(dim=-1)
 
-        combined = torch.zeros_like(flat)
+        single_route = self.top_k == 1
+        combined = torch.empty_like(flat) if single_route else torch.zeros_like(flat)
 
         for k in range(self.top_k):
             expert_ids = top_indices[:, k]
@@ -278,8 +314,11 @@ class MoEFeedForwardNoHostSync(MoEFeedForward):
                 selected_weights = weights.index_select(0, indices)
                 if selected_weights.dim() == 1:
                     selected_weights = selected_weights.unsqueeze(-1)
-                selected_weights = selected_weights.to(expert_out.dtype)
-                combined.index_add_(0, indices, expert_out * selected_weights)
+                weighted_out = self._scaled_expert_output(expert_out, selected_weights)
+                if single_route:
+                    combined.index_copy_(0, indices, weighted_out)
+                else:
+                    combined.index_add_(0, indices, weighted_out)
 
         combined = combined.view(batch, seq, hidden)
         if collect_router_stats:
@@ -305,18 +344,92 @@ class MoEFeedForwardSortedDispatch(MoEFeedForward):
     This reduces Python overhead and avoids per-expert mask+any() patterns.
     """
 
+    def _token_ids_for(self, tokens: int, device: torch.device) -> torch.Tensor:
+        cache_key = (int(tokens), int(self.top_k), device.type, device.index)
+        cached = getattr(self, "_token_ids_cache", None)
+        if cached is None or getattr(self, "_token_ids_cache_key", None) != cache_key:
+            token_ids = torch.arange(tokens * self.top_k, device=device, dtype=torch.long)
+            if self.top_k > 1:
+                token_ids.div_(self.top_k, rounding_mode="floor")
+            self._token_ids_cache = token_ids
+            self._token_ids_cache_key = cache_key
+            return token_ids
+        return cached
+
+    def _expert_metadata_lists(
+        self,
+        unique_experts: torch.Tensor,
+        counts: torch.Tensor,
+    ) -> Tuple[List[int], List[int]]:
+        count = unique_experts.numel()
+        metadata = getattr(self, "_expert_metadata_buffer", None)
+        if (
+            metadata is None
+            or metadata.device != unique_experts.device
+            or metadata.numel() < 2 * count
+        ):
+            metadata = torch.empty(2, count, dtype=torch.long, device=unique_experts.device)
+            host_metadata = torch.empty(
+                2,
+                count,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=unique_experts.device.type == "cuda",
+            )
+            self._expert_metadata_buffer = metadata
+            self._expert_metadata_host_buffer = host_metadata
+        else:
+            host_metadata = self._expert_metadata_host_buffer
+
+        metadata_slice = metadata[:, :count]
+        metadata_slice[0].copy_(unique_experts)
+        metadata_slice[1].copy_(counts)
+        host_slice = host_metadata[:, :count]
+        host_slice.copy_(metadata_slice)
+        expert_list, count_list = host_slice.tolist()
+        return [int(expert) for expert in expert_list], [int(count_value) for count_value in count_list]
+
+    def _route_workspaces(
+        self,
+        routes: int,
+        hidden: int,
+        device: torch.device,
+        token_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cache_key = (
+            int(routes),
+            int(hidden),
+            device.type,
+            device.index,
+            token_dtype,
+            weight_dtype,
+        )
+        cached = getattr(self, "_route_workspace_key", None)
+        if cached != cache_key:
+            self._sorted_token_ids_workspace = torch.empty(routes, dtype=torch.long, device=device)
+            self._sorted_weights_workspace = torch.empty(routes, 1, dtype=weight_dtype, device=device)
+            self._sorted_flat_workspace = torch.empty(routes, hidden, dtype=token_dtype, device=device)
+            self._route_workspace_key = cache_key
+        return (
+            self._sorted_token_ids_workspace,
+            self._sorted_weights_workspace,
+            self._sorted_flat_workspace,
+        )
+
     def forward(self, x: torch.Tensor, *, collect_router_stats: bool = False):  # type: ignore[override]
         batch, seq, hidden = x.shape
         flat = x.reshape(batch * seq, hidden)
         logits = self.router(flat)
         if self.router_noise > 0:
             logits = logits + torch.randn_like(logits) * self.router_noise
-        probs = torch.softmax(logits, dim=-1)
         router_entropy = None
         if collect_router_stats:
             with torch.no_grad():
-                router_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1).mean()
-        top_scores, top_indices = torch.topk(probs, k=self.top_k, dim=-1)
+                log_probs = torch.log_softmax(logits, dim=-1)
+                probs = log_probs.exp()
+                router_entropy = -(probs * log_probs).sum(dim=-1).mean()
+        top_scores, top_indices = self._topk_route_scores(logits, reusable=not collect_router_stats)
 
         drop_mask = None
         overflow_mask = None
@@ -328,36 +441,57 @@ class MoEFeedForwardSortedDispatch(MoEFeedForward):
             expert_counts = torch.bincount(top_indices.reshape(-1), minlength=self.num_experts)
             overloaded = expert_counts > capacity
             drop_mask = overloaded[top_indices]
-            top_scores = top_scores * (~drop_mask).float()
+            top_scores.masked_fill_(drop_mask, 0.0)
             overflow_mask = drop_mask.any(dim=-1)
 
-        combined = torch.zeros_like(flat)
+        single_route = self.top_k == 1
+        combined = torch.empty_like(flat) if single_route else torch.zeros_like(flat)
         tokens = flat.shape[0]
-        token_ids = torch.arange(tokens, device=flat.device, dtype=torch.long).repeat_interleave(self.top_k)
+        token_ids = self._token_ids_for(tokens, flat.device)
         expert_ids = top_indices.reshape(-1).to(dtype=torch.long)
         weights = top_scores.reshape(-1).unsqueeze(-1)
 
         sorted_expert_ids, perm = torch.sort(expert_ids)
-        sorted_token_ids = token_ids.index_select(0, perm)
-        sorted_weights = weights.index_select(0, perm)
+        if torch.is_grad_enabled():
+            sorted_token_ids = token_ids.index_select(0, perm)
+            sorted_weights = weights.index_select(0, perm)
+            sorted_flat = None
+        else:
+            routes = int(expert_ids.numel())
+            sorted_token_ids, sorted_weights, sorted_flat = self._route_workspaces(
+                routes,
+                hidden,
+                flat.device,
+                flat.dtype,
+                weights.dtype,
+            )
+            torch.index_select(token_ids, 0, perm, out=sorted_token_ids)
+            torch.index_select(weights, 0, perm, out=sorted_weights)
+            torch.index_select(flat, 0, sorted_token_ids, out=sorted_flat)
 
         unique_experts, counts = torch.unique_consecutive(sorted_expert_ids, return_counts=True)
         # Convert small metadata to CPU for efficient Python looping.
-        expert_list = unique_experts.tolist()
-        count_list = counts.tolist()
+        expert_list, count_list = self._expert_metadata_lists(unique_experts, counts)
 
         offset = 0
         for expert_id, count in zip(expert_list, count_list):
             if count <= 0:
                 continue
-            segment_tokens = sorted_token_ids.narrow(0, offset, count)
-            segment_weights = sorted_weights.narrow(0, offset, count)
+            segment_start = offset
+            segment_tokens = sorted_token_ids.narrow(0, segment_start, count)
+            segment_weights = sorted_weights.narrow(0, segment_start, count)
             offset += count
 
-            expert_input = flat.index_select(0, segment_tokens)
+            if sorted_flat is None:
+                expert_input = flat.index_select(0, segment_tokens)
+            else:
+                expert_input = sorted_flat.narrow(0, segment_start, count)
             expert_out = self.experts[int(expert_id)](expert_input)
-            segment_weights = segment_weights.to(expert_out.dtype)
-            combined.index_add_(0, segment_tokens, expert_out * segment_weights)
+            weighted_out = self._scaled_expert_output(expert_out, segment_weights)
+            if single_route:
+                combined.index_copy_(0, segment_tokens, weighted_out)
+            else:
+                combined.index_add_(0, segment_tokens, weighted_out)
 
         combined = combined.view(batch, seq, hidden)
         if collect_router_stats:
@@ -401,7 +535,8 @@ class SimpleMoEBlock(nn.Module):
             self.ff = DenseFeedForward(config.hidden_size, config.ffn_size, device=device, dtype=config.dtype_obj)
 
     def forward(self, hidden: torch.Tensor, *, collect_router_stats: bool = False) -> torch.Tensor | Tuple[torch.Tensor, Optional[dict]]:
-        attn_out, _ = self.attn(self.ln_attn(hidden), self.ln_attn(hidden), self.ln_attn(hidden), need_weights=False)
+        attn_input = self.ln_attn(hidden)
+        attn_out, _ = self.attn(attn_input, attn_input, attn_input, need_weights=False)
         hidden = hidden + attn_out
         if collect_router_stats and isinstance(self.ff, MoEFeedForward):
             ff_out, stats = self.ff(self.ln_mlp(hidden), collect_router_stats=True)

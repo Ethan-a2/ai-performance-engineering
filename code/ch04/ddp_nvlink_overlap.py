@@ -44,12 +44,31 @@ class OptimizedDdpNvlinkOverlapBenchmark(VerificationPayloadMixin, BaseBenchmark
         super().__init__()
         self.models: List[nn.Linear] = []
         self._inputs: List[List[torch.Tensor]] = []
+        self._micro_model_groups: list[list[tuple[int, nn.Linear, torch.Tensor]]] = []
         self.output: Optional[torch.Tensor] = None
         self.microbatches = 2
+        self._microbatch_range = range(self.microbatches)
         self.batch_size = 8
         self.hidden = 512
         self.root_device = torch.device("cuda:0")
+        self._payload_parameter_count = 0
         self._reduce_buffers: List[torch.Tensor] = []
+        self._root_grad_staging: List[List[torch.Tensor]] = []
+        self._grad_ready_events: List[List[torch.cuda.Event]] = []
+        self._update_buffers: List[torch.Tensor] = []
+        self._grad_slots: List[torch.Tensor] = []
+        self._ordered_grad_slots: List[torch.Tensor] = []
+        self._ordered_bucket_indices: List[int] = []
+        self._bucket_reorder_pairs: List[Tuple[int, int]] = []
+        self._model_index_range = range(0)
+        self._tail_model_index_range = range(1, 1)
+        self._reduction_results: List[torch.Tensor] = []
+        self._model_update_groups: List[Tuple[int, nn.Linear, torch.Tensor]] = []
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._model_count = 0
+        self._slot_counts: Tuple[int, ...] = ()
+        self._expected_slot_counts: Tuple[int, ...] = ()
+        self._grad_scale = 1.0
         tokens = self.batch_size * self.hidden * self.microbatches
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size * self.microbatches),
@@ -67,79 +86,166 @@ class OptimizedDdpNvlinkOverlapBenchmark(VerificationPayloadMixin, BaseBenchmark
         for rank in range(num):
             device = f"cuda:{rank}"
             self.models.append(nn.Linear(self.hidden, self.hidden).to(device))
+        self._model_count = len(self.models)
+        self._grad_scale = 1.0 / self._model_count
+        self._payload_parameter_count = sum(p.numel() for model in self.models for p in model.parameters())
+        self._grad_slots = [
+            torch.empty(0, device=model.weight.device)
+            for model in self.models
+        ]
+        self._ordered_grad_slots = [
+            torch.empty(0, device=model.weight.device)
+            for model in self.models
+        ]
+        self._verify_output_buffer = torch.empty(
+            (8, 8),
+            device=self.models[0].weight.device,
+            dtype=torch.float32,
+        )
+        bucket_order = sorted(_bucket_order(), key=lambda kv: kv[0])
+        self._ordered_bucket_indices = [bucket_idx for _, bucket_idx in bucket_order]
+        self._bucket_reorder_pairs = list(enumerate(self._ordered_bucket_indices))
+        self._model_index_range = range(self._model_count)
+        self._tail_model_index_range = range(1, self._model_count)
         self._inputs = []
-        for micro in range(self.microbatches):
+        self._microbatch_range = range(self.microbatches)
+        for _micro in self._microbatch_range:
             micro_inputs: List[torch.Tensor] = []
             for model in self.models:
                 micro_inputs.append(torch.randn(self.batch_size, self.hidden, device=model.weight.device))
             self._inputs.append(micro_inputs)
-        self._reduce_buffers = [
-            torch.zeros_like(self.models[0].weight, device=self.root_device)
-            for _ in range(self.microbatches)
+        self._micro_model_groups = [
+            list(zip(range(self._model_count), self.models, micro_inputs, strict=True))
+            for micro_inputs in self._inputs
         ]
+        self._reduce_buffers = [
+            torch.empty_like(self.models[0].weight, device=self.root_device)
+            for _ in self._microbatch_range
+        ]
+        self._reduction_results = [
+            torch.empty(0, device=self.root_device)
+            for _ in self._microbatch_range
+        ]
+        self._root_grad_staging = [
+            [
+                torch.empty_like(self.models[0].weight, device=self.root_device)
+                for _ in self.models
+            ]
+            for _ in self._microbatch_range
+        ]
+        self._grad_ready_events = [
+            [torch.cuda.Event() for _ in self.models]
+            for _ in self._microbatch_range
+        ]
+        self._update_buffers = [
+            torch.empty_like(model.weight, device=model.weight.device)
+            for model in self.models
+        ]
+        self._model_update_groups = [
+            (model_idx, model, update_buffer)
+            for model_idx, (model, update_buffer) in enumerate(zip(self.models, self._update_buffers, strict=True))
+        ][: len(self._reduction_results)]
+        self._slot_counts = (
+            len(self._grad_slots),
+            len(self._ordered_grad_slots),
+            len(self._ordered_bucket_indices),
+            len(self._reduction_results),
+        )
+        self._expected_slot_counts = (
+            self._model_count,
+            self._model_count,
+            self._model_count,
+            self.microbatches,
+        )
         self._synchronize()
 
     def _async_reduce_to_root(self, grads: List[torch.Tensor], buffer_index: int) -> torch.Tensor:
         """Asynchronously accumulate gradients on the root device."""
         root_buf = self._reduce_buffers[buffer_index]
-        root_buf.zero_()
-        events = []
-        for g in grads:
-            evt = torch.cuda.Event()
-            evt.record()
-            events.append((g, evt))
+        event_row = self._grad_ready_events[buffer_index]
+        staging_row = self._root_grad_staging[buffer_index]
+        for idx in self._model_index_range:
+            event_row[idx].record()
 
         with torch.cuda.stream(self.comm_stream):
-            for g, evt in events:
+            first = grads[0]
+            self.comm_stream.wait_event(event_row[0])
+            if first.device == self.root_device:
+                root_buf.copy_(first)
+            else:
+                staging = staging_row[0]
+                staging.copy_(first, non_blocking=True)
+                root_buf.copy_(staging)
+
+            for idx in self._tail_model_index_range:
+                g = grads[idx]
+                evt = event_row[idx]
                 self.comm_stream.wait_event(evt)
-                root_buf.add_(g.to(self.root_device, non_blocking=True))
+                if g.device == self.root_device:
+                    root_buf.add_(g)
+                else:
+                    staging = staging_row[idx]
+                    staging.copy_(g, non_blocking=True)
+                    root_buf.add_(staging)
         return root_buf
 
     def benchmark_fn(self) -> None:
         assert self.models
         with self._nvtx_range("optimized_ddp_multigpu_nvlink_overlap"):
-            reduction_results: List[torch.Tensor] = []
+            if (
+                self._slot_counts != self._expected_slot_counts
+                or not self._model_update_groups
+            ):
+                raise RuntimeError("Gradient reduction slots not initialized")
+            grads = self._grad_slots
+            ordered_grads = self._ordered_grad_slots
+            reduction_results = self._reduction_results
             # Process microbatches; overlap reduction of previous with compute of next
-            for micro in range(self.microbatches):
-                grads = []
-                for model_idx, model in enumerate(self.models):
-                    x = self._inputs[micro][model_idx]
+            for micro in self._microbatch_range:
+                for model_idx, model, x in self._micro_model_groups[micro]:
                     y = model(x)
-                    loss = y.pow(2).mean()
+                    loss = y.square().mean()
                     loss.backward()
-                    grads.append(model.weight.grad)
+                    grad = model.weight.grad
+                    if grad is None:
+                        raise RuntimeError("Gradient missing after backward")
+                    grads[model_idx] = grad
 
                 # Reorder buckets (simple proxy: ascending device id)
-                ordered = sorted(zip(grads, _bucket_order()), key=lambda kv: kv[1][0])
-                ordered_grads = [g for g, _ in ordered]
+                for ordered_idx, source_idx in self._bucket_reorder_pairs:
+                    ordered_grads[ordered_idx] = grads[source_idx]
 
-                reduction_results.append(self._async_reduce_to_root(ordered_grads, micro))
+                reduction_results[micro] = self._async_reduce_to_root(ordered_grads, micro)
 
             # Finalize reductions and apply updates
             torch.cuda.current_stream(self.root_device).wait_stream(self.comm_stream)
-            for model, root_buf in zip(self.models, reduction_results):
+            for model_idx, model, update_buffer in self._model_update_groups:
+                root_buf = reduction_results[model_idx]
                 if root_buf.device != model.weight.device:
-                    root_local = root_buf.to(model.weight.device, non_blocking=True)
+                    root_local = update_buffer
+                    root_local.copy_(root_buf, non_blocking=True)
                 else:
                     root_local = root_buf
                 with torch.no_grad():
-                    root_local.mul_(1.0 / len(self.models))
+                    root_local.mul_(self._grad_scale)
                     model.weight.add_(-1e-3, root_local)
                     model.weight.grad.zero_()
                     model.bias.grad.zero_()
-            self.output = self.models[0].weight.detach()
+            self.output = self.models[0].weight
 
     def capture_verification_payload(self) -> None:
         if self.output is None or not self._inputs:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
+        if self._verify_output_buffer is None:
+            raise RuntimeError("Verification output buffer not initialized")
         x_probe = self._inputs[0][0]
-        param_count = sum(p.numel() for m in self.models for p in m.parameters())
-        weight_slice = self.output[:8, :8].to(dtype=torch.float32).clone()
+        weight_slice = self.output[:8, :8].detach()
+        self._verify_output_buffer.copy_(weight_slice)
         self._set_verification_payload(
             inputs={"x": x_probe},
-            output=weight_slice,
+            output=self._verify_output_buffer,
             batch_size=int(x_probe.shape[0]),
-            parameter_count=param_count,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,
@@ -152,8 +258,25 @@ class OptimizedDdpNvlinkOverlapBenchmark(VerificationPayloadMixin, BaseBenchmark
     def teardown(self) -> None:
         self.models.clear()
         self._inputs = []
+        self._micro_model_groups = []
         self._reduce_buffers = []
+        self._root_grad_staging = []
+        self._grad_ready_events = []
+        self._update_buffers = []
+        self._grad_slots = []
+        self._ordered_grad_slots = []
+        self._ordered_bucket_indices = []
+        self._bucket_reorder_pairs = []
+        self._model_index_range = range(0)
+        self._tail_model_index_range = range(1, 1)
+        self._reduction_results = []
+        self._model_update_groups = []
+        self._model_count = 0
+        self._slot_counts = ()
+        self._expected_slot_counts = ()
+        self._grad_scale = 1.0
         self.output = None
+        self._verify_output_buffer = None
         torch.cuda.empty_cache()
 
     def get_config(self) -> BenchmarkConfig:
@@ -191,5 +314,3 @@ class OptimizedDdpNvlinkOverlapBenchmark(VerificationPayloadMixin, BaseBenchmark
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedDdpNvlinkOverlapBenchmark()
-
-

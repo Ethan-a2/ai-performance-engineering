@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
-import statistics
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import torch
 
@@ -79,14 +80,28 @@ def _policy_probs(
 
 def _routing_stats(indices: torch.Tensor, *, num_experts: int) -> tuple[float, float, int]:
     counts = torch.bincount(indices.reshape(-1), minlength=num_experts).to(torch.float32)
-    total = float(counts.sum().item())
-    active = float((counts > 0).sum().item()) / float(num_experts)
-    max_tokens = int(counts.max().item()) if total > 0 else 0
+    total_tensor = counts.sum()
+    probs = counts / total_tensor.clamp_min(1.0)
+    nz = probs[probs > 0]
+    entropy_tensor = (
+        -(nz * nz.log()).sum() / math.log(num_experts)
+        if num_experts > 1
+        else counts.new_zeros(())
+    )
+    stats = torch.empty(4, device=counts.device, dtype=counts.dtype)
+    stats[0].copy_(total_tensor)
+    stats[1].copy_((counts > 0).sum().to(counts.dtype))
+    stats[2].copy_(counts.max())
+    stats[3].copy_(entropy_tensor)
+    stats_host = stats.detach().cpu()
+    total = float(stats_host[0])
+    active_count = float(stats_host[1])
+    max_tokens_float = float(stats_host[2])
+    entropy = float(stats_host[3])
+    active = float(active_count) / float(num_experts)
+    max_tokens = int(max_tokens_float) if total > 0 else 0
     if total <= 0:
         return 0.0, active, max_tokens
-    probs = counts / total
-    nz = probs[probs > 0]
-    entropy = float((-(nz * nz.log()).sum() / math.log(num_experts)).item()) if num_experts > 1 else 0.0
     return entropy, active, max_tokens
 
 
@@ -160,7 +175,7 @@ def run_decode_step(
     *,
     scenario: MatrixScenario,
 ) -> torch.Tensor:
-    with torch.no_grad():
+    with torch.inference_mode():
         if scenario.schedule_mode == "dynamic":
             return experts.forward_grouped(
                 batch.hidden_states, batch.expert_indices, batch.expert_weights
@@ -181,7 +196,7 @@ def _reference_outputs(
     batches: Sequence[DispatchBatch],
 ) -> list[torch.Tensor]:
     refs: list[torch.Tensor] = []
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in batches:
             refs.append(
                 experts.forward_grouped(
@@ -198,12 +213,18 @@ def _compare_outputs(
     *,
     scenario: MatrixScenario,
 ) -> float:
-    diffs: list[float] = []
-    with torch.no_grad():
-        for batch, ref in zip(batches, refs):
+    max_diff: torch.Tensor | None = None
+    with torch.inference_mode():
+        for batch, ref in zip(batches, refs, strict=True):
             out = run_decode_step(experts, batch, scenario=scenario)
-            diffs.append(float(torch.max(torch.abs(out.float() - ref.float())).item()))
-    return max(diffs, default=0.0)
+            diff = torch.abs(out.float() - ref.float()).amax()
+            if max_diff is None:
+                max_diff = diff.clone()
+            else:
+                torch.maximum(max_diff, diff, out=max_diff)
+    if max_diff is None:
+        return 0.0
+    return float(max_diff.detach().cpu())
 
 
 def measure_scenario(
@@ -274,27 +295,46 @@ def measure_scenario(
     torch.cuda.synchronize(device)
 
     elapsed_per_step_ms: list[float] = []
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream(device)
     for _ in range(scenario.repeats):
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
+        start_event.record(current_stream)
         for batch in batches:
             run_decode_step(experts, batch, scenario=scenario)
-        end_event.record()
-        torch.cuda.synchronize(device)
+        end_event.record(current_stream)
+        end_event.synchronize()
         elapsed_per_step_ms.append(start_event.elapsed_time(end_event) / len(batches))
 
+    batch_count = len(batches)
+    entropy_total = 0.0
+    active_fraction_total = 0.0
+    max_tokens_per_expert_total = 0.0
+    for batch in batches:
+        entropy_total += batch.routing_entropy_norm
+        active_fraction_total += batch.active_expert_fraction
+        max_tokens_per_expert_total += float(batch.max_tokens_per_expert)
+    entropy_mean = entropy_total / batch_count
+    active_fraction_mean = active_fraction_total / batch_count
+    max_tokens_per_expert_mean = max_tokens_per_expert_total / batch_count
+
+    sample_count = len(elapsed_per_step_ms)
+    latency_total = 0.0
+    latency_total_sq = 0.0
+    for elapsed_ms in elapsed_per_step_ms:
+        latency_total += elapsed_ms
+        latency_total_sq += elapsed_ms * elapsed_ms
+    step_mean_ms = latency_total / sample_count
+    if sample_count > 1:
+        latency_variance = (latency_total_sq / sample_count) - step_mean_ms * step_mean_ms
+        step_stdev_ms = math.sqrt(max(0.0, latency_variance))
+    else:
+        step_stdev_ms = 0.0
+    p95_index = max(0, math.ceil(0.95 * sample_count) - 1)
+    upper_tail_count = sample_count - p95_index
+    step_p95_ms = heapq.nlargest(upper_tail_count, elapsed_per_step_ms)[-1]
+
     max_abs_diff = _compare_outputs(experts, batches, refs, scenario=scenario)
-    entropy_mean = statistics.fmean(batch.routing_entropy_norm for batch in batches)
-    active_fraction_mean = statistics.fmean(batch.active_expert_fraction for batch in batches)
-    max_tokens_per_expert_mean = statistics.fmean(batch.max_tokens_per_expert for batch in batches)
-    step_mean_ms = statistics.fmean(elapsed_per_step_ms)
-    step_stdev_ms = (
-        statistics.pstdev(elapsed_per_step_ms) if len(elapsed_per_step_ms) > 1 else 0.0
-    )
-    sorted_latencies = sorted(elapsed_per_step_ms)
-    p95_index = max(0, math.ceil(0.95 * len(sorted_latencies)) - 1)
-    step_p95_ms = sorted_latencies[p95_index]
 
     metrics = experts.get_cuda_graph_metrics()
     graph_captured = float(metrics.get("cuda_graph_captured", 0.0))
@@ -327,18 +367,35 @@ def measure_scenario(
 
 
 def summarize_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    ok_rows = [row for row in rows if row.get("status") == "ok"]
+    ok_row_count = 0
+    unsupported_row_count = 0
+    error_row_count = 0
+    best: dict[str, Any] | None = None
+    by_config: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+    workload_keys: set[Any] = set()
+    for row in rows:
+        status = row.get("status")
+        if status == "ok":
+            ok_row_count += 1
+            if best is None or float(row["step_mean_ms"]) < float(best["step_mean_ms"]):
+                best = row
+            by_config[(row["workload_key"], row["schedule_mode"], row["launch_mode"])] = row
+            workload_keys.add(row["workload_key"])
+        elif status == "unsupported":
+            unsupported_row_count += 1
+        elif status == "error":
+            error_row_count += 1
+
     summary: dict[str, Any] = {
         "row_count": len(rows),
-        "ok_row_count": len(ok_rows),
-        "unsupported_row_count": sum(1 for row in rows if row.get("status") == "unsupported"),
-        "error_row_count": sum(1 for row in rows if row.get("status") == "error"),
+        "ok_row_count": ok_row_count,
+        "unsupported_row_count": unsupported_row_count,
+        "error_row_count": error_row_count,
         "best_overall": None,
         "persistent_vs_dynamic": [],
         "graph_vs_eager": [],
     }
-    if ok_rows:
-        best = min(ok_rows, key=lambda row: float(row["step_mean_ms"]))
+    if best is not None:
         summary["best_overall"] = {
             "config_id": best["config_id"],
             "step_mean_ms": best["step_mean_ms"],
@@ -346,16 +403,7 @@ def summarize_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "workload_key": best["workload_key"],
         }
 
-    by_config = {
-        (
-            row["workload_key"],
-            row["schedule_mode"],
-            row["launch_mode"],
-        ): row
-        for row in ok_rows
-    }
-    workload_keys = sorted({row["workload_key"] for row in ok_rows})
-    for workload_key in workload_keys:
+    for workload_key in sorted(workload_keys):
         dynamic = by_config.get((workload_key, "dynamic", "eager"))
         persistent = by_config.get((workload_key, "persistent", "eager"))
         graph = by_config.get((workload_key, "persistent", "cuda_graph"))
@@ -392,10 +440,11 @@ def summarize_rows(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 
 def render_console_table(rows: Sequence[dict[str, Any]], *, limit: int = 16) -> str:
-    ok_rows = sorted(
+    ok_rows = heapq.nsmallest(
+        limit,
         (row for row in rows if row.get("status") == "ok"),
         key=lambda row: float(row["step_mean_ms"]),
-    )[:limit]
+    )
     lines = [
         "| config_id | batch | routing | schedule | launch | mean ms | tok/s |",
         "| --- | ---: | --- | --- | --- | ---: | ---: |",

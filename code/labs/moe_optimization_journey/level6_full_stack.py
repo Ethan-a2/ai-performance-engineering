@@ -14,7 +14,6 @@ Expected speedup: 1.3-2x over Level 4 (for small batches where launch overhead d
 
 from __future__ import annotations
 
-import time
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -62,13 +61,17 @@ class CUDAGraphMoEExperts(nn.Module):
         
         # Batched matmul - all done in BF16
         gate = torch.einsum('bkh,bkhi->bki', x_exp, w1_sel)
-        gate = F.silu(gate)
+        F.silu(gate, inplace=True)
         up = torch.einsum('bkh,bkhi->bki', x_exp, w3_sel)
-        hidden = gate * up
-        out = torch.einsum('bki,bkih->bkh', hidden, w2_sel)
+        gate.mul_(up)
+        out = torch.einsum('bki,bkih->bkh', gate, w2_sel)
         
         # Weight and sum
-        return (out * expert_weights.unsqueeze(-1)).sum(dim=1)
+        out.mul_(expert_weights.unsqueeze(-1))
+        reduced = out[:, 0, :]
+        for route_idx in range(1, top_k):
+            reduced.add_(out[:, route_idx, :])
+        return reduced
 
 
 class CUDAGraphMoELayer(nn.Module):
@@ -90,9 +93,9 @@ class CUDAGraphMoELayer(nn.Module):
         
         # Router
         router_logits = self.gate(x_flat)
-        routing_weights = F.softmax(router_logits.float(), dim=-1)
-        expert_weights, expert_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-        expert_weights = (expert_weights / expert_weights.sum(dim=-1, keepdim=True)).to(x.dtype)
+        top_logits, expert_indices = torch.topk(router_logits.float(), self.top_k, dim=-1)
+        expert_weights = F.softmax(top_logits, dim=-1)
+        expert_weights = expert_weights.to(x.dtype)
         
         # Experts
         output = self.experts(x_flat, expert_indices, expert_weights)
@@ -169,9 +172,15 @@ class Level6FullStack(VerificationPayloadMixin, BaseBenchmark):
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.graph_output: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self.parameter_count: int = 0
         self.last_latency_ms: float = 0.0
         self.last_tokens_per_sec: float = 0.0
+        self._iteration_metrics: Dict[str, float] = {
+            "latency_ms": 0.0,
+            "tokens_per_sec": 0.0,
+        }
+        self._timing_events: Optional[Tuple[torch.cuda.Event, torch.cuda.Event]] = None
         self._pending_events: Optional[Tuple[torch.cuda.Event, torch.cuda.Event]] = None
         
         total_tokens = self.config.batch_size * self.config.seq_len
@@ -209,6 +218,11 @@ class Level6FullStack(VerificationPayloadMixin, BaseBenchmark):
             device=self.device,
         )
         self.static_input = self.input_ids.clone()
+        self._verify_output_buffer = torch.empty(
+            (self.config.batch_size, 1, min(8, self.config.vocab_size)),
+            device=self.device,
+            dtype=torch.float32,
+        )
         
         # Use torch.compile with max-autotune mode for best performance
         # max-autotune provides aggressive kernel fusion and optimization
@@ -221,7 +235,7 @@ class Level6FullStack(VerificationPayloadMixin, BaseBenchmark):
         # Warmup to trigger compilation and internal graph capture
         print("\n  Warmup (compilation + graph capture)...")
         for i in range(5):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.compiled_model(self.static_input)
             if i == 0:
                 print("    First run (compile): done")
@@ -233,21 +247,33 @@ class Level6FullStack(VerificationPayloadMixin, BaseBenchmark):
         self.graph_output = None
         
         torch.cuda.synchronize()
+        self._timing_events = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
         print("Ready")
+
+    def _get_timing_events(self) -> Tuple[torch.cuda.Event, torch.cuda.Event]:
+        if self._timing_events is None:
+            self._timing_events = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+        return self._timing_events
     
     def benchmark_fn(self) -> None:
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
+        events = self._get_timing_events()
+        start_event, end_event = events
+        current_stream = torch.cuda.current_stream(self.device)
+        start_event.record(current_stream)
         
         with self._nvtx_range("level6_cuda_graphs"):
             # torch.compile with reduce-overhead handles graph replay internally
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits = self.compiled_model(self.static_input)
-        self.output = logits[:, :1, : min(8, logits.shape[-1])].detach().float().clone()
-        
-        end_event.record()
-        self._pending_events = (start_event, end_event)
+        end_event.record(current_stream)
+        self.output = logits
+        self._pending_events = events
         if self.static_input is None or self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
@@ -259,15 +285,23 @@ class Level6FullStack(VerificationPayloadMixin, BaseBenchmark):
         self.last_latency_ms = start_event.elapsed_time(end_event)
         total_tokens = self.config.batch_size * self.config.seq_len
         self.last_tokens_per_sec = total_tokens / max(self.last_latency_ms / 1000.0, 1e-9)
-        return {
-            "latency_ms": float(self.last_latency_ms),
-            "tokens_per_sec": float(self.last_tokens_per_sec),
-        }
+        metrics = self._iteration_metrics
+        metrics["latency_ms"] = float(self.last_latency_ms)
+        metrics["tokens_per_sec"] = float(self.last_tokens_per_sec)
+        return metrics
 
     def capture_verification_payload(self) -> None:
+        if self.static_input is None or self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"input_ids": self.static_input.detach()},
-            output=self.output,
+            output=self._verify_output_buffer,
             batch_size=self.config.batch_size,
             parameter_count=self.parameter_count,
             precision_flags={"bf16": True, "tf32": torch.backends.cuda.matmul.allow_tf32},
@@ -285,6 +319,10 @@ class Level6FullStack(VerificationPayloadMixin, BaseBenchmark):
         self.model = None
         self.input_ids = None
         self.static_input = None
+        self.output = None
+        self._verify_output_buffer = None
+        self._timing_events = None
+        self._pending_events = None
         torch.cuda.empty_cache()
         super().teardown()
     
@@ -310,4 +348,3 @@ class Level6FullStack(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return Level6FullStack()
-

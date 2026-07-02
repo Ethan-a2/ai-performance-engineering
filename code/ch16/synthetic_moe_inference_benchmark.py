@@ -34,7 +34,9 @@ For REAL GPT-OSS models, see:
 from core.harness.arch_config import prefer_flash_sdpa
 
 import json
+import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
@@ -174,10 +176,14 @@ class FP8Linear(nn.Module):
             "weight_scale",
             torch.ones(out_features, 1, dtype=torch.float32),
         )
+        self.register_buffer(
+            "weight_dequant",
+            torch.empty(out_features, in_features, dtype=compute_dtype),
+        )
         if bias:
-            self.register_buffer("bias", torch.zeros(out_features, dtype=torch.float32))
+            self.register_buffer("bias", torch.zeros(out_features, dtype=compute_dtype))
         else:
-            self.register_buffer("bias", torch.empty(0, dtype=torch.float32))
+            self.register_buffer("bias", torch.empty(0, dtype=compute_dtype))
 
         self.reset_parameters()
 
@@ -194,21 +200,34 @@ class FP8Linear(nn.Module):
         quant = torch.clamp((weight_fp32 / scale).round(), -240, 240).to(self.fp8_dtype)
         self.weight_fp8.copy_(quant)
         self.weight_scale.copy_(scale)
+        self._refresh_dequantized_weight()
+
+    def _refresh_dequantized_weight(self) -> None:
+        scale = self.weight_scale.to(dtype=self.compute_dtype, device=self.weight_fp8.device)
+        dequant = self.weight_fp8.to(dtype=self.compute_dtype).mul_(scale)
+        if (
+            self.weight_dequant.device != dequant.device
+            or self.weight_dequant.dtype != dequant.dtype
+            or tuple(self.weight_dequant.shape) != tuple(dequant.shape)
+        ):
+            self.weight_dequant = dequant
+        else:
+            self.weight_dequant.copy_(dequant)
 
     def convert_precision(self, compute_dtype: torch.dtype) -> None:
         """Update compute dtype while keeping FP8 weights intact."""
         self.compute_dtype = compute_dtype
         if self.has_bias and self.bias.dtype != compute_dtype:
             self.bias = self.bias.to(compute_dtype)
+        self._refresh_dequantized_weight()
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if input.dtype != self.compute_dtype:
             input = input.to(self.compute_dtype)
-        scale = self.weight_scale.to(self.compute_dtype)
-        weight = self.weight_fp8.to(self.compute_dtype) * scale
+        weight = self.weight_dequant
         bias = None
         if self.has_bias:
-            bias = self.bias if self.bias.dtype == self.compute_dtype else self.bias.to(self.compute_dtype)
+            bias = self.bias
         return F.linear(input, weight, bias)
 
 
@@ -219,7 +238,7 @@ def _convert_module_precision(module: nn.Module, dtype: torch.dtype) -> None:
     if isinstance(module, FP8Linear):
         module.convert_precision(dtype)
         return
-    for name, param in module.named_parameters(recurse=False):
+    for _name, param in module.named_parameters(recurse=False):
         if not torch.is_floating_point(param):
             continue
         param.data = param.data.to(dtype)
@@ -286,8 +305,6 @@ class SimpleMoELayer(nn.Module):
         )
         
     def forward(self, x):
-        if x.dtype != self.compute_dtype:
-            x = x.to(self.compute_dtype)
         # Route to experts (simplified: use all tokens with expert 0)
         return self.expert(x)
 
@@ -309,8 +326,6 @@ class SyntheticMoEBlock(nn.Module):
         self.moe = SimpleMoELayer(config)
         
     def forward(self, x):
-        if x.dtype != self.compute_dtype:
-            x = x.to(self.compute_dtype)
         # Attention with residual
         residual = x
         x = self.ln1(x)
@@ -320,8 +335,10 @@ class SyntheticMoEBlock(nn.Module):
         head_dim = d_model // n_heads
         
         qkv = self.qkv(x).reshape(batch, seq_len, 3, n_heads, head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         
         # Flash Attention
         with prefer_flash_sdpa():
@@ -361,12 +378,12 @@ class SyntheticMoEModel(nn.Module):
         self.total_params = _count_parameters_with_fp8(self)
         
     def forward(self, input_ids):
-        x = self.embedding(input_ids).to(self.compute_dtype)
+        x = self.embedding(input_ids)
         
         for block in self.blocks:
             x = block(x)
             
-        x = self.ln_f(x.to(self.compute_dtype))
+        x = self.ln_f(x)
         logits = self.lm_head(x)
         
         return logits
@@ -401,6 +418,12 @@ def estimate_memory_usage(config: SyntheticMoEConfig, batch_size: int, seq_len: 
     }
 
 
+def _benchmark_autocast_context(use_autocast, autocast_dtype):
+    if use_autocast:
+        return torch.autocast("cuda", dtype=autocast_dtype)
+    return nullcontext()
+
+
 def benchmark_inference(model, input_ids, name, num_warmup=20, num_iters=100, *, autocast_dtype=None):
     """Benchmark inference performance"""
     print(f"\nBenchmarking: {name}")
@@ -409,34 +432,37 @@ def benchmark_inference(model, input_ids, name, num_warmup=20, num_iters=100, *,
     # Warmup
     print(f"  Warming up ({num_warmup} iterations)...", end='', flush=True)
     use_autocast = autocast_dtype is not None and input_ids.device.type == "cuda"
-    for _ in range(num_warmup):
-        with torch.no_grad():
-            if use_autocast:
-                with torch.autocast("cuda", dtype=autocast_dtype):
-                    _ = model(input_ids)
-            else:
-                _ = model(input_ids)
+    with torch.inference_mode(), _benchmark_autocast_context(use_autocast, autocast_dtype):
+        for _ in range(num_warmup):
+            _ = model(input_ids)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     print(" done")
     
     # Benchmark
     print(f"  Running benchmark ({num_iters} iterations)...", end='', flush=True)
-    start = time.perf_counter()
-    for _ in range(num_iters):
-        with torch.no_grad():
-            if use_autocast:
-                with torch.autocast("cuda", dtype=autocast_dtype):
-                    _ = model(input_ids)
-            else:
+    count = max(num_iters, 1)
+    if input_ids.device.type == "cuda":
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream(input_ids.device)
+        with torch.inference_mode(), _benchmark_autocast_context(use_autocast, autocast_dtype):
+            start_event.record(current_stream)
+            for _ in range(count):
                 _ = model(input_ids)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
+            end_event.record(current_stream)
+        end_event.synchronize()
+        elapsed = start_event.elapsed_time(end_event) / 1000.0
+    else:
+        start = time.perf_counter()
+        with torch.inference_mode():
+            for _ in range(count):
+                _ = model(input_ids)
+        elapsed = time.perf_counter() - start
     print(" done")
     
-    avg_time_ms = (elapsed / num_iters) * 1000
-    tokens_per_sec = (input_ids.numel() * num_iters) / elapsed
+    avg_time_ms = (elapsed / count) * 1000
+    tokens_per_sec = (input_ids.numel() * count) / elapsed
     
     print(f"  Average time: {avg_time_ms:.2f} ms")
     print(f"  Throughput: {tokens_per_sec:.1f} tokens/sec")

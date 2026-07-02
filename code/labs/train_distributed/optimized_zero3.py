@@ -15,7 +15,6 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     ShardingStrategy,
 )
-from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 
 from labs.train_distributed.training_utils.memory import print_memory_stats
 from labs.train_distributed.training_utils.utils import get
@@ -81,13 +80,15 @@ def main():
         fsdp_model = torch.compile(fsdp_model, mode="reduce-overhead")
 
     optimizer = _maybe_fused_adamw(fsdp_model.parameters(), args.learning_rate)
+    x = torch.empty(args.batch_size, args.hidden_size, device=device)
+    y = torch.empty_like(x)
 
     # Warmup to stabilize allocator and buckets.
-    warm_x = torch.randn(args.batch_size, args.hidden_size, device=device)
-    warm_y = torch.randn_like(warm_x)
+    x.normal_()
+    y.normal_()
     optimizer.zero_grad(set_to_none=True)
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        warm_loss = nn.functional.mse_loss(fsdp_model(warm_x), warm_y)
+        warm_loss = nn.functional.mse_loss(fsdp_model(x), y)
     warm_loss.backward()
     optimizer.step()
     if rank == 0:
@@ -97,12 +98,13 @@ def main():
     total_tokens = 0
     start = perf_counter()
     grad_clip = 1.0
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
 
     for step in range(args.steps):
         optimizer.zero_grad(set_to_none=True)
         for _ in range(args.grad_accum):
-            x = torch.randn(args.batch_size, args.hidden_size, device=device)
-            y = torch.randn_like(x)
+            x.normal_()
+            y.normal_()
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 loss = nn.functional.mse_loss(fsdp_model(x), y) / args.grad_accum
             loss.backward()
@@ -114,9 +116,11 @@ def main():
         if rank == 0 and step % 10 == 0:
             elapsed = perf_counter() - start
             toks_per_sec = total_tokens / elapsed if elapsed > 0 else 0.0
+            loss_value_buffer[0].copy_(loss.detach())
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
             print(
                 f"[optimized-zero3] step {step}/{args.steps} "
-                f"loss={loss.item():.4f} tokens/s per rank={toks_per_sec:,.0f}"
+                f"loss={loss_value:.4f} tokens/s per rank={toks_per_sec:,.0f}"
             )
 
     torch.cuda.synchronize(device)

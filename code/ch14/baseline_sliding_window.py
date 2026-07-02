@@ -11,10 +11,11 @@ via scaled_dot_product_attention for O(n) memory and fused kernels.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import (
@@ -43,6 +44,19 @@ class NaiveAttentionModule(nn.Module):
         
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.register_buffer(
+            "_causal_mask",
+            torch.empty(0, 0, dtype=torch.bool),
+            persistent=False,
+        )
+
+    def _causal_mask_for(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        mask = self._causal_mask
+        if mask.device != device or mask.size(0) < seq_len:
+            pos = torch.arange(seq_len, device=device)
+            self._causal_mask = pos.unsqueeze(0) > pos.unsqueeze(1)
+            mask = self._causal_mask
+        return mask[:seq_len, :seq_len]
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Naive O(n²) attention with explicit matmul operations."""
@@ -51,18 +65,14 @@ class NaiveAttentionModule(nn.Module):
         # QKV projection
         qkv = self.qkv_proj(x)
         qkv = qkv.view(B, S, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, D]
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
         
         # Explicit O(n²) attention - creates full S×S attention matrix
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         
         # Causal mask
-        causal_mask = torch.triu(
-            torch.ones(S, S, device=x.device, dtype=torch.bool),
-            diagonal=1
-        )
-        scores = scores.masked_fill(causal_mask, float('-inf'))
+        causal_mask = self._causal_mask_for(S, x.device)
+        scores.masked_fill_(causal_mask, float('-inf'))
         
         # Softmax and weighted sum
         attn = F.softmax(scores, dim=-1)
@@ -116,14 +126,13 @@ class BaselineSlidingWindowBenchmark(VerificationPayloadMixin, BaseBenchmark):
         
         # Proper warmup to avoid cold cache effects
         for _ in range(5):
-            with torch.no_grad():
+            with torch.inference_mode():
                 _ = self.model(self.x)
 
     def benchmark_fn(self) -> None:
         """Benchmark: Naive attention."""
-        with torch.no_grad():
+        with torch.inference_mode():
             self.output = self.model(self.x)
-            self._last = float(self.output.sum())
         if self.output is None or self.x is None:
             raise RuntimeError("benchmark_fn() must produce output")
 

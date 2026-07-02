@@ -47,7 +47,7 @@ from ch04.distributed_helper import run_main_with_skip_status, setup_single_gpu_
 import time
 import torch
 import torch.distributed as dist
-from typing import Optional, List
+from typing import Optional
 import math
 
 
@@ -117,9 +117,6 @@ def ring_allreduce_symmetric(
     chunk_size = tensor.numel() // world_size
     chunks = torch.chunk(tensor, world_size)
     
-    # Allocate result
-    result = torch.zeros_like(tensor)
-    
     # Ring reduction
     for step in range(world_size - 1):
         send_chunk_idx = (rank - step) % world_size
@@ -144,7 +141,7 @@ def ring_allreduce_symmetric(
         chunks[recv_chunk_idx].add_(recv_tensor)
     
     # Reconstruct tensor
-    result = torch.cat([c for c in chunks], dim=0)
+    result = torch.cat(chunks, dim=0)
     
     # AllGather phase (simplified - just use NCCL)
     dist.all_gather_into_tensor(result, result)
@@ -168,7 +165,7 @@ def benchmark_traditional_allreduce(
     
     # Warmup
     for _ in range(10):
-        dist.all_reduce(tensor.clone())
+        dist.all_reduce(tensor)
     torch.cuda.synchronize()
     dist.barrier()
     
@@ -178,7 +175,7 @@ def benchmark_traditional_allreduce(
     
     start.record()
     for _ in range(iterations):
-        dist.all_reduce(tensor.clone())
+        dist.all_reduce(tensor)
     end.record()
     end.synchronize()
     
@@ -201,6 +198,7 @@ def benchmark_symmetric_memory_access(
     """
     device = torch.cuda.current_device()
     tensor = torch.randn(size, device=device, dtype=torch.float32)
+    recv_tensor = torch.empty_like(tensor) if rank > 0 else None
     
     try:
         # Try to use symmetric memory API
@@ -213,7 +211,8 @@ def benchmark_symmetric_memory_access(
         for _ in range(10):
             # Simulate direct access pattern
             if rank > 0:
-                recv_tensor = torch.empty_like(tensor)
+                if recv_tensor is None:
+                    raise RuntimeError("Receive buffer was not initialized")
                 dist.recv(recv_tensor, src=rank-1)
             if rank < world_size - 1:
                 dist.send(tensor, dst=rank+1)
@@ -228,7 +227,8 @@ def benchmark_symmetric_memory_access(
         start.record()
         for _ in range(iterations):
             if rank > 0:
-                recv_tensor = torch.empty_like(tensor)
+                if recv_tensor is None:
+                    raise RuntimeError("Receive buffer was not initialized")
                 dist.recv(recv_tensor, src=rank-1)
             if rank < world_size - 1:
                 dist.send(tensor, dst=rank+1)
@@ -271,6 +271,7 @@ def demonstrate_ring_pattern(rank: int, world_size: int) -> None:
     
     for size in sizes:
         tensor = torch.randn(size, device=device, dtype=torch.float32)
+        recv_tensor = torch.empty_like(tensor)
         
         # Warmup
         for _ in range(10):
@@ -278,7 +279,6 @@ def demonstrate_ring_pattern(rank: int, world_size: int) -> None:
             prev_rank = (rank - 1) % world_size
             
             send_req = dist.isend(tensor, dst=next_rank)
-            recv_tensor = torch.empty_like(tensor)
             recv_req = dist.irecv(recv_tensor, src=prev_rank)
             
             send_req.wait()
@@ -288,19 +288,18 @@ def demonstrate_ring_pattern(rank: int, world_size: int) -> None:
         dist.barrier()
         
         # Benchmark
-        start = time.time()
+        start = time.perf_counter()
         for _ in range(100):
             next_rank = (rank + 1) % world_size
             prev_rank = (rank - 1) % world_size
             
             send_req = dist.isend(tensor, dst=next_rank)
-            recv_tensor = torch.empty_like(tensor)
             recv_req = dist.irecv(recv_tensor, src=prev_rank)
             
             send_req.wait()
             recv_req.wait()
         torch.cuda.synchronize()
-        elapsed = time.time() - start
+        elapsed = time.perf_counter() - start
         
         if rank == 0:
             latency_us = (elapsed / 100) * 1e6
@@ -337,6 +336,7 @@ def demonstrate_butterfly_pattern(rank: int, world_size: int) -> None:
     # Small message (latency-bound)
     size = 1024  # 4 KB
     tensor = torch.randn(size, device=device, dtype=torch.float32)
+    recv_tensor = torch.empty_like(tensor)
     
     # Warmup
     for _ in range(10):
@@ -345,7 +345,6 @@ def demonstrate_butterfly_pattern(rank: int, world_size: int) -> None:
             peer = rank ^ stride
             
             send_req = dist.isend(tensor, dst=peer)
-            recv_tensor = torch.empty_like(tensor)
             recv_req = dist.irecv(recv_tensor, src=peer)
             
             send_req.wait()
@@ -358,14 +357,13 @@ def demonstrate_butterfly_pattern(rank: int, world_size: int) -> None:
     dist.barrier()
     
     # Benchmark
-    start = time.time()
+    start = time.perf_counter()
     for _ in range(100):
         for stage in range(stages):
             stride = 1 << stage
             peer = rank ^ stride
             
             send_req = dist.isend(tensor, dst=peer)
-            recv_tensor = torch.empty_like(tensor)
             recv_req = dist.irecv(recv_tensor, src=peer)
             
             send_req.wait()
@@ -373,7 +371,7 @@ def demonstrate_butterfly_pattern(rank: int, world_size: int) -> None:
             
             tensor.add_(recv_tensor)
     torch.cuda.synchronize()
-    elapsed = time.time() - start
+    elapsed = time.perf_counter() - start
     
     if rank == 0:
         latency_us = (elapsed / 100) * 1e6

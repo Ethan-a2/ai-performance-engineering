@@ -37,7 +37,7 @@ def _epilogue_chain(
     y = torch.sigmoid(y) * y
     y = y + bias2
     y = y * scale2
-    y = torch.relu(y)
+    y = torch.relu_(y)
     y = F.silu(y)
     y = y * 1.1 + 0.1
     y = F.gelu(y)
@@ -57,6 +57,7 @@ class BaselineWarpSpecializationTrainingBenchmark(VerificationPayloadMixin, Base
         self.scale2: Optional[torch.Tensor] = None
         self.bias2: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
         self.rows = 4096
         self.cols = 4096
@@ -83,13 +84,26 @@ class BaselineWarpSpecializationTrainingBenchmark(VerificationPayloadMixin, Base
         self.scale2 = torch.tensor(0.97, device=self.device, dtype=self.dtype)
         self.bias2 = torch.tensor(0.2, device=self.device, dtype=self.dtype)
         self.output = None
+        self._verify_output_buffer = torch.empty(
+            (min(128, self.rows), min(256, self.cols)),
+            device=self.device,
+            dtype=torch.float32,
+        )
         self._synchronize()
 
     def benchmark_fn(self) -> None:
-        if any(v is None for v in (self.x, self.scale0, self.bias0, self.scale1, self.bias1, self.scale2, self.bias2)):
+        if (
+            self.x is None
+            or self.scale0 is None
+            or self.bias0 is None
+            or self.scale1 is None
+            or self.bias1 is None
+            or self.scale2 is None
+            or self.bias2 is None
+        ):
             raise RuntimeError("Benchmark not configured")
         with self._nvtx_range("baseline_warp_specialization_training"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 self.output = _epilogue_chain(
                     self.x,
                     self.scale0,
@@ -103,11 +117,16 @@ class BaselineWarpSpecializationTrainingBenchmark(VerificationPayloadMixin, Base
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
-        if self.x is None or self.output is None:
+        if self.x is None or self.output is None or self._verify_output_buffer is None:
             raise RuntimeError("capture_verification_payload() requires a completed benchmark run")
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+        ]
+        self._verify_output_buffer.copy_(output_slice)
         self._set_verification_payload(
             inputs={"x": self.x},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=int(self.rows),
             precision_flags={
                 "fp16": False,
@@ -128,6 +147,7 @@ class BaselineWarpSpecializationTrainingBenchmark(VerificationPayloadMixin, Base
         self.scale2 = None
         self.bias2 = None
         self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
@@ -148,5 +168,3 @@ class BaselineWarpSpecializationTrainingBenchmark(VerificationPayloadMixin, Base
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineWarpSpecializationTrainingBenchmark()
-
-

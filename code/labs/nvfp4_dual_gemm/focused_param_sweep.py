@@ -143,7 +143,7 @@ def _run_candidate(
         ]
         for allow in isolation_allow_cmd_substring:
             cmd += ["--isolation-allow-cmd-substring", str(allow)]
-        t0 = time.time()
+        t0 = time.perf_counter()
         try:
             proc = subprocess.run(
                 cmd,
@@ -154,11 +154,11 @@ def _run_candidate(
         except subprocess.TimeoutExpired as exc:
             _cleanup_orphans()
             row["status"] = "timeout"
-            row["seconds"] = time.time() - t0
+            row["seconds"] = time.perf_counter() - t0
             row["stdout_tail"] = (exc.stdout or "")[-4000:]
             row["stderr_tail"] = (exc.stderr or "")[-4000:]
             return row
-        dt = time.time() - t0
+        dt = time.perf_counter() - t0
         row["seconds"] = dt
         if proc.returncode != 0:
             _cleanup_orphans()
@@ -213,21 +213,22 @@ def main() -> int:
     ]
 
     results = []
+    verify_green = []
     for i, cand in enumerate(candidates, start=1):
         print(f"[{i}/{len(candidates)}] {cand.tag}", flush=True)
-        results.append(
-            _run_candidate(
-                cand,
-                src,
-                owner_pid=owner_pid,
-                require_idle_gpu=bool(args.require_idle_gpu),
-                kill_foreign_gpu_jobs=bool(args.kill_foreign_gpu_jobs),
-                isolation_settle_seconds=float(args.isolation_settle_seconds),
-                isolation_allow_cmd_substring=list(args.isolation_allow_cmd_substring),
-            )
+        result = _run_candidate(
+            cand,
+            src,
+            owner_pid=owner_pid,
+            require_idle_gpu=bool(args.require_idle_gpu),
+            kill_foreign_gpu_jobs=bool(args.kill_foreign_gpu_jobs),
+            isolation_settle_seconds=float(args.isolation_settle_seconds),
+            isolation_allow_cmd_substring=list(args.isolation_allow_cmd_substring),
         )
+        results.append(result)
+        if result.get("status") == "ok":
+            verify_green.append(result)
 
-    verify_green = [r for r in results if r.get("status") == "ok"]
     verify_green.sort(key=lambda r: r["score_us"])
 
     payload = {

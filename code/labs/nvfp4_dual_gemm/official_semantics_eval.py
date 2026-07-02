@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,10 +70,24 @@ def _null_ctx():
 
 
 def _calculate_stats(durations_ns: list[float]) -> Stats:
-    runs = len(durations_ns)
-    mean = sum(durations_ns) / runs
+    runs = 0
+    mean = 0.0
+    m2 = 0.0
+    best = float("inf")
+    worst = float("-inf")
+    for value in durations_ns:
+        runs += 1
+        delta = value - mean
+        mean += delta / runs
+        m2 += delta * (value - mean)
+        if value < best:
+            best = value
+        if value > worst:
+            worst = value
+    if runs == 0:
+        raise ValueError("durations_ns must not be empty")
     if runs > 1:
-        variance = sum((x - mean) ** 2 for x in durations_ns) / (runs - 1)
+        variance = m2 / (runs - 1)
         std = math.sqrt(variance)
         err = std / math.sqrt(runs)
     else:
@@ -84,8 +98,8 @@ def _calculate_stats(durations_ns: list[float]) -> Stats:
         mean=mean,
         std=std,
         err=err,
-        best=min(durations_ns),
-        worst=max(durations_ns),
+        best=best,
+        worst=worst,
     )
 
 
@@ -136,19 +150,17 @@ def _run_single_benchmark_case(
 
         if clear_l2:
             clear_l2_cache_large()
-            # clear_l2_cache_large allocates a very large tensor; force allocator release
-            # between repeats so benchmark loops don't OOM from cached segments.
-            torch.cuda.empty_cache()
 
         outputs_iter = []
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
+        current_stream = torch.cuda.current_stream()
 
-        start.record()
+        start.record(current_stream)
         for data in data_list:
             outputs_iter.append(submission_mod.custom_kernel(data))
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
 
         duration_ns = (start.elapsed_time(end) / float(num_iterations)) * 1e6
 

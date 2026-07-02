@@ -29,7 +29,6 @@ import argparse
 import asyncio
 import json
 import random
-import statistics
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
@@ -62,6 +61,32 @@ TERMINAL_STATUSES = {
     FAILED_STAGE_B,
     FAILED_STAGE_C,
 }
+
+
+def _latency_percentiles(values: list[float]) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+
+    values.sort()
+    midpoint = len(values) // 2
+    if len(values) % 2:
+        p50 = values[midpoint]
+    else:
+        p50 = (values[midpoint - 1] + values[midpoint]) / 2.0
+    p95 = values[max(0, int(0.95 * len(values)) - 1)]
+    return round(p50, 2), round(p95, 2)
+
+
+def _count_whitespace_separated_tokens(text: str) -> int:
+    count = 0
+    in_token = False
+    for char in text:
+        if char.isspace():
+            in_token = False
+        elif not in_token:
+            count += 1
+            in_token = True
+    return count
 
 
 class TransientStageError(RuntimeError):
@@ -253,7 +278,7 @@ def cpu_transform(payload: str, cpu_rounds: int, force_fail: bool) -> dict[str, 
     return {
         "text": transformed,
         "checksum": checksum,
-        "token_count": len(transformed.split()),
+        "token_count": _count_whitespace_separated_tokens(transformed),
     }
 
 
@@ -1070,11 +1095,16 @@ def summarize(results: list[ResultRecord], shared: SharedState) -> dict[str, Any
         FAILED_STAGE_C: 0,
     }
 
+    totals: list[float] = []
+    success_totals: list[float] = []
     for record in results:
         status_counts[record.status] += 1
+        totals.append(record.total_ms)
+        if record.status == SUCCESS:
+            success_totals.append(record.total_ms)
 
-    totals = [record.total_ms for record in results]
-    success_totals = [record.total_ms for record in results if record.status == SUCCESS]
+    p50_total_ms, p95_total_ms = _latency_percentiles(totals)
+    p50_success_ms, _ = _latency_percentiles(success_totals)
 
     summary = {
         "total": len(results),
@@ -1084,14 +1114,9 @@ def summarize(results: list[ResultRecord], shared: SharedState) -> dict[str, Any
         "unique_completed_keys": len(shared.completed_keys),
         "retried_fetch": shared.retried_fetch,
         "retried_write": shared.retried_write,
-        "p50_total_ms": round(statistics.median(totals), 2) if totals else 0.0,
-        "p95_total_ms": round(
-            sorted(totals)[max(0, int(0.95 * len(totals)) - 1)],
-            2,
-        )
-        if totals
-        else 0.0,
-        "p50_success_ms": round(statistics.median(success_totals), 2) if success_totals else 0.0,
+        "p50_total_ms": p50_total_ms,
+        "p95_total_ms": p95_total_ms,
+        "p50_success_ms": p50_success_ms,
     }
 
     summary.update(status_counts)

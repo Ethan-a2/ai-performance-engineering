@@ -18,7 +18,6 @@ The gap analysis shows what optimizations cuBLAS uses that we don't.
 
 import argparse
 import ctypes
-import time
 from pathlib import Path
 
 import torch
@@ -50,14 +49,18 @@ def benchmark_kernel(fn, *args, warmup=5, iters=20):
     for _ in range(warmup):
         fn(*args)
     torch.cuda.synchronize()
-    
+
     # Timed runs
-    start = time.time()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
+    start.record(current_stream)
     for _ in range(iters):
         fn(*args)
-    torch.cuda.synchronize()
-    
-    elapsed_ms = (time.time() - start) / iters * 1000
+    end.record(current_stream)
+    end.synchronize()
+
+    elapsed_ms = start.elapsed_time(end) / iters
     return elapsed_ms
 
 
@@ -99,7 +102,7 @@ def stage1_naive_smem(A, B_T):
     
     M, K = A.shape
     N = B_T.shape[0]
-    C = torch.zeros(M, N, device='cuda', dtype=torch.float32)
+    C = torch.empty(M, N, device='cuda', dtype=torch.float32)
     
     _kernels_lib.launch_gemm_naive_smem(
         ctypes.c_void_p(A.data_ptr()),
@@ -268,6 +271,21 @@ def stage11_cluster(A, B_T):
         return torch.matmul(A, B_T.T)
 
 
+def stage13_dual_cta(A, B_T):
+    """Stage 13: Dual-CTA Occupancy (2 CTAs/SM)
+
+    128x128 tile -> 128-col TMEM accumulator + ~96KB smem (3 stages) +
+    early tcgen05 alloc-permit release. Two CTAs co-reside per SM and
+    cover each other's TMA latency (vs 1 CTA/SM for all prior stages).
+    """
+    try:
+        from labs.custom_vs_cublas.tcgen05_loader import matmul_tcgen05_dual_cta
+        return matmul_tcgen05_dual_cta(A, B_T)
+    except Exception as e:
+        print(f"  [tcgen05_dual_cta unavailable: {e}]")
+        return torch.matmul(A, B_T.T)
+
+
 def stage12_cutlass(A, B_T):
     """Stage 12: CUTLASS CollectiveBuilder (BEST!)
     
@@ -302,6 +320,7 @@ STAGES = {
     10: ("+ TMA Before Wait", stage10_warp_parallel),
     11: ("+ Cluster Launch", stage11_cluster),       # 64% of cuBLAS
     12: ("CUTLASS CollectiveBuilder", stage12_cutlass),  # 68% of cuBLAS - BEST!
+    13: ("+ 2 CTAs/SM (Dual-CTA)", stage13_dual_cta),  # occupancy rewrite
 }
 
 # Note: Stages 8+ are the key optimizations discovered through CUTLASS study.
@@ -335,16 +354,22 @@ def verify_correctness(A, B_T, verbose=True):
         print("\nVerifying correctness...")
     
     ref = torch.matmul(A, B_T.T)
+    ref_fp32 = ref.float()
+    ref_abs_max = ref_fp32.abs().max()
+    error_stats = torch.empty(2, device=ref_fp32.device, dtype=ref_fp32.dtype)
     
     for stage_num, (name, fn) in STAGES.items():
         if stage_num == 0:
             continue
         try:
             result = fn(A, B_T)
-            ref_fp32 = ref.float()
             result_fp32 = result.float()
-            max_diff = (ref_fp32 - result_fp32).abs().max().item()
-            rel_err = max_diff / ref_fp32.abs().max().item()
+            error_stats[0].copy_((ref_fp32 - result_fp32).abs().max())
+            error_stats[1].copy_(ref_abs_max)
+            error_stats_host = error_stats.detach().cpu()
+            max_diff = float(error_stats_host[0])
+            ref_abs_max_host = float(error_stats_host[1])
+            rel_err = max_diff / ref_abs_max_host
             passed = rel_err < 0.01
             if verbose:
                 status = "✓" if passed else "✗"

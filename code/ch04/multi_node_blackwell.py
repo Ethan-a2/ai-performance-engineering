@@ -31,7 +31,7 @@ from torch.distributed.tensor.parallel import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 import torch.nn.functional as F
-from typing import Tuple, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 import time
 # ============================================================================
 # Environment Setup for Blackwell Multi-Node
@@ -134,7 +134,6 @@ def setup_blackwell_distributed(
     
     # Set device
     torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
     
     # Configure NCCL for Blackwell
     if backend == "nccl":
@@ -275,6 +274,11 @@ class MultiNodeTransformer(nn.Module):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_embedding = nn.Embedding(max_seq_len, d_model)
+        self.register_buffer(
+            "_position_ids",
+            torch.arange(max_seq_len, dtype=torch.long).unsqueeze(0),
+            persistent=False,
+        )
         self.layers = nn.ModuleList([
             MultiNodeTransformerBlock(d_model, num_heads, d_ff, dropout)
     for _ in range(num_layers)
@@ -285,11 +289,15 @@ class MultiNodeTransformer(nn.Module):
         self.lm_head.weight = self.embedding.weight
     
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        B, T = input_ids.shape
+        _, T = input_ids.shape
+        if T > self._position_ids.size(1):
+            raise ValueError(
+                f"Sequence length {T} exceeds max_seq_len {self._position_ids.size(1)}"
+            )
         
         # Embeddings
         x = self.embedding(input_ids)
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
+        pos = self._position_ids[:, :T]
         x = x + self.pos_embedding(pos)
         
         # Transformer blocks
@@ -358,7 +366,7 @@ def apply_tensor_parallelism(
     Optimized for intra-node parallelism via NVLink-C2C.
     """
     # Parallelize attention projections
-    for i, layer in enumerate(model.layers):
+    for layer in model.layers:
         # Column-wise parallel for Q, K, V projections
         parallelize_module(
             layer,
@@ -486,12 +494,14 @@ def train_multi_node(
     
     model.train()
     global_step = 0
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=f"cuda:{device}")
+    epoch_loss_sum = torch.zeros((), dtype=torch.float64, device=f"cuda:{device}")
     
     for epoch in range(num_epochs):
-        epoch_loss = 0.0
-        epoch_start = time.time()
+        epoch_loss_sum.zero_()
+        epoch_start = time.perf_counter()
         for step, batch in enumerate(train_data):
-            step_start = time.time()
+            step_start = time.perf_counter()
             
             # Move to device
             input_ids = batch['input_ids'].to(device)
@@ -514,22 +524,27 @@ def train_multi_node(
                 optimizer.zero_grad()
                 global_step += 1
             
-            step_time = time.time() - step_start
+            step_time = time.perf_counter() - step_start
             # Log statistics
             if rank == 0 and step % 10 == 0:
+                loss_value_buffer[0].copy_(loss.detach())
+                loss_value = float(loss_value_buffer.detach().cpu()[0]) * gradient_accumulation_steps
                 tokens_per_step = input_ids.numel() * world_size
                 throughput = tokens_per_step / step_time
-                stats['losses'].append(loss.item() * gradient_accumulation_steps)
+                stats['losses'].append(loss_value)
                 stats['throughputs'].append(throughput)
                 stats['step_times'].append(step_time)
                 print(f"Epoch {epoch} | Step {step:4d} | "
-                      f"Loss: {loss.item()*gradient_accumulation_steps:.4f} | "
+                      f"Loss: {loss_value:.4f} | "
                       f"Throughput: {throughput/1e6:.2f}M tokens/s | "
                       f"Time: {step_time*1000:.1f}ms")
             
-            epoch_loss += loss.item()
-            epoch_time = time.time() - epoch_start
+            if rank == 0:
+                epoch_loss_sum.add_(loss.detach())
+            epoch_time = time.perf_counter() - epoch_start
         if rank == 0:
+            loss_value_buffer[0].copy_(epoch_loss_sum)
+            epoch_loss = float(loss_value_buffer.detach().cpu()[0])
             avg_loss = epoch_loss / len(train_data)
             print(f"\nEpoch {epoch} complete:")
             print(f" Average loss: {avg_loss:.4f}")
@@ -564,11 +579,11 @@ def benchmark_multigpu_bandwidth(
         for _ in range(10):
             collective()
         torch.cuda.synchronize(device)
-        start = time.time()
+        start = time.perf_counter()
         for _ in range(num_iters):
             collective()
         torch.cuda.synchronize(device)
-        return time.time() - start
+        return time.perf_counter() - start
 
     # All-reduce
     if rank == 0:
@@ -629,9 +644,9 @@ def benchmark_multigpu_bandwidth(
     for size in sizes[1:3]:
         tensor = torch.randn(size * world_size, device=device, dtype=torch.float32)
         output = torch.empty(size, device=device, dtype=torch.float32)
-        input_list = list(tensor.chunk(world_size))
+        reducescatter_input = tensor.view(world_size, size)
         bytes_transferred = tensor.numel() * tensor.element_size()
-        elapsed = _bench(lambda: dist.reduce_scatter(output, input_list))
+        elapsed = _bench(lambda: dist.reduce_scatter_tensor(output, reducescatter_input))
         bandwidth_gbs = (bytes_transferred * num_iters) / elapsed / 1e9
         results[f"reducescatter_{bytes_transferred/1e6:.1f}MB"] = bandwidth_gbs
         if rank == 0:
@@ -641,9 +656,14 @@ def benchmark_multigpu_bandwidth(
             )
 
     if rank == 0:
-        allreduce_values = [v for k, v in results.items() if k.startswith("allreduce")]
-        if allreduce_values:
-            avg_allreduce = sum(allreduce_values) / len(allreduce_values)
+        allreduce_total = 0.0
+        allreduce_count = 0
+        for key, value in results.items():
+            if key.startswith("allreduce"):
+                allreduce_total += value
+                allreduce_count += 1
+        if allreduce_count:
+            avg_allreduce = allreduce_total / allreduce_count
             efficiency = (avg_allreduce / 750.0) * 100  # 750 GB/s target
             print("\n" + "=" * 70)
             print(f"Average All-Reduce Bandwidth: {avg_allreduce:.2f} GB/s")
@@ -679,11 +699,11 @@ def benchmark_multi_node_bandwidth(
         for _ in range(5):
             collective()
         torch.cuda.synchronize(device)
-        start = time.time()
+        start = time.perf_counter()
         for _ in range(num_iters):
             collective()
         torch.cuda.synchronize(device)
-        return time.time() - start
+        return time.perf_counter() - start
 
     for size in sizes:
         tensor = torch.randn(size, device=device, dtype=torch.float32)

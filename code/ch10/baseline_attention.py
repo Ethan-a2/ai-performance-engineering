@@ -16,7 +16,6 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import torch.nn as nn
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
@@ -29,6 +28,7 @@ class BaselineAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         super().__init__()
         self.query: Optional[torch.Tensor] = None
         self.key: Optional[torch.Tensor] = None
+        self._key_t: Optional[torch.Tensor] = None
         self.value: Optional[torch.Tensor] = None
         # Larger sizes to show optimization benefits
         self.batch_size = 16
@@ -40,6 +40,7 @@ class BaselineAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.head_dim = self.hidden_dim // self.num_heads
         self.scale = 1.0 / (self.head_dim ** 0.5)
         self.output = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
 
     def setup(self) -> None:
         torch.manual_seed(42)
@@ -59,6 +60,9 @@ class BaselineAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             self.batch_size, self.num_heads, self.seq_len, self.head_dim,
             device=self.device, dtype=torch.float16
         )
+        self._key_t = self.key.transpose(-2, -1)
+        self._verify_output_buffer = torch.empty_like(self.query, dtype=torch.float32)
+        self.scale = 1.0 / (self.head_dim ** 0.5)
         
         self._synchronize()
         tokens = float(self.batch_size * self.seq_len)
@@ -82,11 +86,11 @@ class BaselineAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
         - Multiple kernel launches
         """
         with self._nvtx_range("baseline_attention_naive"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Naive: Explicit matrix multiplications
                 # Q @ K^T -> (batch, heads, seq, seq) attention matrix
-                attn_scores = torch.matmul(self.query, self.key.transpose(-2, -1))
-                attn_scores = attn_scores * self.scale
+                attn_scores = torch.matmul(self.query, self._key_t)
+                attn_scores.mul_(self.scale)
                 
                 # Softmax over last dimension (materializes full attention matrix).
                 # Keep the compute dtype aligned with the optimized SDPA path.
@@ -98,13 +102,16 @@ class BaselineAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={
                 "query": self.query,
                 "key": self.key,
                 "value": self.value,
             },
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.batch_size,
             parameter_count=0,
             precision_flags={
@@ -119,7 +126,10 @@ class BaselineAttentionBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.query = None
         self.key = None
+        self._key_t = None
         self.value = None
+        self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:

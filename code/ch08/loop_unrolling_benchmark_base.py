@@ -10,6 +10,7 @@ from typing import Optional
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
+from core.benchmark.utils import scalar_tensor_to_float
 from core.common.device_utils import require_cuda_device
 from core.harness.benchmark_harness import BaseBenchmark, BenchmarkConfig
 from core.utils.extension_loader_template import load_cuda_extension
@@ -49,6 +50,7 @@ class LoopUnrollingBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         self.weights: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._output_buffer: Optional[torch.Tensor] = None
+        self._inner_iteration_range = range(self.inner_iterations)
         # Loop unrolling benchmark: fixed dimensions for measurement
 
     def setup(self) -> None:
@@ -80,16 +82,11 @@ class LoopUnrollingBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.synchronize()
 
     def benchmark_fn(self) -> None:
-        from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range(self.nvtx_label, enable=enable_nvtx):
+        with torch.inference_mode(), self._nvtx_range(self.nvtx_label):
             if self._output_buffer is None:
                 raise RuntimeError("setup() must initialize the output buffer")
             self.output = self._output_buffer
-            for _ in range(self.inner_iterations):
+            for _ in self._inner_iteration_range:
                 self._invoke_kernel()
         if self.inputs is None or self.weights is None or self.output is None:
             raise RuntimeError("benchmark_fn() must run after setup() initializes tensors")
@@ -126,7 +123,7 @@ class LoopUnrollingBenchmarkBase(VerificationPayloadMixin, BaseBenchmark):
         tiled_weights = self.weights.repeat(repeats)[: self.elements_per_row]
         reference = (self.inputs * tiled_weights).sum(dim=1)
         torch.cuda.synchronize()
-        max_error = torch.max(torch.abs(reference - self.output)).item()
+        max_error = scalar_tensor_to_float(torch.max(torch.abs(reference - self.output)))
         if max_error > 5e-3:
             raise RuntimeError(
                 f"Loop unrolling kernel validation failed (max error={max_error:.4f})"

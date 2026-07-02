@@ -24,13 +24,13 @@ robust FP8 training/inference, but this script uses PyTorch native APIs.
 
 from core.harness.arch_config import prefer_flash_sdpa
 
+import json
 import os
+from dataclasses import dataclass, asdict
+from typing import Dict, Any
+
 import torch
 import torch.nn as nn
-import time
-import json
-from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any
 
 
 @dataclass
@@ -86,8 +86,7 @@ class SimpleTransformerBlock(nn.Module):
         
         batch, seq_len, _ = x.shape
         qkv = self.qkv(x).reshape(batch, seq_len, 3, self.n_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k, v = (tensor.transpose(1, 2) for tensor in qkv.unbind(dim=2))
         
         with prefer_flash_sdpa():
             attn = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -142,24 +141,29 @@ def benchmark_model(
     print(f"  Warmup: {warmup} iterations")
     
     # Warmup
-    for _ in range(warmup):
-        with torch.no_grad():
+    with torch.inference_mode():
+        for _ in range(warmup):
             _ = model(input_ids)
     torch.cuda.synchronize()
     
     # Benchmark
     print(f"  Running: {iters} iterations")
-    start = time.time()
-    for _ in range(iters):
-        with torch.no_grad():
+    count = max(iters, 1)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream(input_ids.device)
+    with torch.inference_mode():
+        start.record(current_stream)
+        for _ in range(count):
             _ = model(input_ids)
-    torch.cuda.synchronize()
-    elapsed = time.time() - start
+        end.record(current_stream)
+    end.synchronize()
+    elapsed_ms = start.elapsed_time(end)
     
     # Metrics
-    avg_time_ms = (elapsed / iters) * 1000
+    avg_time_ms = elapsed_ms / count
     tokens = input_ids.numel()
-    throughput = tokens / (elapsed / iters)
+    throughput = tokens / (avg_time_ms / 1000.0)
     memory_mb = get_model_memory_mb(model)
     params = sum(p.numel() for p in model.parameters())
     
@@ -281,7 +285,7 @@ def print_summary(results: Dict[str, BenchmarkResult]):
     if not baseline:
         baseline = results.get('fp16')
     
-    for precision, result in results.items():
+    for _precision, result in results.items():
         speedup = baseline.time_ms / result.time_ms if baseline else 1.0
         memory_ratio = result.memory_mb / baseline.memory_mb if baseline else 1.0
         

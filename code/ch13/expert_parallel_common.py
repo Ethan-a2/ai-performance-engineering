@@ -61,7 +61,11 @@ def gather_recv_splits(send_splits: List[int], world_size: int, rank: int) -> Li
     send_counts = torch.tensor(send_splits, dtype=torch.int64, device="cuda")
     gathered = [torch.empty_like(send_counts) for _ in range(world_size)]
     dist.all_gather(gathered, send_counts)
-    return [int(gathered[src][rank].item()) for src in range(world_size)]
+    recv_counts = torch.empty(world_size, dtype=send_counts.dtype, device=send_counts.device)
+    for src, counts in enumerate(gathered):
+        recv_counts[src].copy_(counts[rank])
+    recv_counts_host = recv_counts.detach().cpu()
+    return [int(recv_counts_host[src]) for src in range(recv_counts_host.numel())]
 
 
 def pack_tokens(
@@ -76,6 +80,16 @@ def pack_tokens(
         if count:
             send_buf[offset:offset + count].copy_(tokens[idx])
         offset += count
+
+
+def split_buffer_views(buffer: torch.Tensor, splits: List[int]) -> List[torch.Tensor]:
+    views: List[torch.Tensor] = []
+    offset = 0
+    for count in splits:
+        next_offset = offset + int(count)
+        views.append(buffer[offset:next_offset])
+        offset = next_offset
+    return views
 
 
 def run_expert_parallel(
@@ -105,14 +119,16 @@ def run_expert_parallel(
     recv_total = int(sum(recv_splits))
     expert_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False, dtype=config.dtype).to(device)
 
-    def _all_to_all_list() -> torch.Tensor:
-        send_list = [tokens[idx].contiguous() for idx in send_indices]
-        recv_list = [torch.empty((count, config.hidden_size), device=device, dtype=config.dtype) for count in recv_splits]
-        dist.all_to_all(recv_list, send_list)
-        return torch.cat(recv_list, dim=0)
-
     send_buf = torch.empty((tokens_per_rank, config.hidden_size), device=device, dtype=config.dtype)
     recv_buf = torch.empty((recv_total, config.hidden_size), device=device, dtype=config.dtype)
+    send_views = split_buffer_views(send_buf, send_splits)
+    recv_views = split_buffer_views(recv_buf, recv_splits)
+    if impl == "list":
+        pack_tokens(tokens=tokens, send_indices=send_indices, send_splits=send_splits, send_buf=send_buf)
+
+    def _all_to_all_list() -> torch.Tensor:
+        dist.all_to_all(recv_views, send_views)
+        return recv_buf
 
     def _all_to_all_single() -> torch.Tensor:
         pack_tokens(tokens=tokens, send_indices=send_indices, send_splits=send_splits, send_buf=send_buf)

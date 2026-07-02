@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import torch
@@ -13,8 +14,14 @@ from labs.flashattention4.optimized_best_available_attention_alibi import (
 from labs.flashattention4.flashattention4_common import (
     FlashAttention4Inputs,
     FlashAttention4Config,
+    _ALIBI_DISTANCE_CACHE,
+    _ALIBI_SLOPE_CACHE,
+    _DENSE_MASK_POSITION_CACHE,
+    _alibi_distance_for,
+    _dense_mask_positions_for,
     _experimental_windowed_skip_reason,
     best_available_candidate_providers,
+    build_alibi_slopes,
     build_flashattention4_mode_table_payload,
     build_reference_inputs,
     build_dense_attention_mask,
@@ -30,13 +37,28 @@ from labs.flashattention4.flashattention4_common import (
 
 
 def test_dense_attention_mask_for_windowed_mode_is_causal_and_bounded() -> None:
+    _DENSE_MASK_POSITION_CACHE.clear()
     mask = build_dense_attention_mask(
         "windowed",
         seq_len=8,
         window_size=3,
         device=torch.device("cpu"),
     )
+    first_q_idx, first_kv_idx = _dense_mask_positions_for(8, torch.device("cpu"))
+    second_mask = build_dense_attention_mask(
+        "windowed",
+        seq_len=8,
+        window_size=3,
+        device=torch.device("cpu"),
+    )
+    second_q_idx, second_kv_idx = _dense_mask_positions_for(8, torch.device("cpu"))
+
     assert mask is not None
+    assert second_mask is not None
+    assert second_mask.data_ptr() != mask.data_ptr()
+    assert second_q_idx.data_ptr() == first_q_idx.data_ptr()
+    assert second_kv_idx.data_ptr() == first_kv_idx.data_ptr()
+    torch.testing.assert_close(mask, second_mask)
     mask_2d = mask[0, 0]
     assert bool(mask_2d[3, 3])
     assert bool(mask_2d[3, 1])
@@ -45,6 +67,14 @@ def test_dense_attention_mask_for_windowed_mode_is_causal_and_bounded() -> None:
 
 
 def test_reference_attention_runs_for_softcap_mode_on_cpu() -> None:
+    source = inspect.getsource(reference_attention)
+    assert "scores.addcmul_(" in source
+    assert "scores.div_(inputs.softcap_scale).tanh_().mul_(inputs.softcap_scale)" in source
+    assert 'scores.masked_fill_(~inputs.dense_mask, float("-inf"))' in source
+    assert "scores = scores - inputs.alibi_slopes" not in source
+    assert "scores = inputs.softcap_scale * torch.tanh" not in source
+    assert "scores = scores.masked_fill(" not in source
+
     cfg = FlashAttention4Config(
         batch=1,
         heads=2,
@@ -57,6 +87,33 @@ def test_reference_attention_runs_for_softcap_mode_on_cpu() -> None:
     output = reference_attention(inputs)
     assert output.shape == (1, 2, 8, 4)
     assert output.dtype == torch.float32
+
+
+def test_reference_attention_reuses_alibi_distance_cache_on_cpu() -> None:
+    cfg = FlashAttention4Config(
+        batch=1,
+        heads=2,
+        seq_len=8,
+        head_dim=4,
+        mode="alibi",
+        dtype=torch.float32,
+    )
+    _ALIBI_DISTANCE_CACHE.clear()
+    _ALIBI_SLOPE_CACHE.clear()
+    inputs = build_reference_inputs(cfg, device=torch.device("cpu"), include_block_mask=False)
+
+    first = reference_attention(inputs)
+    first_distance = _alibi_distance_for(cfg.seq_len, inputs.q.device)
+    first_slopes = build_alibi_slopes(cfg.heads, device=inputs.q.device)
+    second = reference_attention(inputs)
+    second_distance = _alibi_distance_for(cfg.seq_len, inputs.q.device)
+    second_slopes = build_alibi_slopes(cfg.heads, device=inputs.q.device)
+
+    assert second_distance.data_ptr() == first_distance.data_ptr()
+    assert second_slopes.data_ptr() == first_slopes.data_ptr()
+    assert inputs.alibi_slopes is not None
+    assert first_slopes.data_ptr() == inputs.alibi_slopes.data_ptr()
+    torch.testing.assert_close(first, second)
 
 
 def test_attention_flop_count_matches_dense_and_causal_conventions() -> None:
@@ -91,6 +148,40 @@ def test_attention_flop_count_matches_dense_and_causal_conventions() -> None:
     )
     assert dense_flops == 4 * 2 * 4 * 16 * 64
     assert causal_flops == 4 * 2 * 4 * 16 * 36
+
+
+def test_nonmasked_attention_count_closed_form_matches_brute_force() -> None:
+    def brute_causal(q_seq_len: int, kv_seq_len: int) -> int:
+        return sum(min(kv_seq_len, q_idx + 1) for q_idx in range(q_seq_len))
+
+    def brute_windowed(q_seq_len: int, kv_seq_len: int, window_size: int) -> int:
+        total = 0
+        for q_idx in range(q_seq_len):
+            upper = min(kv_seq_len - 1, q_idx)
+            lower = max(0, q_idx - window_size + 1)
+            total += max(0, upper - lower + 1)
+        return total
+
+    for q_seq_len in (0, 1, 2, 8, 9, 16):
+        for kv_seq_len in (0, 1, 3, 8, 11, 16):
+            assert count_nonmasked_attention_elements(
+                "causal",
+                q_seq_len=q_seq_len,
+                kv_seq_len=kv_seq_len,
+            ) == brute_causal(q_seq_len, kv_seq_len)
+            for window_size in (1, 2, 3, 8, 32):
+                assert count_nonmasked_attention_elements(
+                    "windowed",
+                    q_seq_len=q_seq_len,
+                    kv_seq_len=kv_seq_len,
+                    window_size=window_size,
+                ) == brute_windowed(q_seq_len, kv_seq_len, window_size)
+                assert count_nonmasked_attention_elements(
+                    "alibi_windowed",
+                    q_seq_len=q_seq_len,
+                    kv_seq_len=kv_seq_len,
+                    window_size=window_size,
+                ) == brute_windowed(q_seq_len, kv_seq_len, window_size)
 
 
 def test_windowed_nonmasked_count_respects_window_size() -> None:

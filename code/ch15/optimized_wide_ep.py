@@ -9,7 +9,7 @@ Semantic contract:
   expert weights are shared across expert ids.
 
 Optimization behavior:
-- Uses a single GPU permutation (`argsort`) to pack tokens by destination rank.
+- Precomputes a single GPU permutation to pack tokens by destination rank.
 - Uses single-shot gather/scatter ops instead of a Python loop over ranks.
 """
 
@@ -57,13 +57,18 @@ class OptimizedWideEPBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
         self.expert: Optional[nn.Module] = None
         self.inputs: Optional[torch.Tensor] = None
+        self._flat_inputs: Optional[torch.Tensor] = None
         self.expert_ids: Optional[torch.Tensor] = None
+        self._dest_ranks: Optional[torch.Tensor] = None
+        self._perm: Optional[torch.Tensor] = None
         self._recv_buf: Optional[torch.Tensor] = None
-        self._recv_back: Optional[torch.Tensor] = None
         self._out_flat: Optional[torch.Tensor] = None
+        self._output_view: Optional[torch.Tensor] = None
         self.output: Optional[torch.Tensor] = None
         self._verify_probe: Optional[torch.Tensor] = None
         self._verify_meta: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
 
     def setup(self) -> None:
         if not torch.cuda.is_available():
@@ -80,68 +85,82 @@ class OptimizedWideEPBenchmark(VerificationPayloadMixin, BaseBenchmark):
         torch.cuda.manual_seed_all(42)
 
         self.expert = ExpertMLP(self.hidden_size, self.ffn_size, device=self.device, dtype=self.dtype).eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.expert.parameters())
         self.inputs = torch.randn(self.batch, self.seq, self.hidden_size, device=self.device, dtype=self.dtype)
+        self._flat_inputs = self.inputs.view(-1, self.hidden_size)
 
         token_ids = torch.arange(self.batch * self.seq, device=self.device, dtype=torch.int64)
         self.expert_ids = _pseudo_uniform_expert_ids(token_ids, self.num_experts).view(self.batch, self.seq)
-        flat = self.inputs.view(-1, self.hidden_size)
+        expert_ids_flat = self.expert_ids.reshape(-1)
+        self._dest_ranks = torch.div(expert_ids_flat, self.experts_per_rank, rounding_mode="floor")
+        self._perm = torch.argsort(self._dest_ranks)
+        flat = self._flat_inputs
         self._recv_buf = torch.empty_like(flat)
-        self._recv_back = torch.empty_like(flat)
         self._out_flat = torch.empty_like(flat)
+        self._output_view = self._out_flat.view(self.batch, self.seq, self.hidden_size)
 
-        self._verify_probe = self.inputs[:1, :1, :256].detach().cpu()
+        probe_cols = min(256, self.hidden_size)
+        self._verify_probe = torch.empty((1, 1, probe_cols), dtype=self.inputs.dtype, pin_memory=True)
+        self._verify_probe.copy_(
+            self.inputs[:1, :1, :probe_cols],
+            non_blocking=False,
+        )
         self._verify_meta = torch.tensor(
             [int(self.world_size), int(self.experts_per_rank), int(self.num_experts)],
             dtype=torch.int64,
         )
+        self._verify_output_buffer = torch.empty((2, 2, 256), dtype=torch.float32)
 
         for _ in range(3):
-            with torch.no_grad():
-                _ = self.expert(self.inputs.view(-1, self.hidden_size))
+            with torch.inference_mode():
+                _ = self.expert(self._flat_inputs)
 
     def benchmark_fn(self) -> None:
         if (
             self.expert is None
             or self.inputs is None
-            or self.expert_ids is None
+            or self._flat_inputs is None
+            or self._perm is None
             or self._recv_buf is None
-            or self._recv_back is None
             or self._out_flat is None
+            or self._output_view is None
         ):
             raise RuntimeError("setup() must run before benchmark_fn()")
 
-        flat = self.inputs.view(-1, self.hidden_size)
-        expert_ids_flat = self.expert_ids.reshape(-1)
-        dest_ranks = torch.div(expert_ids_flat, self.experts_per_rank, rounding_mode="floor")
+        flat = self._flat_inputs
 
         with self._nvtx_range("optimized_wide_ep"):
-            with torch.no_grad():
-                perm = torch.argsort(dest_ranks)
-                send_buf = flat.index_select(0, perm)
-
+            with torch.inference_mode():
+                perm = self._perm
                 recv_buf = self._recv_buf
-                recv_buf.copy_(send_buf)
+                torch.index_select(flat, 0, perm, out=recv_buf)
 
                 recv_out = self.expert(recv_buf)
 
-                recv_back = self._recv_back
-                recv_back.copy_(recv_out)
-
                 out_flat = self._out_flat
-                out_flat.index_copy_(0, perm, recv_back)
-                self.output = out_flat.view(self.batch, self.seq, self.hidden_size)
+                out_flat.index_copy_(0, perm, recv_out)
+                self.output = self._output_view
 
 
     def capture_verification_payload(self) -> None:
-        if self.output is None or self._verify_probe is None or self._verify_meta is None:
+        if (
+            self.output is None
+            or self._verify_probe is None
+            or self._verify_meta is None
+            or self._verify_output_buffer is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
-        output_slice = self.output[:2, :2, :256].detach().cpu().float().clone()
-        param_count = sum(p.numel() for p in self.expert.parameters()) if self.expert is not None else 0
+        output_slice = self.output[
+            : self._verify_output_buffer.shape[0],
+            : self._verify_output_buffer.shape[1],
+            : self._verify_output_buffer.shape[2],
+        ].detach()
+        self._verify_output_buffer.copy_(output_slice, non_blocking=False)
         self._set_verification_payload(
             inputs={"probe": self._verify_probe, "routing": self._verify_meta},
-            output=output_slice,
+            output=self._verify_output_buffer,
             batch_size=int(self.batch),
-            parameter_count=int(param_count),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": True,
@@ -158,11 +177,17 @@ class OptimizedWideEPBenchmark(VerificationPayloadMixin, BaseBenchmark):
     def teardown(self) -> None:
         self.expert = None
         self.inputs = None
+        self._flat_inputs = None
         self.expert_ids = None
+        self._dest_ranks = None
+        self._perm = None
         self._recv_buf = None
-        self._recv_back = None
         self._out_flat = None
+        self._output_view = None
         self.output = None
+        self._verify_probe = None
+        self._verify_meta = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
@@ -179,5 +204,3 @@ class OptimizedWideEPBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
 def get_benchmark() -> BaseBenchmark:
     return OptimizedWideEPBenchmark()
-
-

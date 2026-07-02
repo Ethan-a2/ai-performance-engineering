@@ -1,13 +1,5 @@
-import os
-import torch.profiler as profiler
-from torch.profiler import profile, record_function, ProfilerActivity, schedule
-import torch.cuda.nvtx as nvtx
 import torch
-from core.utils.architecture_runtime import (
-    get_arch_config,
-    get_architecture,
-    get_architecture_info,
-)
+from core.utils.architecture_runtime import get_arch_config
 
 _ARCH_CFG = get_arch_config()
 
@@ -18,10 +10,11 @@ Implementation of dynamic routing algorithms that decide whether to offload
 prefill computation to dedicated prefill workers or handle it locally on
 decode workers."""
 
+import heapq
 import time
 import random
-import threading
-from typing import Dict, List, Optional, Tuple
+from itertools import chain
+from typing import Dict, List, Optional, Sequence, Tuple
 from dataclasses import dataclass
 from enum import Enum
 import json
@@ -35,7 +28,7 @@ class Priority(Enum):
 @dataclass
 class Request:
     id: str
-    prompt_tokens: List[int]
+    prompt_tokens: Sequence[int]
     priority: Priority
     timestamp: float
     prefix_cached_length: int = 0
@@ -320,7 +313,7 @@ def simulate_request_stream():
         
         request = Request(
             id=f"req-{i:03d}-{desc}",
-            prompt_tokens=list(range(prompt_len)),  # dummy tokens
+            prompt_tokens=range(prompt_len),  # dummy tokens; routing only needs length
             priority=priority,
             timestamp=time.time() + i * 0.1,  # stagger requests
             prefix_cached_length=max(0, cached),
@@ -361,6 +354,7 @@ def main():
     
     # Generate request stream
     requests = simulate_request_stream()
+    worker_update_ids = tuple(router.prefill_workers) + tuple(router.decode_workers)
     
     print(f"\n=== Processing {len(requests)} Requests ===")
     
@@ -392,9 +386,8 @@ def main():
         time.sleep(0.05)
         
         # Occasionally update worker metrics to simulate changing load
-        if random.random() < 0.3:
-            worker_to_update = random.choice(list(router.prefill_workers.keys()) + 
-                                           list(router.decode_workers.keys()))
+        if worker_update_ids and random.random() < 0.3:
+            worker_to_update = random.choice(worker_update_ids)
             if worker_to_update.startswith("prefill"):
                 current = router.prefill_workers[worker_to_update]
                 current.queue_length = max(0, current.queue_length + random.randint(-1, 2))
@@ -423,13 +416,19 @@ def main():
     print(f"\n=== Latency Cost Analysis ===")
     print("Worker latency costs (lower is better):")
     
-    all_workers = [(f"prefill-{k}", v) for k, v in router.prefill_workers.items()] + \
-                  [(f"decode-{k}", v) for k, v in router.decode_workers.items()]
+    worker_costs = chain(
+        (
+            (f"prefill-{worker_id}", metrics, router.calculate_latency_cost(metrics))
+            for worker_id, metrics in router.prefill_workers.items()
+        ),
+        (
+            (f"decode-{worker_id}", metrics, router.calculate_latency_cost(metrics))
+            for worker_id, metrics in router.decode_workers.items()
+        ),
+    )
+    top_workers = heapq.nsmallest(5, worker_costs, key=lambda row: row[2])
     
-    all_workers.sort(key=lambda x: router.calculate_latency_cost(x[1]))
-    
-    for worker_id, metrics in all_workers[:5]:  # Show top 5
-        cost = router.calculate_latency_cost(metrics)
+    for worker_id, metrics, cost in top_workers:
         print(f"  {worker_id}: cost={cost:.3f} "
               f"(mem={metrics.memory_usage:.1f}%, active={metrics.active_requests})")
     

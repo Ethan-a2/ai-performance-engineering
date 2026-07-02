@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 
-import torch
-import os
-from core.utils.architecture_runtime import (
-    get_arch_config,
-    get_architecture,
-    get_architecture_info,
-)
+from core.utils.architecture_runtime import get_arch_config
 
 _ARCH_CFG = get_arch_config()
 """
@@ -22,19 +16,64 @@ This example demonstrates:
 
 import torch
 import torch.nn as nn
-import torch.profiler as profiler
 import time
 import numpy as np
+import heapq
 from typing import Dict, List, Tuple, Optional, Any
-import json
-import threading
 import queue
-from dataclasses import dataclass, field
-from enum import Enum
 import psutil
 import GPUtil
 from collections import defaultdict, deque
 import hashlib
+
+
+def _count_whitespace_separated_tokens(text: str) -> int:
+    """Count split-like tokens without allocating substring lists."""
+    count = 0
+    in_token = False
+    for char in text:
+        if char.isspace():
+            in_token = False
+        elif not in_token:
+            count += 1
+            in_token = True
+    return count
+
+
+def _recent_metric_summary(values: List[Tuple[float, float]], limit: int = 100) -> Dict[str, float]:
+    count = min(len(values), limit)
+    if count <= 0:
+        return {"current": 0.0, "average": 0.0, "min": 0.0, "max": 0.0}
+
+    start = len(values) - count
+    total = 0.0
+    min_value = float("inf")
+    max_value = float("-inf")
+    current = 0.0
+    for idx in range(start, len(values)):
+        current = float(values[idx][1])
+        total += current
+        min_value = min(min_value, current)
+        max_value = max(max_value, current)
+    return {
+        "current": current,
+        "average": total / count,
+        "min": min_value,
+        "max": max_value,
+    }
+
+
+def _mean_recent_dict_value(records: List[Dict[str, Any]], key: str, limit: int = 100) -> float:
+    count = min(len(records), limit)
+    if count <= 0:
+        return 0.0
+
+    start = len(records) - count
+    total = 0.0
+    for idx in range(start, len(records)):
+        total += float(records[idx][key])
+    return total / count
+
 
 class MonitoringSystem:
     """Comprehensive monitoring and metrics collection for inference systems."""
@@ -111,13 +150,7 @@ class MonitoringSystem:
         # Calculate metric summaries
         for metric_name, values in self.metrics.items():
             if values:
-                recent_values = [v for _, v in values[-100:]]  # Last 100 values
-                report['metric_summaries'][metric_name] = {
-                    'current': recent_values[-1] if recent_values else 0,
-                    'average': np.mean(recent_values),
-                    'min': np.min(recent_values),
-                    'max': np.max(recent_values)
-                }
+                report['metric_summaries'][metric_name] = _recent_metric_summary(values)
                 
         return report
 
@@ -137,7 +170,7 @@ class DynamicBatcher:
             'prompt': prompt,
             'priority': priority,
             'timestamp': time.time(),
-            'tokens': len(prompt.split())  # Simplified token count
+            'tokens': _count_whitespace_separated_tokens(prompt)
         }
         self.request_queue.append(request)
         return True
@@ -148,33 +181,45 @@ class DynamicBatcher:
             return []
             
         current_time = time.time()
-        batch = []
-        
-        # Sort by priority and timestamp
-        sorted_requests = sorted(
-            self.request_queue, 
-            key=lambda x: (-x['priority'], x['timestamp'])
+        def request_sort_key(request: Dict[str, Any]) -> Tuple[int, float]:
+            return (-int(request['priority']), float(request['timestamp']))
+
+        top_batch_requests = heapq.nsmallest(
+            self.max_batch_size,
+            self.request_queue,
+            key=request_sort_key,
         )
-        
-        for request in sorted_requests:
-            # Check if we should include this request
+        selected_request_ids = {id(request) for request in top_batch_requests}
+
+        for request in self.request_queue:
             age_ms = (current_time - request['timestamp']) * 1000
-            
-            if len(batch) < self.max_batch_size and age_ms <= self.max_delay_ms:
-                batch.append(request)
-            elif age_ms > self.max_delay_ms:
-                # Force include old requests
-                batch.append(request)
+            if age_ms > self.max_delay_ms:
+                # Force include old requests even when the fresh batch is full.
+                selected_request_ids.add(id(request))
+
+        batch = [
+            request
+            for request in self.request_queue
+            if id(request) in selected_request_ids
+        ]
+        batch.sort(key=request_sort_key)
                 
-        # Remove processed requests from queue
-        for request in batch:
-            self.request_queue.remove(request)
+        # Remove processed requests from queue in one pass.
+        if selected_request_ids:
+            self.request_queue = deque(
+                request
+                for request in self.request_queue
+                if id(request) not in selected_request_ids
+            )
             
         if batch:
+            token_total = 0
+            for request in batch:
+                token_total += request['tokens']
             self.batch_history.append({
                 'timestamp': current_time,
                 'batch_size': len(batch),
-                'avg_tokens': np.mean([r['tokens'] for r in batch])
+                'avg_tokens': token_total / len(batch)
             })
             
         return batch
@@ -188,10 +233,9 @@ class DynamicBatcher:
                 'queue_length': len(self.request_queue)
             }
             
-        recent_batches = self.batch_history[-100:]  # Last 100 batches
         return {
-            'avg_batch_size': np.mean([b['batch_size'] for b in recent_batches]),
-            'avg_tokens_per_batch': np.mean([b['avg_tokens'] for b in recent_batches]),
+            'avg_batch_size': _mean_recent_dict_value(self.batch_history, 'batch_size'),
+            'avg_tokens_per_batch': _mean_recent_dict_value(self.batch_history, 'avg_tokens'),
             'queue_length': len(self.request_queue)
         }
 
@@ -217,11 +261,11 @@ class QuantizationManager:
         for name, module in quantized_model.named_modules():
             if isinstance(module, nn.Linear):
                 # Simulate weight quantization
-                with torch.no_grad():
+                with torch.inference_mode():
                     # Quantize weights to 4-bit
                     weights = module.weight.data
                     quantized_weights = self._quantize_weights(weights, bits=4)
-                    module.weight.data = quantized_weights
+                    module.weight.copy_(quantized_weights)
                     
         print(f"GPTQ quantization completed. Model size reduced by ~4x")
         return quantized_model
@@ -236,12 +280,12 @@ class QuantizationManager:
         # Apply channel-specific scaling
         for name, module in quantized_model.named_modules():
             if isinstance(module, nn.Linear):
-                with torch.no_grad():
+                with torch.inference_mode():
                     weights = module.weight.data
                     # Apply channel-specific scaling for salient channels
                     scaled_weights = self._apply_channel_scaling(weights)
                     quantized_weights = self._quantize_weights(scaled_weights, bits=4)
-                    module.weight.data = quantized_weights
+                    module.weight.copy_(quantized_weights)
                     
         print(f"AWQ quantization completed. Model size reduced by ~4x")
         return quantized_model
@@ -256,12 +300,12 @@ class QuantizationManager:
         # Apply row/column scaling to shift quantization error
         for name, module in quantized_model.named_modules():
             if isinstance(module, nn.Linear):
-                with torch.no_grad():
+                with torch.inference_mode():
                     weights = module.weight.data
                     # Apply SmoothQuant scaling
                     scaled_weights = self._apply_smoothquant_scaling(weights)
                     quantized_weights = self._quantize_weights(scaled_weights, bits=8)
-                    module.weight.data = quantized_weights
+                    module.weight.copy_(quantized_weights)
                     
         print(f"SmoothQuant quantization completed. Model size reduced by ~2x")
         return quantized_model
@@ -310,19 +354,28 @@ class PrefixCache:
     def get_cache_key(self, prompt: str) -> str:
         """Generate cache key for prompt."""
         return hashlib.md5(prompt.encode()).hexdigest()
-        
+
     def find_longest_prefix(self, prompt: str) -> Tuple[str, int]:
         """Find the longest cached prefix for a prompt."""
         words = prompt.split()
-        
-        for length in range(len(words), 0, -1):
-            prefix = ' '.join(words[:length])
-            cache_key = self.get_cache_key(prefix)
-            
+        digest = hashlib.md5()
+        longest_cache_key: Optional[str] = None
+        longest_prefix_length = 0
+
+        for idx, word in enumerate(words, start=1):
+            if idx > 1:
+                digest.update(b" ")
+            digest.update(word.encode())
+            cache_key = digest.hexdigest()
             if cache_key in self.cache:
-                self.hit_count += 1
-                self.access_times[cache_key] = time.time()
-                return prefix, length
+                longest_cache_key = cache_key
+                longest_prefix_length = idx
+
+        if longest_cache_key is not None:
+            self.hit_count += 1
+            self.access_times[longest_cache_key] = time.time()
+            prefix = ' '.join(words[:longest_prefix_length])
+            return prefix, longest_prefix_length
                 
         self.miss_count += 1
         return "", 0
@@ -373,15 +426,20 @@ class ModelCascader:
         
     def classify_request(self, prompt: str) -> str:
         """Classify request complexity to determine model tier."""
+        prompt_length = _count_whitespace_separated_tokens(prompt)
+        return self._classify_request_with_length(prompt, prompt_length)
+
+    def _classify_request_with_length(self, prompt: str, prompt_length: int) -> str:
+        """Classify request complexity using precomputed prompt length."""
         # Simple heuristics for request classification
-        words = prompt.split()
+        prompt_lower = prompt.lower()
         
         # Short factual questions -> small model
-        if len(words) < 20 and any(word in prompt.lower() for word in ['what', 'who', 'when', 'where']):
+        if prompt_length < 20 and any(word in prompt_lower for word in ['what', 'who', 'when', 'where']):
             return 'small'
             
         # Long creative requests -> large model
-        if len(words) > 100 or any(word in prompt.lower() for word in ['explain', 'analyze', 'elaborate', 'creative']):
+        if prompt_length > 100 or any(word in prompt_lower for word in ['explain', 'analyze', 'elaborate', 'creative']):
             return 'large'
             
         # Medium complexity -> medium model
@@ -389,7 +447,8 @@ class ModelCascader:
         
     def route_request(self, prompt: str, user_tier: str = 'standard') -> str:
         """Route request to appropriate model tier."""
-        complexity = self.classify_request(prompt)
+        prompt_length = _count_whitespace_separated_tokens(prompt)
+        complexity = self._classify_request_with_length(prompt, prompt_length)
         
         # Premium users get upgraded model
         if user_tier == 'premium' and complexity == 'small':
@@ -400,7 +459,7 @@ class ModelCascader:
         # Record routing decision
         self.routing_history.append({
             'timestamp': time.time(),
-            'prompt_length': len(prompt.split()),
+            'prompt_length': prompt_length,
             'complexity': complexity,
             'user_tier': user_tier
         })
@@ -412,16 +471,19 @@ class ModelCascader:
         if not self.routing_history:
             return {}
             
-        recent_routes = self.routing_history[-100:]  # Last 100 routes
-        
+        route_count = min(len(self.routing_history), 100)
+        route_start = len(self.routing_history) - route_count
         complexity_counts = defaultdict(int)
-        for route in recent_routes:
+        prompt_length_total = 0.0
+        for idx in range(route_start, len(self.routing_history)):
+            route = self.routing_history[idx]
             complexity_counts[route['complexity']] += 1
+            prompt_length_total += route['prompt_length']
             
         return {
-            'total_routes': len(recent_routes),
+            'total_routes': route_count,
             'complexity_distribution': dict(complexity_counts),
-            'avg_prompt_length': np.mean([r['prompt_length'] for r in recent_routes])
+            'avg_prompt_length': prompt_length_total / route_count
         }
 
 class StreamingResponse:
@@ -484,7 +546,7 @@ class InferenceOptimizer:
         
     def process_request(self, request_id: str, prompt: str, user_tier: str = 'standard') -> Dict:
         """Process a single inference request with optimizations."""
-        start_time = time.time()
+        start_time = time.perf_counter()
         
         # 1. Check prefix cache
         prefix, prefix_length = self.prefix_cache.find_longest_prefix(prompt)
@@ -506,7 +568,7 @@ class InferenceOptimizer:
         response_tokens = self.streamer.generate_streaming_response(prompt)
         
         # 7. Record metrics
-        total_time = time.time() - start_time
+        total_time = time.perf_counter() - start_time
         self.monitor.record_metric('request_latency_ms', total_time * 1000)
         self.monitor.record_metric('cache_hit_rate', 1.0 if cache_hit else 0.0)
         self.monitor.record_metric('model_tier_usage', len(model_tier))

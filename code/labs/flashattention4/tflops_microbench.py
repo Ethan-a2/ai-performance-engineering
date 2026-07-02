@@ -3,23 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import json
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
-import json
 from pathlib import Path
-import statistics
 from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from core.benchmark.utils import calculate_tflops
+from core.benchmark.utils import calculate_tflops, scalar_tensor_to_float
 from core.harness.benchmark_harness import lock_gpu_clocks
 from labs.flashattention4.flashattention4_common import (
     FlashAttention4Config,
-    build_reference_inputs,
     build_flashattention4_mode_table_payload,
+    build_reference_inputs,
     compile_flashattention4_provider,
     eager_flex_attention,
     estimate_attention_forward_flops,
@@ -77,6 +76,44 @@ class MicrobenchResult:
     speedup_vs_triton_flex: Optional[float]
     speedup_vs_cudnn_sdpa: Optional[float]
     verification_max_diff: Optional[float]
+
+
+def _timing_stats_from_samples(times_ms: list[float]) -> TimingStats:
+    if not times_ms:
+        raise ValueError("times_ms must contain at least one sample")
+
+    count = len(times_ms)
+    total = 0.0
+    total_sq = 0.0
+    min_ms = float("inf")
+    max_ms = float("-inf")
+    for value in times_ms:
+        total += value
+        total_sq += value * value
+        min_ms = min(min_ms, value)
+        max_ms = max(max_ms, value)
+
+    times_ms.sort()
+    midpoint = count // 2
+    if count % 2:
+        median_ms = times_ms[midpoint]
+    else:
+        median_ms = (times_ms[midpoint - 1] + times_ms[midpoint]) / 2.0
+
+    mean_ms = total / count
+    if count > 1:
+        variance = (total_sq - (total * total / count)) / (count - 1)
+        std_ms = variance**0.5 if variance > 0.0 else 0.0
+    else:
+        std_ms = 0.0
+
+    return TimingStats(
+        mean_ms=mean_ms,
+        median_ms=median_ms,
+        min_ms=min_ms,
+        max_ms=max_ms,
+        std_ms=std_ms,
+    )
 
 
 BACKENDS = {
@@ -230,7 +267,7 @@ def _verify_backend(args: argparse.Namespace, mode: str, backend: BenchBackend) 
     candidate_out = candidate().float()
     if not torch.isfinite(candidate_out).all():
         raise RuntimeError("non-finite output")
-    max_diff = float((candidate_out - reference_out).abs().max().item())
+    max_diff = scalar_tensor_to_float((candidate_out - reference_out).abs().max())
     if not torch.allclose(candidate_out, reference_out, atol=0.5, rtol=0.05):
         raise RuntimeError(f"max_diff={max_diff:.6f}")
     return max_diff
@@ -242,22 +279,17 @@ def _benchmark_cuda_callable(fn: Callable[[], torch.Tensor], *, warmup: int, ite
     torch.cuda.synchronize()
 
     times_ms: list[float] = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    current_stream = torch.cuda.current_stream()
     for _ in range(iterations):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
+        start.record(current_stream)
         _ = fn()
-        end.record()
-        torch.cuda.synchronize()
+        end.record(current_stream)
+        end.synchronize()
         times_ms.append(float(start.elapsed_time(end)))
 
-    return TimingStats(
-        mean_ms=statistics.mean(times_ms),
-        median_ms=statistics.median(times_ms),
-        min_ms=min(times_ms),
-        max_ms=max(times_ms),
-        std_ms=statistics.stdev(times_ms) if len(times_ms) > 1 else 0.0,
-    )
+    return _timing_stats_from_samples(times_ms)
 
 
 def _build_benchmark_callable(args: argparse.Namespace, mode: str, backend: BenchBackend) -> Callable[[], torch.Tensor]:

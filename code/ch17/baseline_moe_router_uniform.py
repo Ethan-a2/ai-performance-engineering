@@ -62,6 +62,7 @@ class BaselineMoERouterUniformBenchmark(VerificationPayloadMixin, BaseBenchmark)
 
         self.expert: Optional[nn.Module] = None
         self.inputs: Optional[torch.Tensor] = None
+        self._flat_inputs: Optional[torch.Tensor] = None
         self.expert_ids: Optional[torch.Tensor] = None
         self.local_island: Optional[torch.Tensor] = None
         self._remote_idx: Optional[torch.Tensor] = None
@@ -70,6 +71,8 @@ class BaselineMoERouterUniformBenchmark(VerificationPayloadMixin, BaseBenchmark)
         self.output: Optional[torch.Tensor] = None
         self._verify_probe: Optional[torch.Tensor] = None
         self._verify_meta: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
+        self._payload_parameter_count = 0
 
     def setup(self) -> None:
         if not torch.cuda.is_available():
@@ -86,7 +89,9 @@ class BaselineMoERouterUniformBenchmark(VerificationPayloadMixin, BaseBenchmark)
         torch.cuda.manual_seed_all(42)
 
         self.expert = ExpertMLP(self.hidden_size, self.ffn_size, device=self.device, dtype=self.dtype).eval()
+        self._payload_parameter_count = sum(p.numel() for p in self.expert.parameters())
         self.inputs = torch.randn(self.batch, self.seq, self.hidden_size, device=self.device, dtype=self.dtype)
+        self._flat_inputs = self.inputs.view(-1, self.hidden_size)
 
         token_ids = torch.arange(self.batch * self.seq, device=self.device, dtype=torch.int64)
         self.local_island = (token_ids % int(self.num_islands)).to(torch.int64).view(self.batch, self.seq)
@@ -100,34 +105,45 @@ class BaselineMoERouterUniformBenchmark(VerificationPayloadMixin, BaseBenchmark)
         if self._remote_idx.numel() > 0:
             remote_tokens = int(self._remote_idx.numel())
             payload_dim = int(self.hidden_size) * int(self.remote_round_trips)
-            self._remote_buf_a = torch.zeros((remote_tokens, payload_dim), device=self.device, dtype=self.dtype)
-            self._remote_buf_b = torch.zeros((remote_tokens, payload_dim), device=self.device, dtype=self.dtype)
+            self._remote_buf_a = torch.empty((remote_tokens, payload_dim), device=self.device, dtype=self.dtype)
+            self._remote_buf_b = torch.empty((remote_tokens, payload_dim), device=self.device, dtype=self.dtype)
 
-        self._verify_probe = self.inputs[:1, :1, :256].detach().cpu()
+        probe_cols = min(256, self.hidden_size)
+        self._verify_probe = torch.empty((1, 1, probe_cols), dtype=self.inputs.dtype, pin_memory=True)
+        self._verify_probe.copy_(
+            self.inputs[:1, :1, :probe_cols],
+            non_blocking=False,
+        )
         self._verify_meta = torch.tensor(
             [int(self.num_islands), int(self.experts_per_island), int(self.num_experts)],
             dtype=torch.int64,
         )
+        self._verify_output_buffer = torch.empty(
+            (min(2, self.batch), min(2, self.seq), min(256, self.hidden_size)),
+            dtype=torch.float32,
+            device="cpu",
+        )
 
         for _ in range(3):
-            with torch.no_grad():
-                _ = self.expert(self.inputs.view(-1, self.hidden_size))
+            with torch.inference_mode():
+                _ = self.expert(self._flat_inputs)
         self._synchronize()
 
     def benchmark_fn(self) -> None:
         if (
             self.expert is None
             or self.inputs is None
+            or self._flat_inputs is None
             or self.expert_ids is None
             or self.local_island is None
             or self._remote_idx is None
         ):
             raise RuntimeError("setup() must run before benchmark_fn()")
 
-        flat = self.inputs.view(-1, self.hidden_size)
+        flat = self._flat_inputs
 
         with self._nvtx_range("baseline_moe_router_uniform"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 if self._remote_idx.numel() > 0:
                     if self._remote_buf_a is None or self._remote_buf_b is None:
                         raise RuntimeError("Remote buffers not initialized")
@@ -140,15 +156,21 @@ class BaselineMoERouterUniformBenchmark(VerificationPayloadMixin, BaseBenchmark)
 
 
     def capture_verification_payload(self) -> None:
-        if self.output is None or self._verify_probe is None or self._verify_meta is None:
+        if (
+            self.output is None
+            or self._verify_probe is None
+            or self._verify_meta is None
+            or self._verify_output_buffer is None
+        ):
             raise RuntimeError("setup() and benchmark_fn() must run before capture_verification_payload()")
-        output_slice = self.output[:2, :2, :256].detach().cpu().float().clone()
-        param_count = sum(p.numel() for p in self.expert.parameters()) if self.expert is not None else 0
+        verify_output = self._verify_output_buffer
+        output_slice = self.output[: verify_output.shape[0], : verify_output.shape[1], : verify_output.shape[2]]
+        verify_output.copy_(output_slice)
         self._set_verification_payload(
             inputs={"probe": self._verify_probe, "topology": self._verify_meta},
-            output=output_slice,
+            output=verify_output,
             batch_size=int(self.batch),
-            parameter_count=int(param_count),
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": True,
@@ -161,12 +183,16 @@ class BaselineMoERouterUniformBenchmark(VerificationPayloadMixin, BaseBenchmark)
     def teardown(self) -> None:
         self.expert = None
         self.inputs = None
+        self._flat_inputs = None
         self.expert_ids = None
         self.local_island = None
         self._remote_idx = None
         self._remote_buf_a = None
         self._remote_buf_b = None
         self.output = None
+        self._verify_probe = None
+        self._verify_meta = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
@@ -183,5 +209,3 @@ class BaselineMoERouterUniformBenchmark(VerificationPayloadMixin, BaseBenchmark)
 
 def get_benchmark() -> BaseBenchmark:
     return BaselineMoERouterUniformBenchmark()
-
-

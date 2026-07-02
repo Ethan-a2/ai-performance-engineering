@@ -168,12 +168,29 @@ def get_optimal_compile_mode(preferred_mode: str = "max-autotune", sm_threshold:
         The compile mode to use: "max-autotune" if GPU has enough SMs,
         otherwise "reduce-overhead"
     """
+    # Testing / A-B facility: force a specific compile mode regardless of the
+    # caller's preference (used by the GB300 sm_103a-unlock re-sweep to measure
+    # incumbent arms, e.g. AISP_COMPILE_MODE_OVERRIDE=reduce-overhead). Not set
+    # in normal operation.
+    override = os.environ.get("AISP_COMPILE_MODE_OVERRIDE", "").strip()
+    if override:
+        return override
+
     if preferred_mode != "max-autotune":
         return preferred_mode
-    
+
     if not torch.cuda.is_available():
         return "reduce-overhead"
-    
+
+    # HISTORICAL (root-caused 2026-06-11, guard retired same day): the "sm_103
+    # tcgen05.wait.st LLVM abort" under max-autotune was NOT a Triton >= 3.6 bug.
+    # It was self-inflicted by core/benchmark/triton_compat.py, which de-suffixed
+    # sm_103a -> sm_103; the arch-conditional tcgen05 intrinsics are only
+    # selectable for the 'a' targets, so LLVM hard-aborted (uncatchable SIGABRT).
+    # triton_compat.py now preserves the 'a' suffix for all arches and the
+    # max-autotune paths were re-verified clean on GB300 / Triton 3.7 (see
+    # code/upstream/triton-tcgen05-wait-st/STATUS.md), so the sm_103 downgrade
+    # to "default" is gone.
     try:
         device_index = torch.cuda.current_device()
         num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count

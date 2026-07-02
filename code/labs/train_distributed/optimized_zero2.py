@@ -92,13 +92,16 @@ def main():
     total_tokens = 0
     start = perf_counter()
     grad_clip = 1.0
+    loss_value_buffer = torch.empty(1, dtype=torch.float64, device=device)
+    x = torch.empty(args.batch_size, args.hidden_size, device=device)
+    y = torch.empty_like(x)
 
     # Warmup
-    warm_x = torch.randn(args.batch_size, args.hidden_size, device=device)
-    warm_y = torch.randn_like(warm_x)
+    x.normal_()
+    y.normal_()
     optimizer.zero_grad(set_to_none=True)
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-        warm_loss = nn.functional.mse_loss(ddp_model(warm_x), warm_y)
+        warm_loss = nn.functional.mse_loss(ddp_model(x), y)
     warm_loss.backward()
     optimizer.step()
 
@@ -109,8 +112,8 @@ def main():
     for step in range(args.steps):
         optimizer.zero_grad(set_to_none=True)
         for micro in range(args.grad_accum):
-            x = torch.randn(args.batch_size, args.hidden_size, device=device)
-            y = torch.randn_like(x)
+            x.normal_()
+            y.normal_()
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 loss = nn.functional.mse_loss(ddp_model(x), y) / args.grad_accum
             loss.backward()
@@ -122,9 +125,11 @@ def main():
         if rank == 0 and step % 10 == 0:
             elapsed = perf_counter() - start
             toks_per_sec = total_tokens / elapsed if elapsed > 0 else 0.0
+            loss_value_buffer[0].copy_(loss.detach())
+            loss_value = float(loss_value_buffer.detach().cpu()[0])
             print(
                 f"[optimized-zero2] step {step}/{args.steps} "
-                f"loss={loss.item():.4f} "
+                f"loss={loss_value:.4f} "
                 f"tokens/s per rank={toks_per_sec:,.0f}"
             )
 

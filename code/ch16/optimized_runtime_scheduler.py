@@ -27,6 +27,9 @@ class OptimizedRuntimeSchedulerBenchmark(VerificationPayloadMixin, BaseBenchmark
         self.workload: Optional[RuntimeSchedulerWorkload] = None
         self.scenarios: Tuple[SchedulerScenario, ...] = ()
         self._custom_metrics: Dict[str, float] = {}
+        self._enable_nvtx = False
+        self._verification_dummy: Optional[torch.Tensor] = None
+        self._verification_output_buffer: Optional[torch.Tensor] = None
 
         self.scenarios = (
             SchedulerScenario(
@@ -62,6 +65,16 @@ class OptimizedRuntimeSchedulerBenchmark(VerificationPayloadMixin, BaseBenchmark
             torch.cuda.manual_seed_all(42)
         torch.set_num_threads(1)
         self.workload = RuntimeSchedulerWorkload(self.device, self.scenarios)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
+        self._verification_dummy = torch.zeros(1, device=self.device)
+        max_dim = max(scenario.matmul_dim for scenario in self.scenarios)
+        self._verification_output_buffer = torch.empty(
+            max_dim,
+            max_dim,
+            device=self.device,
+            dtype=torch.float32,
+        )
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
 
@@ -73,16 +86,17 @@ class OptimizedRuntimeSchedulerBenchmark(VerificationPayloadMixin, BaseBenchmark
         # The CPU prep result is not consumed by GPU compute, so a thread-pool only adds
         # executor overhead. Launch compute first, then use the host thread for next-step prep
         # while the kernel is in flight.
-        self.workload.cpu_prepare()
-        for step in range(scenario.decode_steps):
-            self.output = self.workload.gpu_compute(scenario)
-            if step + 1 < scenario.decode_steps:
-                self.workload.cpu_prepare()
-            send_tokens = scenario.concurrency * scenario.tokens_per_step
-            interval = max(1, scenario.stream_interval)
-            for offset in range(0, send_tokens, interval):
-                self.workload.stream_send(min(interval, send_tokens - offset))
-            torch.cuda.synchronize(self.device)
+        with torch.inference_mode():
+            self.workload.cpu_prepare()
+            for step in range(scenario.decode_steps):
+                self.output = self.workload.gpu_compute(scenario)
+                if step + 1 < scenario.decode_steps:
+                    self.workload.cpu_prepare()
+                send_tokens = scenario.concurrency * scenario.tokens_per_step
+                interval = max(1, scenario.stream_interval)
+                for offset in range(0, send_tokens, interval):
+                    self.workload.stream_send(min(interval, send_tokens - offset))
+                torch.cuda.synchronize(self.device)
         end = time.perf_counter()
         elapsed = max(end - start, 1e-9)
         self._custom_metrics[f"{scenario.name}.tps_per_gpu"] = total_tokens / elapsed
@@ -93,20 +107,27 @@ class OptimizedRuntimeSchedulerBenchmark(VerificationPayloadMixin, BaseBenchmark
         return elapsed
 
     def benchmark_fn(self) -> None:
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-        with nvtx_range("runtime_scheduler_optimized", enable=enable_nvtx):
+        with nvtx_range("runtime_scheduler_optimized", enable=self._enable_nvtx):
             for scenario in self.scenarios:
                 self._run_scenario_async(scenario)
         if self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
-        if self.output is None:
+        if (
+            self.output is None
+            or self._verification_dummy is None
+            or self._verification_output_buffer is None
+        ):
             raise RuntimeError("benchmark_fn() did not produce output")
+        verify_output = self._verification_output_buffer[
+            : self.output.shape[0],
+            : self.output.shape[1],
+        ]
+        verify_output.copy_(self.output)
         self._set_verification_payload(
-            inputs={"dummy": torch.zeros(1, device=self.device)},
-            output=self.output.detach().clone(),
+            inputs={"dummy": self._verification_dummy},
+            output=verify_output,
             batch_size=1,
             parameter_count=0,
             precision_flags={

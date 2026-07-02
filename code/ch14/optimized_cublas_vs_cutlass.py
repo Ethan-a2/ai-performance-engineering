@@ -12,6 +12,7 @@ from core.harness.benchmark_harness import (  # noqa: E402
     BenchmarkConfig,
     WorkloadMetadata,
 )
+from core.profiling.nvtx_helper import get_nvtx_enabled, nvtx_range
 
 class OptimizedCublasVsCutlassBenchmark(VerificationPayloadMixin, BaseBenchmark):
     """Supplementary comparison pair: explicit CUTLASS FP16 GEMM."""
@@ -50,15 +51,18 @@ class OptimizedCublasVsCutlassBenchmark(VerificationPayloadMixin, BaseBenchmark)
             tokens_per_iteration=float(self.m * self.n),
         )
         self._verification_payload = None
+        self._enable_nvtx = False
     
     def setup(self) -> None:
         """Setup: Initialize matrices with optimal configuration."""
         torch.manual_seed(42)
+        config = getattr(self, "_config", None) or self.get_config()
+        self._enable_nvtx = get_nvtx_enabled(config) if config else False
         
         # Use float16 matrices for tensor core acceleration
         self.A = torch.randn(self.m, self.k, device=self.device, dtype=torch.float16)
         self.B = torch.randn(self.k, self.n, device=self.device, dtype=torch.float16)
-        self.C = torch.zeros(self.m, self.n, device=self.device, dtype=torch.float16)
+        self.C = None
         
         try:
             from core.benchmark.cutlass_binding import cutlass_gemm_fp16
@@ -70,12 +74,7 @@ class OptimizedCublasVsCutlassBenchmark(VerificationPayloadMixin, BaseBenchmark)
     
     def benchmark_fn(self) -> None:
         """Benchmark: explicit CUTLASS FP16 GEMM."""
-        from core.profiling.nvtx_helper import nvtx_range, get_nvtx_enabled
-
-        config = self.get_config()
-        enable_nvtx = get_nvtx_enabled(config) if config else False
-
-        with nvtx_range("optimized_cublas_vs_cutlass", enable=enable_nvtx):
+        with nvtx_range("optimized_cublas_vs_cutlass", enable=self._enable_nvtx):
             if self.A is None or self.B is None or self._cutlass_gemm is None:
                 raise RuntimeError("Benchmark not initialized")
             self.C = self._cutlass_gemm(self.A, self.B)

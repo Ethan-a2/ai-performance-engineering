@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Callable, Dict
+from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 
 from ch19.mxfp8_moe_common import (
@@ -35,6 +35,37 @@ except ImportError:
     TRITON_AVAILABLE = False
     def fused_silu_mul(gate, up):
         return F.silu(gate) * up
+
+
+def _flat_topk_token_ids(num_tokens: int, top_k: int, device: torch.device) -> torch.Tensor:
+    token_ids = torch.arange(num_tokens * top_k, device=device, dtype=torch.int64)
+    if top_k > 1:
+        token_ids.div_(top_k, rounding_mode="floor")
+    return token_ids
+
+
+def _weight_routes_in_place_if_safe(out: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and out.requires_grad:
+        return out * weights
+    out.mul_(weights)
+    return out
+
+
+def _sum_routes_in_place_if_safe(out: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and out.requires_grad:
+        return out.sum(dim=1)
+    reduced = out[:, 0, :]
+    for route_idx in range(1, out.shape[1]):
+        reduced.add_(out[:, route_idx, :])
+    return reduced
+
+
+def _silu_mul_in_place_if_safe(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and gate.requires_grad:
+        return F.silu(gate) * up
+    F.silu(gate, inplace=True)
+    gate.mul_(up)
+    return gate
 
 
 @dataclass
@@ -74,15 +105,17 @@ class MoEExperts(nn.Module):
         self.w2_stacked = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
         self.w3_stacked = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for idx, expert in enumerate(self.experts):
                 self.w1_stacked[idx].copy_(expert["w1"].weight.t())
                 self.w2_stacked[idx].copy_(expert["w2"].weight.t())
                 self.w3_stacked[idx].copy_(expert["w3"].weight.t())
         
         # Pre-allocated buffers for memory-efficient mode
+        self._naive_output: Optional[torch.Tensor] = None
         self._gate_buffer: Optional[torch.Tensor] = None
         self._up_buffer: Optional[torch.Tensor] = None
+        self._mem_out_buffer: Optional[torch.Tensor] = None
         self._cuda_graph = None
         self._cuda_graph_stream: Optional[torch.cuda.Stream] = None
         self._cuda_graph_signature: Optional[Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...], str, str, str, int]] = None
@@ -95,6 +128,18 @@ class MoEExperts(nn.Module):
         self._cuda_graph_replays = 0
         self._cuda_graph_capture_failures = 0
         self._cuda_graph_last_error: Optional[str] = None
+        self._bmm_padded_tokens: Optional[torch.Tensor] = None
+        self._bmm_padded_weights: Optional[torch.Tensor] = None
+        self._bmm_valid_out: Optional[torch.Tensor] = None
+        self._bmm_restored: Optional[torch.Tensor] = None
+        self._graph_padded_tokens: Optional[torch.Tensor] = None
+        self._grouped_output: Optional[torch.Tensor] = None
+        self._grouped_restored: Optional[torch.Tensor] = None
+        self._bmm_flat_token_ids_cache: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
+        self._bmm_position_ids_cache: Dict[Tuple[int, torch.device], torch.Tensor] = {}
+        self._bmm_padded_token_index_view_cache: Dict[Tuple[int, int, int, torch.device], torch.Tensor] = {}
+        self._bmm_padded_column_index_cache: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
+        self._bmm_sorted_weight_column_cache: Dict[Tuple[int, int, torch.device], torch.Tensor] = {}
 
     @staticmethod
     def _is_torch_compiling() -> bool:
@@ -122,6 +167,86 @@ class MoEExperts(nn.Module):
             str(expert_weights.dtype),
             device_index,
         )
+
+    def _bmm_workspace(
+        self,
+        name: str,
+        shape: Tuple[int, ...],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        shape = tuple(int(dim) for dim in shape)
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        cached = getattr(self, name, None)
+        if (
+            not isinstance(cached, torch.Tensor)
+            or cached.device != device
+            or cached.dtype != dtype
+            or cached.numel() < numel
+        ):
+            cached = torch.empty(numel, device=device, dtype=dtype)
+            setattr(self, name, cached)
+        return cached[:numel].view(shape)
+
+    def _naive_output_like(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled() and x.requires_grad:
+            return torch.empty_like(x)
+        shape = tuple(int(dim) for dim in x.shape)
+        numel = int(x.numel())
+        if (
+            self._naive_output is None
+            or self._naive_output.device != x.device
+            or self._naive_output.dtype != x.dtype
+            or self._naive_output.numel() < numel
+        ):
+            self._naive_output = torch.empty(numel, device=x.device, dtype=x.dtype)
+        return self._naive_output[:numel].view(shape)
+
+    def _flat_topk_token_ids_for(self, num_tokens: int, top_k: int, device: torch.device) -> torch.Tensor:
+        key = (num_tokens, top_k, device)
+        cached = self._bmm_flat_token_ids_cache.get(key)
+        if cached is None:
+            cached = _flat_topk_token_ids(num_tokens, top_k, device)
+            self._bmm_flat_token_ids_cache[key] = cached
+        return cached
+
+    def _position_ids_for(self, length: int, device: torch.device) -> torch.Tensor:
+        key = (length, device)
+        cached = self._bmm_position_ids_cache.get(key)
+        if cached is None:
+            cached = torch.arange(length, device=device, dtype=torch.int64)
+            self._bmm_position_ids_cache[key] = cached
+        return cached
+
+    def _padded_token_index_view(self, padded_indices: torch.Tensor, width: int) -> torch.Tensor:
+        key = (int(padded_indices.data_ptr()), int(padded_indices.numel()), int(width), padded_indices.device)
+        cached = self._bmm_padded_token_index_view_cache.get(key)
+        expected_shape = (int(padded_indices.numel()), int(width))
+        if cached is None or cached.device != padded_indices.device or tuple(cached.shape) != expected_shape:
+            cached = padded_indices.unsqueeze(1).expand(-1, width)
+            self._bmm_padded_token_index_view_cache[key] = cached
+        return cached
+
+    def _padded_column_index(self, padded_indices: torch.Tensor) -> torch.Tensor:
+        key = (int(padded_indices.data_ptr()), int(padded_indices.numel()), padded_indices.device)
+        cached = self._bmm_padded_column_index_cache.get(key)
+        expected_shape = (int(padded_indices.numel()), 1)
+        if cached is None or cached.device != padded_indices.device or tuple(cached.shape) != expected_shape:
+            cached = padded_indices.unsqueeze(1)
+            self._bmm_padded_column_index_cache[key] = cached
+        return cached
+
+    def _sorted_weight_column(self, sorted_weights: torch.Tensor) -> torch.Tensor:
+        key = (int(sorted_weights.data_ptr()), int(sorted_weights.numel()), sorted_weights.device)
+        cached = self._bmm_sorted_weight_column_cache.get(key)
+        expected_shape = (int(sorted_weights.numel()), 1)
+        if cached is None or cached.device != sorted_weights.device or tuple(cached.shape) != expected_shape:
+            cached = sorted_weights.unsqueeze(1)
+            self._bmm_sorted_weight_column_cache[key] = cached
+        return cached
 
     def _reset_cuda_graph_cache(self) -> None:
         self._cuda_graph = None
@@ -189,26 +314,32 @@ class MoEExperts(nn.Module):
         """Level 0: NAIVE - Python loops over experts.
         
         This is how you might write MoE naively:
+        - Loop over each top-K selection
         - Loop over each expert
-        - Loop over each top-K selection  
         - Compute expert output
         - Accumulate weighted results
         
         Problems: Python loop overhead, no parallelism, memory inefficient
         """
-        output = torch.zeros_like(x)
+        output = self._naive_output_like(x)
         
-        for expert_idx in range(self.num_experts):
-            for k in range(num_experts_per_tok):
-                mask = expert_indices[:, k] == expert_idx
-                if mask.any():
-                    expert_input = x[mask]
-                    expert = self.experts[expert_idx]
-                    gate = F.silu(expert['w1'](expert_input))
-                    up = expert['w3'](expert_input)
-                    expert_output = expert['w2'](gate * up)
-                    weights = expert_weights[mask, k].unsqueeze(-1)
-                    output[mask] += weights * expert_output
+        for k in range(num_experts_per_tok):
+            for expert_idx in range(self.num_experts):
+                token_ids = (expert_indices[:, k] == expert_idx).nonzero(as_tuple=True)[0]
+                if token_ids.numel() == 0:
+                    continue
+                expert_input = x[token_ids]
+                expert = self.experts[expert_idx]
+                gate = expert['w1'](expert_input)
+                up = expert['w3'](expert_input)
+                hidden = _silu_mul_in_place_if_safe(gate, up)
+                expert_output = expert['w2'](hidden)
+                weights = expert_weights[token_ids, k].unsqueeze(-1)
+                weighted_output = _weight_routes_in_place_if_safe(expert_output, weights)
+                if k == 0:
+                    output[token_ids] = weighted_output
+                else:
+                    output[token_ids] += weighted_output
         return output
     
     def forward_batched(
@@ -240,13 +371,13 @@ class MoEExperts(nn.Module):
         w2_flat = w2_sel.reshape(total_tokens, self.intermediate_size, self.hidden_size)
 
         gate = torch.bmm(x_flat.unsqueeze(1), w1_flat).squeeze(1)
-        gate = F.silu(gate)
         up = torch.bmm(x_flat.unsqueeze(1), w3_flat).squeeze(1)
-        hidden = gate * up
+        hidden = _silu_mul_in_place_if_safe(gate, up)
         out = torch.bmm(hidden.unsqueeze(1), w2_flat).squeeze(1)
         out = out.view(batch_seq, top_k, self.hidden_size)
 
-        return (out * expert_weights.unsqueeze(-1)).sum(dim=1)
+        out = _weight_routes_in_place_if_safe(out, expert_weights.unsqueeze(-1))
+        return _sum_routes_in_place_if_safe(out)
     
     def forward_fused(
         self, x: torch.Tensor, expert_indices: torch.Tensor, expert_weights: torch.Tensor,
@@ -276,7 +407,8 @@ class MoEExperts(nn.Module):
         hidden = fused_silu_mul(gate, up)
         
         out = torch.einsum('bki,bkih->bkh', hidden, w2_sel)
-        return (out * expert_weights.unsqueeze(-1)).sum(dim=1)
+        out = _weight_routes_in_place_if_safe(out, expert_weights.unsqueeze(-1))
+        return _sum_routes_in_place_if_safe(out)
     
     def forward_mem_efficient(
         self, x: torch.Tensor, expert_indices: torch.Tensor, expert_weights: torch.Tensor,
@@ -291,12 +423,18 @@ class MoEExperts(nn.Module):
         batch_seq, top_k = expert_indices.shape
         total_tokens = batch_seq * top_k
         
-        # Reuse pre-allocated buffers
-        if self._gate_buffer is None or self._gate_buffer.shape[0] != total_tokens:
-            self._gate_buffer = torch.empty(total_tokens, self.intermediate_size, 
-                                           device=x.device, dtype=x.dtype)
-            self._up_buffer = torch.empty(total_tokens, self.intermediate_size,
-                                         device=x.device, dtype=x.dtype)
+        gate_buffer = self._bmm_workspace(
+            "_gate_buffer",
+            (total_tokens, self.intermediate_size),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        up_buffer = self._bmm_workspace(
+            "_up_buffer",
+            (total_tokens, self.intermediate_size),
+            device=x.device,
+            dtype=x.dtype,
+        )
         
         w1_sel = self.w1_stacked[expert_indices].view(total_tokens, self.hidden_size, -1)
         w3_sel = self.w3_stacked[expert_indices].view(total_tokens, self.hidden_size, -1)
@@ -305,17 +443,24 @@ class MoEExperts(nn.Module):
         x_flat = x.unsqueeze(1).expand(-1, top_k, -1).reshape(total_tokens, self.hidden_size)
         
         # Compute into pre-allocated buffers
-        torch.bmm(x_flat.unsqueeze(1), w1_sel, out=self._gate_buffer.unsqueeze(1))
-        torch.bmm(x_flat.unsqueeze(1), w3_sel, out=self._up_buffer.unsqueeze(1))
+        torch.bmm(x_flat.unsqueeze(1), w1_sel, out=gate_buffer.unsqueeze(1))
+        torch.bmm(x_flat.unsqueeze(1), w3_sel, out=up_buffer.unsqueeze(1))
         
-        # Fused activation
-        hidden = fused_silu_mul(self._gate_buffer, self._up_buffer)
+        # Reuse the gate buffer as the activated hidden state.
+        hidden = _silu_mul_in_place_if_safe(gate_buffer, up_buffer)
         
         # Final projection
-        out = torch.bmm(hidden.unsqueeze(1), w2_sel).squeeze(1)
-        out = out.view(batch_seq, top_k, -1)
+        out_flat = self._bmm_workspace(
+            "_mem_out_buffer",
+            (total_tokens, self.hidden_size),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        torch.bmm(hidden.unsqueeze(1), w2_sel, out=out_flat.unsqueeze(1))
+        out = out_flat.view(batch_seq, top_k, self.hidden_size)
         
-        return (out * expert_weights.unsqueeze(-1)).sum(dim=1)
+        out = _weight_routes_in_place_if_safe(out, expert_weights.unsqueeze(-1))
+        return _sum_routes_in_place_if_safe(out)
     
     def forward_grouped(
         self, x: torch.Tensor, expert_indices: torch.Tensor, expert_weights: torch.Tensor,
@@ -340,41 +485,57 @@ class MoEExperts(nn.Module):
         # path. That keeps the lab aligned with the production-style grouped-routing
         # utilities it already documents, and avoids the current sort-heavy slowdown.
         batch_seq, top_k = expert_indices.shape
-        repeated_tokens = x.repeat_interleave(top_k, dim=0)
+        flat_token_ids = self._flat_topk_token_ids_for(batch_seq, top_k, x.device)
         flat_expert_ids = expert_indices.view(-1)
-        sorted_tokens, counts, bucket_indices, expert_order, _ = bucket_grouped_tokens(
-            repeated_tokens,
+        (
+            sorted_tokens,
+            counts,
+            bucket_indices,
+            _expert_order,
+            _bucket_token_ids,
+            expert_order_host,
+        ) = bucket_grouped_tokens(
+            x,
             flat_expert_ids,
             self.num_experts,
+            token_ids=flat_token_ids,
+            return_expert_order_list=True,
         )
         sorted_weights = expert_weights.view(-1).index_select(0, bucket_indices)
 
         # Per-expert GEMM on contiguous tokens
-        output = torch.zeros(sorted_tokens.shape[0], self.hidden_size,
-                           device=x.device, dtype=x.dtype)
+        output = self._bmm_workspace(
+            "_grouped_output",
+            (sorted_tokens.shape[0], self.hidden_size),
+            device=x.device,
+            dtype=x.dtype,
+        )
 
         offset = 0
-        for expert_id, count in zip(expert_order.tolist(), counts):
+        for expert_id, count in zip(expert_order_host, counts):
             tokens_e = sorted_tokens[offset:offset+count]
             weights_e = sorted_weights[offset:offset+count].unsqueeze(-1)
             
             # Contiguous GEMM for this expert
-            gate = F.silu(tokens_e @ self.w1_stacked[expert_id])
+            gate = tokens_e @ self.w1_stacked[expert_id]
             up = tokens_e @ self.w3_stacked[expert_id]
-            expert_out = (gate * up) @ self.w2_stacked[expert_id]
+            hidden = _silu_mul_in_place_if_safe(gate, up)
+            expert_out = hidden @ self.w2_stacked[expert_id]
             
-            output[offset:offset+count] = expert_out * weights_e
+            weighted_out = _weight_routes_in_place_if_safe(expert_out, weights_e)
+            output[offset:offset+count] = weighted_out
             offset += count
         
         # Restore order
-        restored = torch.empty(
-            batch_seq * top_k,
-            self.hidden_size,
+        restored = self._bmm_workspace(
+            "_grouped_restored",
+            (batch_seq * top_k, self.hidden_size),
             device=x.device,
             dtype=x.dtype,
         )
         restore_grouped_tokens(output, bucket_indices, batch_seq * top_k, out=restored)
-        return restored.view(batch_seq, top_k, -1).sum(dim=1)
+        restored = restored.view(batch_seq, top_k, self.hidden_size)
+        return _sum_routes_in_place_if_safe(restored)
     
     def forward_bmm_fused(
         self, x: torch.Tensor, expert_indices: torch.Tensor, expert_weights: torch.Tensor,
@@ -399,46 +560,144 @@ class MoEExperts(nn.Module):
         # Sort by expert
         flat_idx = expert_indices.view(-1)
         sorted_order = torch.argsort(flat_idx, stable=True)
-        sorted_tokens = x.repeat_interleave(top_k, dim=0)[sorted_order]
-        sorted_weights = expert_weights.view(-1)[sorted_order]
-        sorted_expert_ids = flat_idx[sorted_order]
+        flat_token_ids = self._flat_topk_token_ids_for(batch_seq, top_k, device)
+        assignments = flat_idx.numel()
+        sorted_token_ids = self._bmm_workspace(
+            "_bmm_sorted_token_ids",
+            (assignments,),
+            device=device,
+            dtype=torch.int64,
+        )
+        torch.index_select(flat_token_ids, 0, sorted_order, out=sorted_token_ids)
+        sorted_tokens = self._bmm_workspace(
+            "_bmm_sorted_tokens",
+            (assignments, self.hidden_size),
+            device=device,
+            dtype=x.dtype,
+        )
+        torch.index_select(x, 0, sorted_token_ids, out=sorted_tokens)
+        sorted_weights = self._bmm_workspace(
+            "_bmm_sorted_weights",
+            (assignments,),
+            device=device,
+            dtype=expert_weights.dtype,
+        )
+        torch.index_select(expert_weights.view(-1), 0, sorted_order, out=sorted_weights)
+        sorted_expert_ids = self._bmm_workspace(
+            "_bmm_sorted_expert_ids",
+            (assignments,),
+            device=device,
+            dtype=torch.int64,
+        )
+        torch.index_select(flat_idx, 0, sorted_order, out=sorted_expert_ids)
         counts = torch.bincount(sorted_expert_ids, minlength=self.num_experts)
-        max_count = counts.max().item()
+        max_count = int(counts.max().item())
         
         # Vectorized scatter indices
-        cumsum = counts.cumsum(0)
-        starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
-        expert_offsets = starts[sorted_expert_ids]
-        positions = torch.arange(len(sorted_expert_ids), device=device) - expert_offsets
-        padded_indices = sorted_expert_ids * max_count + positions
+        cumsum = self._bmm_workspace(
+            "_bmm_expert_cumsum",
+            (self.num_experts,),
+            device=device,
+            dtype=counts.dtype,
+        )
+        torch.cumsum(counts, dim=0, out=cumsum)
+        starts = self._bmm_workspace(
+            "_bmm_expert_starts",
+            (self.num_experts,),
+            device=device,
+            dtype=counts.dtype,
+        )
+        starts[0] = 0
+        starts[1:].copy_(cumsum[:-1])
+        expert_offsets = self._bmm_workspace(
+            "_bmm_expert_offsets",
+            (assignments,),
+            device=device,
+            dtype=torch.int64,
+        )
+        torch.index_select(starts, 0, sorted_expert_ids, out=expert_offsets)
+        position_ids = self._position_ids_for(sorted_expert_ids.numel(), device)
+        positions = self._bmm_workspace(
+            "_bmm_positions",
+            (assignments,),
+            device=device,
+            dtype=torch.int64,
+        )
+        torch.sub(position_ids, expert_offsets, out=positions)
+        padded_indices = self._bmm_workspace(
+            "_bmm_padded_indices",
+            (assignments,),
+            device=device,
+            dtype=torch.int64,
+        )
+        torch.mul(sorted_expert_ids, max_count, out=padded_indices)
+        padded_indices.add_(positions)
         
         # Scatter tokens into padded tensor (vectorized!)
-        padded_tokens = torch.zeros(self.num_experts * max_count, self.hidden_size, 
-                                   device=device, dtype=x.dtype)
-        padded_tokens.scatter_(0, padded_indices.unsqueeze(1).expand(-1, self.hidden_size), sorted_tokens)
+        padded_tokens = self._bmm_workspace(
+            "_bmm_padded_tokens",
+            (self.num_experts * int(max_count), self.hidden_size),
+            device=device,
+            dtype=x.dtype,
+        )
+        # Only rows addressed by padded_indices are gathered after the BMM.
+        padded_token_index = self._padded_token_index_view(padded_indices, self.hidden_size)
+        padded_tokens.scatter_(0, padded_token_index, sorted_tokens)
         padded_tokens = padded_tokens.view(self.num_experts, max_count, self.hidden_size)
         
         # SINGLE BMM for all experts!
         gate = torch.bmm(padded_tokens, self.w1_stacked)   # [E, max_count, I]
-        gate = F.silu(gate)
         up = torch.bmm(padded_tokens, self.w3_stacked)     # [E, max_count, I]
-        hidden = gate * up
+        hidden = _silu_mul_in_place_if_safe(gate, up)
         out = torch.bmm(hidden, self.w2_stacked)           # [E, max_count, H]
         
         # Scatter weights and apply
-        padded_weights = torch.zeros(self.num_experts * max_count, 1, device=device, dtype=x.dtype)
-        padded_weights.scatter_(0, padded_indices.unsqueeze(1), sorted_weights.unsqueeze(1))
+        padded_weights = self._bmm_workspace(
+            "_bmm_padded_weights",
+            (self.num_experts * int(max_count), 1),
+            device=device,
+            dtype=x.dtype,
+        )
+        # Padding rows are ignored by the gather, so clearing the workspace is unnecessary.
+        padded_weight_index = self._padded_column_index(padded_indices)
+        sorted_weight_column = self._sorted_weight_column(sorted_weights)
+        padded_weights.scatter_(0, padded_weight_index, sorted_weight_column)
         padded_weights = padded_weights.view(self.num_experts, max_count, 1)
-        out = out * padded_weights
+        out.mul_(padded_weights)
         
         # Gather back using same indices
         flat_out = out.view(-1, self.hidden_size)
-        valid_out = flat_out[padded_indices]
+        if torch.is_grad_enabled() and flat_out.requires_grad:
+            valid_out = flat_out.index_select(0, padded_indices)
+        else:
+            valid_out = self._bmm_workspace(
+                "_bmm_valid_out",
+                (assignments, self.hidden_size),
+                device=device,
+                dtype=out.dtype,
+            )
+            torch.index_select(flat_out, 0, padded_indices, out=valid_out)
         
         # Restore order
-        unsort = torch.argsort(sorted_order)
-        restored = valid_out[unsort].view(batch_seq, top_k, -1)
-        return restored.sum(dim=1)
+        unsort = self._bmm_workspace(
+            "_bmm_unsort",
+            (assignments,),
+            device=device,
+            dtype=torch.int64,
+        )
+        unsort[sorted_order] = position_ids
+        if torch.is_grad_enabled() and valid_out.requires_grad:
+            restored = valid_out.index_select(0, unsort)
+        else:
+            restored = self._bmm_workspace(
+                "_bmm_restored",
+                (assignments, self.hidden_size),
+                device=device,
+                dtype=valid_out.dtype,
+            )
+            torch.index_select(valid_out, 0, unsort, out=restored)
+        restored = restored.view(batch_seq, top_k, self.hidden_size)
+        return _sum_routes_in_place_if_safe(restored)
 
     def _forward_bmm_fused_graphable(
         self, x: torch.Tensor, expert_indices: torch.Tensor, expert_weights: torch.Tensor,
@@ -453,24 +712,39 @@ class MoEExperts(nn.Module):
         compute stays vectorized, but all tensor shapes become capture-safe.
         """
         batch_seq, top_k = expert_indices.shape
+        device = x.device
         flat_idx = expert_indices.reshape(-1)
         flat_weights = expert_weights.reshape(1, -1, 1).to(dtype=x.dtype)
-        expanded_x = x.repeat_interleave(top_k, dim=0)
+        expanded_x = x[:, None, :].expand(batch_seq, top_k, self.hidden_size).reshape(
+            batch_seq * top_k,
+            self.hidden_size,
+        )
 
         expert_mask = F.one_hot(flat_idx, num_classes=self.num_experts).transpose(0, 1)
         expert_mask = expert_mask.to(dtype=x.dtype)
-        padded_tokens = expert_mask.unsqueeze(-1) * expanded_x.unsqueeze(0)
+        expert_mask_column = expert_mask.unsqueeze(-1)
+        expanded_x_broadcast = expanded_x.unsqueeze(0)
+        if torch.is_grad_enabled() and expanded_x.requires_grad:
+            padded_tokens = expert_mask_column * expanded_x_broadcast
+        else:
+            padded_tokens = self._bmm_workspace(
+                "_graph_padded_tokens",
+                (self.num_experts, batch_seq * top_k, self.hidden_size),
+                device=device,
+                dtype=x.dtype,
+            )
+            torch.mul(expert_mask_column, expanded_x_broadcast, out=padded_tokens)
 
         gate = torch.bmm(padded_tokens, self.w1_stacked)
-        gate = F.silu(gate)
         up = torch.bmm(padded_tokens, self.w3_stacked)
-        hidden = gate * up
+        hidden = _silu_mul_in_place_if_safe(gate, up)
         out = torch.bmm(hidden, self.w2_stacked)
-        out = out * expert_mask.unsqueeze(-1) * flat_weights
+        out = _weight_routes_in_place_if_safe(out, expert_mask_column)
+        out = _weight_routes_in_place_if_safe(out, flat_weights)
 
         combined = out.sum(dim=0)
         restored = combined.view(batch_seq, top_k, self.hidden_size)
-        return restored.sum(dim=1)
+        return _sum_routes_in_place_if_safe(restored)
     
     def forward_cuda_graphs(
         self, x: torch.Tensor, expert_indices: torch.Tensor, expert_weights: torch.Tensor,
@@ -578,9 +852,9 @@ class MoELayer(nn.Module):
         x_flat = x.view(-1, hidden)
         
         router_logits = self.gate(x_flat)
-        routing_weights = F.softmax(router_logits.float(), dim=-1)
-        expert_weights, expert_indices = torch.topk(routing_weights, self.num_experts_per_tok, dim=-1)
-        expert_weights = (expert_weights / expert_weights.sum(dim=-1, keepdim=True)).to(x.dtype)
+        top_logits, expert_indices = torch.topk(router_logits.float(), self.num_experts_per_tok, dim=-1)
+        expert_weights = F.softmax(top_logits, dim=-1)
+        expert_weights = expert_weights.to(x.dtype)
         
         output = self.experts(x_flat, expert_indices, expert_weights, self.num_experts_per_tok)
         

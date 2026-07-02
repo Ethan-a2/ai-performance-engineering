@@ -39,6 +39,11 @@ class NvlinkOffloadBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.gpu_cache: Optional[torch.Tensor] = None
         self.copy_stream: Optional[torch.cuda.Stream] = None
         self.next_start: int = 0
+        self._next_chunk_idx: int = 0
+        self._chunk_count: int = 0
+        self._chunk_views: list[tuple[torch.Tensor, torch.Tensor]] = []
+        self._output_view: Optional[torch.Tensor] = None
+        self._verify_output_buffer: Optional[torch.Tensor] = None
         self._bytes_per_iteration: float = 0.0
         self.output: Optional[torch.Tensor] = None
         self.register_workload_metadata(requests_per_iteration=1.0)
@@ -59,6 +64,28 @@ class NvlinkOffloadBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.cpu_cache = torch.zeros(shape, dtype=self.cfg.dtype, pin_memory=self.cfg.use_pinned)
         self.gpu_cache = torch.zeros(shape, dtype=self.cfg.dtype, device=self.device)
         self.copy_stream = torch.cuda.Stream() if self.cfg.use_copy_stream else None
+        self._next_chunk_idx = 0
+        self._chunk_count = 0
+        self.next_start = 0
+        self._chunk_views = []
+        for start in range(0, self.cfg.max_seq_len, self.cfg.chunk_tokens):
+            end = min(start + self.cfg.chunk_tokens, self.cfg.max_seq_len)
+            slice_len = end - start
+            if slice_len <= 0:
+                continue
+            self._chunk_views.append(
+                (
+                    self.cpu_cache[..., start:end, :],
+                    self.gpu_cache[..., :slice_len, :],
+                )
+            )
+        self._chunk_count = len(self._chunk_views)
+        self._output_view = self.gpu_cache[
+            ...,
+            : min(1, self.cfg.max_seq_len),
+            : min(8, self.cfg.head_dim),
+        ]
+        self._verify_output_buffer = torch.empty_like(self._output_view, dtype=torch.float32)
 
         elements_per_chunk = (
             self.cfg.num_layers
@@ -74,44 +101,44 @@ class NvlinkOffloadBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def benchmark_fn(self) -> None:
         assert self.cpu_cache is not None and self.gpu_cache is not None
+        if not self._chunk_views or not self._chunk_count or self._output_view is None:
+            raise RuntimeError("Offload chunk views not initialized")
 
-        start = self.next_start
-        end = min(start + self.cfg.chunk_tokens, self.cfg.max_seq_len)
-        slice_len = end - start
-        if slice_len <= 0:
-            self.next_start = 0
-            return
-
-        cpu_slice = self.cpu_cache[..., start:end, :]
-        if self.copy_stream is not None:
-            with torch.cuda.stream(self.copy_stream):
-                self.gpu_cache[..., :slice_len, :].copy_(cpu_slice.to(self.device, non_blocking=self.cfg.non_blocking))
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+        cpu_slice, gpu_slice = self._chunk_views[self._next_chunk_idx]
+        copy_stream = self.copy_stream
+        current_stream = torch.cuda.current_stream() if copy_stream is not None else None
+        if copy_stream is not None and current_stream is not None:
+            with torch.cuda.stream(copy_stream):
+                gpu_slice.copy_(cpu_slice, non_blocking=self.cfg.non_blocking)
+            current_stream.wait_stream(copy_stream)
         else:
-            self.gpu_cache[..., :slice_len, :].copy_(cpu_slice.to(self.device, non_blocking=self.cfg.non_blocking))
+            gpu_slice.copy_(cpu_slice, non_blocking=self.cfg.non_blocking)
 
         # Lightweight compute to keep the slice "hot"
-        self.gpu_cache[..., :slice_len, :].mul_(1.0001)
+        gpu_slice.mul_(1.0001)
 
-        if self.copy_stream is not None:
-            with torch.cuda.stream(self.copy_stream):
-                target = self.cpu_cache[..., start:end, :]
-                target.copy_(self.gpu_cache[..., :slice_len, :].to("cpu", non_blocking=self.cfg.non_blocking))
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
+        if copy_stream is not None and current_stream is not None:
+            copy_stream.wait_stream(current_stream)
+            with torch.cuda.stream(copy_stream):
+                cpu_slice.copy_(gpu_slice, non_blocking=self.cfg.non_blocking)
+            current_stream.wait_stream(copy_stream)
         else:
-            target = self.cpu_cache[..., start:end, :]
-            target.copy_(self.gpu_cache[..., :slice_len, :].to("cpu", non_blocking=self.cfg.non_blocking))
+            cpu_slice.copy_(gpu_slice, non_blocking=self.cfg.non_blocking)
 
         # Capture a representative slice for verification (GPU slice to avoid host sync patterns)
-        self.output = self.gpu_cache[..., : min(1, self.cfg.max_seq_len), : min(8, self.cfg.head_dim)].detach()
-        self.next_start = 0 if end >= self.cfg.max_seq_len else end
+        self.output = self._output_view
+        self._next_chunk_idx = (self._next_chunk_idx + 1) % self._chunk_count
+        self.next_start = self._next_chunk_idx * self.cfg.chunk_tokens
         if self.output is None:
             raise RuntimeError("benchmark_fn() did not produce output")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"gpu_cache": self.gpu_cache.detach()},
-            output=self.output.float().clone(),
+            output=self._verify_output_buffer,
             batch_size=self.cfg.batch_size,
             parameter_count=0,
             precision_flags={
@@ -126,6 +153,11 @@ class NvlinkOffloadBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.cpu_cache = None
         self.gpu_cache = None
         self.copy_stream = None
+        self._next_chunk_idx = 0
+        self._chunk_count = 0
+        self._chunk_views = []
+        self._output_view = None
+        self._verify_output_buffer = None
         self.output = None
         super().teardown()
 

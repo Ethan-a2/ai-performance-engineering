@@ -11,6 +11,7 @@ import copy
 
 from typing import Optional
 
+from ch04.reduction_common import ReusableReductionMlp
 from core.common.device_utils import resolve_local_rank
 from core.harness.benchmark_harness import (
     BaseBenchmark,
@@ -35,6 +36,7 @@ class OptimizedDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.batch_size = 2
         self.prefill_len = 512
         self.hidden_dim = 256
+        self._payload_parameter_count = 0
         tokens = self.batch_size * (self.prefill_len + 1)  # include decode token
         self._workload = WorkloadMetadata(
             requests_per_iteration=float(self.batch_size),
@@ -67,14 +69,12 @@ class OptimizedDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         # Decode: Autoregressive, latency-sensitive, dedicated GPU resources
         
         # Prefill model (optimized for parallel processing)
-        base_model = nn.Sequential(
-            nn.Linear(256, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-        ).to(self.device).eval()
+        base_model = ReusableReductionMlp(self.hidden_dim, self.hidden_dim * 2).to(self.device).eval()
         self.prefill_model = base_model
         # Decode model uses identical weights; disaggregation changes placement/scheduling, not math.
         self.decode_model = copy.deepcopy(base_model)
+        model_param_count = sum(p.numel() for p in base_model.parameters())
+        self._payload_parameter_count = model_param_count * 2
         
         if self.is_distributed:
             # In disaggregated setup, prefill and decode can use different GPU groups.
@@ -95,14 +95,14 @@ class OptimizedDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
         assert self.prefill_model is not None and self.decode_model is not None
         assert self.prefill_input is not None and self.decode_input is not None
         with self._nvtx_range("optimized_disaggregated"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 # Process prefill on dedicated prefill GPUs (parallel, compute-intensive)
                 prefill_output = self.prefill_model(self.prefill_input)
                 
                 # Synchronize prefill across GPUs
                 if self.is_distributed:
                     dist.all_reduce(prefill_output, op=dist.ReduceOp.SUM)
-                    prefill_output = prefill_output / self.world_size
+                    prefill_output.div_(self.world_size)
                 
                 # Process decode on dedicated decode GPUs (autoregressive, latency-sensitive)
                 decode_output = self.decode_model(self.decode_input)
@@ -110,22 +110,17 @@ class OptimizedDisaggregatedBenchmark(VerificationPayloadMixin, BaseBenchmark):
                 # Synchronize decode across GPUs
                 if self.is_distributed:
                     dist.all_reduce(decode_output, op=dist.ReduceOp.SUM)
-                    decode_output = decode_output / self.world_size
-                self.output = decode_output.detach()
+                    decode_output.div_(self.world_size)
+                self.output = decode_output
 
     def capture_verification_payload(self) -> None:
         if self.prefill_input is None or self.decode_input is None or self.output is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        total_params = 0
-        if self.prefill_model is not None:
-            total_params += sum(p.numel() for p in self.prefill_model.parameters())
-        if self.decode_model is not None:
-            total_params += sum(p.numel() for p in self.decode_model.parameters())
         self._set_verification_payload(
             inputs={"prefill": self.prefill_input, "decode": self.decode_input},
             output=self.output.to(dtype=torch.float32),
             batch_size=int(self.batch_size),
-            parameter_count=total_params,
+            parameter_count=self._payload_parameter_count,
             precision_flags={
                 "fp16": False,
                 "bf16": False,

@@ -30,6 +30,13 @@ class BaselineStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.host_data: Optional[List[torch.Tensor]] = None
         self.device_data: Optional[List[torch.Tensor]] = None
         self.results: Optional[List[torch.Tensor]] = None
+        self._scratch0: Optional[torch.Tensor] = None
+        self._scratch1: Optional[torch.Tensor] = None
+        self._scratch_pair: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        self._chunk_triplets: List[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._verify_output: Optional[torch.Tensor] = None
+        self._verify_indices: tuple[int, int, int] = ()
+        self._verify_slice_len = 0
         self.N = 5_000_000  # Elements per chunk - balanced for H2D/compute overlap
         self.num_chunks = 20  # More chunks to amortize pipeline startup
         # Stream benchmark - fixed dimensions for overlap measurement
@@ -62,6 +69,17 @@ class BaselineStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
             torch.empty(self.N, dtype=torch.float32, device=self.device)
             for _ in range(self.num_chunks)
         ]
+        self._scratch0 = torch.empty(self.N, dtype=torch.float32, device=self.device)
+        self._scratch1 = torch.empty(self.N, dtype=torch.float32, device=self.device)
+        self._scratch_pair = (self._scratch0, self._scratch1)
+        self._chunk_triplets = list(zip(self.host_data, self.device_data, self.results, strict=True))
+        self._verify_slice_len = min(256, self.N)
+        self._verify_indices = (0, self.num_chunks // 2, self.num_chunks - 1)
+        self._verify_output = torch.empty(
+            self._verify_slice_len * len(self._verify_indices),
+            dtype=torch.float32,
+            device=self.device,
+        )
         
         self._synchronize()
         processed = float(self.N * self.num_chunks)
@@ -70,17 +88,26 @@ class BaselineStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
             requests_per_iteration=float(self.num_chunks),
         )
     
-    def _compute(self, data: torch.Tensor) -> torch.Tensor:
+    def _compute(self, data: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Compute-intensive operation on GPU data.
         
         Multiple trig operations to ensure compute time is meaningful
         relative to H2D transfer time for proper overlap demonstration.
         """
+        if self._scratch_pair is None:
+            raise RuntimeError("setup() must initialize compute scratch buffers")
+        scratch0, scratch1 = self._scratch_pair
         result = data
         for _ in range(3):  # Multiple passes to increase compute time
-            result = torch.sin(result) * torch.cos(result) + result * 0.1
-            result = torch.tanh(result) + torch.sigmoid(result) * 0.5
-        return result
+            torch.sin(result, out=scratch0)
+            torch.cos(result, out=scratch1)
+            scratch0.mul_(scratch1)
+            scratch0.add_(result, alpha=0.1)
+            torch.tanh(scratch0, out=out)
+            torch.sigmoid(scratch0, out=scratch1)
+            out.add_(scratch1, alpha=0.5)
+            result = out
+        return out
     
     def benchmark_fn(self) -> None:
         """Benchmark: Sequential H2D transfer then compute for each chunk.
@@ -91,19 +118,28 @@ class BaselineStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         - GPU compute units are idle during H2D transfers
         - Memory controller is idle during compute
         """
-        with self._nvtx_range("baseline_streams_sequential"):
-            for i in range(self.num_chunks):
+        if not self._chunk_triplets:
+            raise RuntimeError("setup() must initialize chunk views")
+        with torch.inference_mode(), self._nvtx_range("baseline_streams_sequential"):
+            for host_chunk, device_chunk, result_chunk in self._chunk_triplets:
                 # Transfer data from host to device (blocking)
-                self.device_data[i].copy_(self.host_data[i])
+                device_chunk.copy_(host_chunk)
                 
                 # Compute on device
-                self.results[i] = self._compute(self.device_data[i])
+                self._compute(device_chunk, result_chunk)
     
     def teardown(self) -> None:
         """Teardown: Clean up resources."""
         self.host_data = None
         self.device_data = None
         self.results = None
+        self._scratch0 = None
+        self._scratch1 = None
+        self._scratch_pair = None
+        self._chunk_triplets = []
+        self._verify_output = None
+        self._verify_indices = ()
+        self._verify_slice_len = 0
         super().teardown()
     
     def get_config(self) -> BenchmarkConfig:
@@ -129,14 +165,17 @@ class BaselineStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
         )
 
     def capture_verification_payload(self) -> None:
-        if self.host_data is None or self.results is None:
+        if self.host_data is None or self.results is None or self._verify_output is None:
             raise RuntimeError("setup() and benchmark_fn() must be called before capture_verification_payload()")
-        sample = self.host_data[0][:256]
-        indices = [0, self.num_chunks // 2, self.num_chunks - 1]
-        verify_output = torch.cat([self.results[i][:256].detach() for i in indices], dim=0)
+        slice_len = self._verify_slice_len
+        sample = self.host_data[0][:slice_len]
+        with torch.no_grad():
+            for slot, result_idx in enumerate(self._verify_indices):
+                start = slot * slice_len
+                self._verify_output[start : start + slice_len].copy_(self.results[result_idx][:slice_len])
         self._set_verification_payload(
             inputs={"host_data": sample},
-            output=verify_output,
+            output=self._verify_output,
             batch_size=int(self.num_chunks),
             parameter_count=int(self.N * self.num_chunks),
             precision_flags={
@@ -152,5 +191,3 @@ class BaselineStreamsBenchmark(VerificationPayloadMixin, BaseBenchmark):
 def get_benchmark() -> BaselineStreamsBenchmark:
     """Factory function for benchmark discovery."""
     return BaselineStreamsBenchmark()
-
-

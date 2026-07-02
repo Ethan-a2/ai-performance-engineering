@@ -42,6 +42,7 @@ class OptimizedDualPipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.input_a: torch.Tensor | None = None
         self.input_b: torch.Tensor | None = None
         self.output: torch.Tensor | None = None
+        self._verify_output_buffer: torch.Tensor | None = None
 
         # Match constants from baseline for fair comparison
         self.tile_elems = 1024
@@ -61,6 +62,7 @@ class OptimizedDualPipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
         total_elems = self.tiles * self.tile_elems
         self.input_a = torch.randn(total_elems, device=self.device, dtype=torch.float32)
         self.input_b = torch.randn(total_elems, device=self.device, dtype=torch.float32)
+        self._verify_output_buffer = torch.empty(total_elems, device=self.device, dtype=torch.float32)
         self.output = None
         self._synchronize()
         tokens = float(total_elems * 2)
@@ -71,7 +73,7 @@ class OptimizedDualPipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
 
     def benchmark_fn(self) -> None:
         assert self.input_a is not None and self.input_b is not None and self.ext is not None
-        with self._nvtx_range("optimized_dual_pipeline_multistream"):
+        with torch.inference_mode(), self._nvtx_range("optimized_dual_pipeline_multistream"):
             result = self.ext.warp_specialized_multistream_forward(
                 self.input_a,
                 self.input_b,
@@ -82,9 +84,12 @@ class OptimizedDualPipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
             raise RuntimeError("benchmark_fn() must produce output for verification")
 
     def capture_verification_payload(self) -> None:
+        if self.output is None or self._verify_output_buffer is None:
+            raise RuntimeError("benchmark_fn() must run before capture_verification_payload()")
+        self._verify_output_buffer.copy_(self.output)
         self._set_verification_payload(
             inputs={"input_a": self.input_a, "input_b": self.input_b},
-            output=self.output.detach().float().clone(),
+            output=self._verify_output_buffer,
             batch_size=int(self.tiles),
             precision_flags={
                 "fp16": False,
@@ -100,14 +105,20 @@ class OptimizedDualPipelineBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.input_a = None
         self.input_b = None
         self.output = None
+        self._verify_output_buffer = None
         super().teardown()
 
     def get_config(self) -> BenchmarkConfig:
         return BenchmarkConfig(
             iterations=10,
             warmup=5,
-            measurement_timeout_seconds=120,
-            setup_timeout_seconds=120,
+            # The one-time cold JIT compile of this warp-specialized dual-pipeline
+            # multistream kernel takes ~121s on GB300 (the kernel itself then runs
+            # in well under a millisecond). 120s was just too tight for the cold
+            # build, so the first inventory run timed out in setup. 300s covers the
+            # cold compile with headroom; warm-cache runs are instant.
+            measurement_timeout_seconds=300,
+            setup_timeout_seconds=300,
             ncu_replay_mode="application",
             ncu_metric_set="minimal",
             nsys_nvtx_include=[canonicalize_nvtx_name("optimized_dual_pipeline_multistream")],

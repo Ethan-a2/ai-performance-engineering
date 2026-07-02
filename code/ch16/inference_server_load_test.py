@@ -24,7 +24,7 @@ from core.common.device_utils import resolve_local_rank
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -176,11 +176,10 @@ def run_load_test(
 
     _run_warmup_phase()
 
-    start_time = time.time()
-    next_tick = start_time
+    run_start = time.perf_counter()
 
-    while time.time() - start_time < duration:
-        tick_start = time.time()
+    while time.perf_counter() - run_start < duration:
+        tick_start = time.perf_counter()
 
         # Generate load on rank 0 and broadcast to others
         if rank == 0:
@@ -236,7 +235,7 @@ def run_load_test(
             )
 
         # Maintain target tick rate
-        tick_elapsed = time.time() - tick_start
+        tick_elapsed = time.perf_counter() - tick_start
         sleep_time = interval - tick_elapsed
         if sleep_time > 0:
             time.sleep(sleep_time)
@@ -244,7 +243,7 @@ def run_load_test(
     dist.barrier()
 
     stats = server.scheduler.get_stats()
-    elapsed = time.time() - start_time
+    elapsed = time.perf_counter() - run_start
     return {
         "rank": rank,
         "elapsed": elapsed,
@@ -254,15 +253,31 @@ def run_load_test(
     }
 
 
-def _summarize_samples(values: List[int]) -> Dict[str, float]:
+def _summarize_samples(values: List[int], total: Optional[float] = None) -> Dict[str, float]:
     if not values:
         return {"p50": 0.0, "p95": 0.0, "avg": 0.0}
-    array = np.asarray(values, dtype=np.float64)
+    values.sort()
+    p50, p95 = _percentiles_from_ordered(values, (50.0, 95.0))
     return {
-        "avg": float(array.mean()),
-        "p50": float(np.percentile(array, 50)),
-        "p95": float(np.percentile(array, 95)),
+        "avg": float((sum(values) if total is None else total) / len(values)),
+        "p50": p50,
+        "p95": p95,
     }
+
+
+def _percentile_from_ordered(values: List[float] | List[int], pct: float) -> float:
+    if not values:
+        return 0.0
+    rank = (len(values) - 1) * (pct / 100.0)
+    lower = int(rank)
+    upper = lower if rank == lower else lower + 1
+    if lower == upper:
+        return float(values[lower])
+    return float(values[lower] * (upper - rank) + values[upper] * (rank - lower))
+
+
+def _percentiles_from_ordered(values: List[float] | List[int], pcts: Tuple[float, ...]) -> Tuple[float, ...]:
+    return tuple(_percentile_from_ordered(values, pct) for pct in pcts)
 
 
 def aggregate_results(local_result: Dict) -> Dict:
@@ -274,17 +289,30 @@ def aggregate_results(local_result: Dict) -> Dict:
     rejected_requests = sum(item["stats"]["rejected_requests"] for item in gathered)
     tokens_generated = sum(item["stats"]["total_tokens_generated"] for item in gathered)
     elapsed = max(item["elapsed"] for item in gathered)
-    latencies = [rec["latency_ms"] for item in gathered for rec in item["completions"]]
-    prompt_lengths = [rec["prompt_tokens"] for item in gathered for rec in item["completions"]]
-    generated_lengths = [rec["generated_tokens"] for item in gathered for rec in item["completions"]]
+    latencies: List[float] = []
+    prompt_lengths: List[int] = []
+    generated_lengths: List[int] = []
+    prompt_token_total = 0.0
+    generated_token_total = 0.0
+    for item in gathered:
+        for rec in item["completions"]:
+            latencies.append(rec["latency_ms"])
+            prompt_tokens = rec["prompt_tokens"]
+            generated_tokens = rec["generated_tokens"]
+            prompt_lengths.append(prompt_tokens)
+            generated_lengths.append(generated_tokens)
+            prompt_token_total += prompt_tokens
+            generated_token_total += generated_tokens
 
     throughput = tokens_generated / elapsed if elapsed > 0 else 0.0
-    p50 = float(np.percentile(latencies, 50)) if latencies else 0.0
-    p90 = float(np.percentile(latencies, 90)) if latencies else 0.0
-    p99 = float(np.percentile(latencies, 99)) if latencies else 0.0
+    if latencies:
+        latencies.sort()
+        p50, p90, p99 = _percentiles_from_ordered(latencies, (50.0, 90.0, 99.0))
+    else:
+        p50 = p90 = p99 = 0.0
 
-    prompt_stats = _summarize_samples(prompt_lengths)
-    generated_stats = _summarize_samples(generated_lengths)
+    prompt_stats = _summarize_samples(prompt_lengths, prompt_token_total)
+    generated_stats = _summarize_samples(generated_lengths, generated_token_total)
     world_size = gathered[0]["world_size"] if gathered else 1
 
     return {

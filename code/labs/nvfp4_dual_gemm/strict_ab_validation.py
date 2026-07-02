@@ -11,7 +11,6 @@ import argparse
 import json
 import math
 import os
-import statistics
 import subprocess
 import time
 from pathlib import Path
@@ -29,6 +28,78 @@ def _extract_json_blob(text: str) -> dict[str, Any]:
     if start < 0 or end < start:
         raise RuntimeError("No JSON object found in local_eval output")
     return json.loads(text[start : end + 1])
+
+
+def _summarize_deltas(deltas: list[float]) -> tuple[float, float, float]:
+    count = len(deltas)
+    if count == 0:
+        raise ValueError("Cannot summarize an empty delta set")
+
+    total = 0.0
+    total_squares = 0.0
+    for delta in deltas:
+        total += delta
+        total_squares += delta * delta
+
+    mean = total / count
+    deltas.sort()
+    midpoint = count // 2
+    if count % 2:
+        median = deltas[midpoint]
+    else:
+        median = (deltas[midpoint - 1] + deltas[midpoint]) / 2.0
+
+    if count > 1:
+        variance = max(0.0, (total_squares - (total * total / count)) / (count - 1))
+        stdev = math.sqrt(variance)
+    else:
+        stdev = 0.0
+    return float(mean), float(median), float(stdev)
+
+
+def _summarize_pair_rows(pair_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    deltas: list[float] = []
+    baseline_log_total = 0.0
+    candidate_log_total = 0.0
+    wins_candidate = 0
+    wins_baseline = 0
+
+    for row in pair_rows:
+        baseline_score = float(row["baseline_score_us"])
+        candidate_score = float(row["candidate_score_us"])
+        delta = float(row["delta_candidate_minus_baseline_us"])
+        deltas.append(delta)
+        baseline_log_total += math.log(baseline_score)
+        candidate_log_total += math.log(candidate_score)
+        if delta < 0.0:
+            wins_candidate += 1
+        elif delta > 0.0:
+            wins_baseline += 1
+
+    mean_delta, median_delta, stdev_delta = _summarize_deltas(deltas)
+    pair_count = len(deltas)
+    ties = pair_count - wins_candidate - wins_baseline
+    baseline_geo = float(math.exp(baseline_log_total / pair_count))
+    candidate_geo = float(math.exp(candidate_log_total / pair_count))
+    promote_candidate = bool(
+        mean_delta < 0.0 and wins_candidate > wins_baseline and candidate_geo < baseline_geo
+    )
+
+    return {
+        "pairs": pair_count,
+        "baseline_geomean_us": baseline_geo,
+        "candidate_geomean_us": candidate_geo,
+        "delta_geomean_candidate_minus_baseline_us": candidate_geo - baseline_geo,
+        "delta_mean_candidate_minus_baseline_us": mean_delta,
+        "delta_median_candidate_minus_baseline_us": median_delta,
+        "delta_stdev_candidate_minus_baseline_us": stdev_delta,
+        "wins_candidate": wins_candidate,
+        "wins_baseline": wins_baseline,
+        "ties": ties,
+        "promote_candidate": promote_candidate,
+        "delta_candidate_vs_top598_us": candidate_geo - TOP_SCORE_US_598,
+        "delta_baseline_vs_top598_us": baseline_geo - TOP_SCORE_US_598,
+    }
 
 
 def _run_local_eval(
@@ -75,7 +146,7 @@ def _run_local_eval(
     for allow in isolation_allow_cmd_substring:
         cmd += ["--isolation-allow-cmd-substring", str(allow)]
 
-    t0 = time.time()
+    t0 = time.perf_counter()
     env = os.environ.copy()
     if torch_extensions_dir:
         env["TORCH_EXTENSIONS_DIR"] = str(torch_extensions_dir)
@@ -88,7 +159,7 @@ def _run_local_eval(
         timeout=int(timeout_seconds),
         check=False,
     )
-    elapsed = time.time() - t0
+    elapsed = time.perf_counter() - t0
     if proc.returncode != 0:
         raise RuntimeError(
             f"local_eval failed rc={proc.returncode} for {submission_file}\n"
@@ -179,7 +250,7 @@ def main() -> int:
         "top_score_us_598": TOP_SCORE_US_598,
     }
 
-    start = time.time()
+    start = time.perf_counter()
     try:
         # Global preflight before any timed run.
         report["initial_isolation_preflight"] = ensure_gpu_isolation(
@@ -192,7 +263,7 @@ def main() -> int:
         )
 
         for i in range(1, int(args.pairs) + 1):
-            elapsed_window = time.time() - start
+            elapsed_window = time.perf_counter() - start
             if elapsed_window > float(args.run_window_seconds):
                 raise RuntimeError(
                     f"run window exceeded before pair {i}: "
@@ -281,38 +352,7 @@ def main() -> int:
                 }
             )
 
-        deltas = [r["delta_candidate_minus_baseline_us"] for r in report["pair_rows"]]
-        baseline_scores = [r["baseline_score_us"] for r in report["pair_rows"]]
-        candidate_scores = [r["candidate_score_us"] for r in report["pair_rows"]]
-
-        mean_delta = float(statistics.mean(deltas))
-        median_delta = float(statistics.median(deltas))
-        stdev_delta = float(statistics.stdev(deltas)) if len(deltas) > 1 else 0.0
-        wins_candidate = int(sum(1 for d in deltas if d < 0.0))
-        wins_baseline = int(sum(1 for d in deltas if d > 0.0))
-        ties = int(len(deltas) - wins_candidate - wins_baseline)
-
-        baseline_geo = float(math.exp(sum(math.log(x) for x in baseline_scores) / len(baseline_scores)))
-        candidate_geo = float(math.exp(sum(math.log(x) for x in candidate_scores) / len(candidate_scores)))
-        promote_candidate = bool(
-            mean_delta < 0.0 and wins_candidate > wins_baseline and candidate_geo < baseline_geo
-        )
-
-        report["summary"] = {
-            "pairs": len(deltas),
-            "baseline_geomean_us": baseline_geo,
-            "candidate_geomean_us": candidate_geo,
-            "delta_geomean_candidate_minus_baseline_us": candidate_geo - baseline_geo,
-            "delta_mean_candidate_minus_baseline_us": mean_delta,
-            "delta_median_candidate_minus_baseline_us": median_delta,
-            "delta_stdev_candidate_minus_baseline_us": stdev_delta,
-            "wins_candidate": wins_candidate,
-            "wins_baseline": wins_baseline,
-            "ties": ties,
-            "promote_candidate": promote_candidate,
-            "delta_candidate_vs_top598_us": candidate_geo - TOP_SCORE_US_598,
-            "delta_baseline_vs_top598_us": baseline_geo - TOP_SCORE_US_598,
-        }
+        report["summary"] = _summarize_pair_rows(report["pair_rows"])
         report["status"] = "ok"
     except Exception as exc:  # noqa: BLE001
         report["status"] = "error"
