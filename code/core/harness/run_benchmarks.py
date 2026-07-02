@@ -4593,13 +4593,24 @@ def _merge_benchmark_config(
     merged._sync_execution_mode()
     merged._sync_launch_via()
 
+    cpu_fallback_benchmark = bool(getattr(benchmark_obj, "cpu_fallback_benchmark", False))
+
     # Explicit invariants: benchmarks must not override run-level policy knobs.
     merged.timeout_multiplier = getattr(base_config, "timeout_multiplier", merged.timeout_multiplier)
-    merged.enforce_environment_validation = getattr(
-        base_config,
-        "enforce_environment_validation",
-        merged.enforce_environment_validation,
-    )
+    if cpu_fallback_benchmark:
+        merged.enforce_environment_validation = False
+        merged.device = torch.device("cpu")
+        merged.enable_profiling = False
+        merged.enable_nsys = False
+        merged.enable_ncu = False
+        merged.enable_nvtx = False
+        merged.profile_type = "none"
+    else:
+        merged.enforce_environment_validation = getattr(
+            base_config,
+            "enforce_environment_validation",
+            merged.enforce_environment_validation,
+        )
     merged.allow_virtualization = getattr(
         base_config,
         "allow_virtualization",
@@ -4790,6 +4801,11 @@ def _test_chapter_impl(
             "(allow_portable_expectations_update=True) to enable them."
         )
 
+    requested_examples = {name.strip() for name in (only_examples or []) if name.strip()}
+    cpu_target_possible = not only_cuda and (
+        not requested_examples or "cpu_minimal" in requested_examples
+    )
+
     if single_gpu:
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         if visible:
@@ -4797,10 +4813,24 @@ def _test_chapter_impl(
             os.environ["CUDA_VISIBLE_DEVICES"] = tokens[0] if tokens else "0"
         else:
             os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    dump_environment_and_capabilities()
+    if torch.cuda.is_available() or not cpu_target_possible:
+        dump_environment_and_capabilities()
+    else:
+        logger.warning(
+            "CUDA not available; skipping CUDA hardware capability dump for explicit CPU-only target cpu_minimal."
+        )
 
     chapter_id = chapter_slug(chapter_dir, repo_root)
     chapter_name = chapter_id.replace("/", "_")
+    explicit_cpu_minimal_only = requested_examples == {"cpu_minimal"}
+    if explicit_cpu_minimal_only:
+        enable_profiling = False
+        profile_type = "none"
+        enforce_environment_validation = False
+        logger.info(
+            "Explicit CPU-only target cpu_minimal selected; disabling CUDA profiling "
+            "and strict host gates for that target."
+        )
     emit_event(
         event_logger,
         logger,
@@ -4901,27 +4931,48 @@ def _test_chapter_impl(
         git_commit = None
     execution_environment = detect_execution_environment()
 
+    cpu_fallback_mode = False
     if not torch.cuda.is_available():
+        cpu_target_requested = cpu_target_possible
+        if not cpu_target_requested:
+            emit_event(
+                event_logger,
+                logger,
+                "chapter_skip",
+                chapter=chapter_name,
+                reason="CUDA not available",
+            )
+            return {
+                'chapter': chapter_name,
+                'status': 'skipped',
+                'reason': 'CUDA not available',
+                'benchmarks': [],
+                'summary': {
+                    'total_benchmarks': 0,
+                    'successful': 0,
+                    'failed': 0,
+                    'total_speedup': 0.0,
+                    'average_speedup': 0.0,
+                }
+            }
+        cpu_fallback_mode = True
+        only_examples = ["cpu_minimal"]
+        enable_profiling = False
+        profile_type = "none"
+        enforce_environment_validation = False
+        profiling_output_dir = None
+        logger.warning(
+            "CUDA not available; running explicit CPU-only target cpu_minimal. "
+            "CUDA/GPU targets remain skipped and are not reported as CPU results."
+        )
         emit_event(
             event_logger,
             logger,
-            "chapter_skip",
+            "cpu_fallback_target_selected",
             chapter=chapter_name,
+            target="cpu_minimal",
             reason="CUDA not available",
         )
-        return {
-            'chapter': chapter_name,
-            'status': 'skipped',
-            'reason': 'CUDA not available',
-            'benchmarks': [],
-            'summary': {
-                'total_benchmarks': 0,
-                'successful': 0,
-                'failed': 0,
-                'total_speedup': 0.0,
-                'average_speedup': 0.0,
-            }
-        }
 
     def _reset_parent_execution_state(*, include_gpu_state: bool = False) -> None:
         allow_cuda_context = str(launch_via).strip().lower() == "torchrun"
@@ -4932,12 +4983,18 @@ def _test_chapter_impl(
             reset_gpu_state()
     
     # Clean build directories to prevent stale lock issues (before any GPU operations)
-    logger.info(f"  Cleaning build directories...")
-    clean_build_directories(chapter_dir)
+    if cpu_fallback_mode:
+        logger.info("  CPU fallback mode: skipping CUDA build directory cleanup")
+    else:
+        logger.info(f"  Cleaning build directories...")
+        clean_build_directories(chapter_dir)
     
     # Reset CUDA state at start of chapter (always, to prevent cascading failures)
-    logger.info(f"  Resetting GPU state...")
-    _reset_parent_execution_state(include_gpu_state=True)
+    if cpu_fallback_mode:
+        logger.info("  CPU fallback mode: skipping GPU state reset")
+    else:
+        logger.info(f"  Resetting GPU state...")
+        _reset_parent_execution_state(include_gpu_state=True)
     
     # Ensure PyTorch inductor cache directory exists to prevent C++ compilation errors
     # (This is also done in env_defaults.py, but we ensure it here as well for safety)
@@ -4997,7 +5054,9 @@ def _test_chapter_impl(
     logger.info(f"  Discovering CUDA benchmarks...")
     cuda_build_ok = True
     cuda_build_warning = None
-    if cuda_pairs:
+    if cpu_fallback_mode:
+        cuda_pairs = []
+    elif cuda_pairs:
         logger.info(f"  Found {len(cuda_pairs)} CUDA benchmark pair(s), ensuring executables are built...")
         cuda_build_ok, cuda_build_warning = ensure_cuda_executables_built(chapter_dir)
     

@@ -643,11 +643,6 @@ def _execute_benchmarks(
             ),
         }
 
-    try:
-        dump_environment_and_capabilities()
-    except Exception as exc:
-        logger.error(f"Skipping environment/capabilities dump due to error: {exc}")
-
     if only_cuda and only_python:
         logger.error("Cannot combine --only-cuda and --only-python.")
         sys.exit(1)
@@ -659,6 +654,29 @@ def _execute_benchmarks(
     except (ValueError, FileNotFoundError) as exc:
         logger.error(str(exc))
         sys.exit(1)
+
+    def _cpu_minimal_filter_only() -> bool:
+        if only_cuda or torch.cuda.is_available():
+            return False
+        if not chapter_dirs:
+            return False
+        for chapter_dir in chapter_dirs:
+            chapter_id = chapter_slug(chapter_dir, active_bench_root, bench_root=active_bench_root)
+            example_filter = chapter_filters.get(chapter_id)
+            if example_filter is not None and set(example_filter) != {"cpu_minimal"}:
+                return False
+        return True
+
+    if _cpu_minimal_filter_only():
+        logger.warning(
+            "CUDA not available; skipping CUDA hardware capability dump for CPU-only cpu_minimal run."
+        )
+    else:
+        try:
+            dump_environment_and_capabilities()
+        except Exception as exc:
+            logger.error(f"Skipping environment/capabilities dump due to error: {exc}")
+
     explicit_targets = bool(targets) and not all(
         str(target).strip().lower() == "all" for target in targets
     )

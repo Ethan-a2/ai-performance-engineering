@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 import torch
 
@@ -23,13 +23,10 @@ from core.utils.chapter_compare_template import profile_template
 
 
 def _requested_cpu_minimal() -> bool:
-    for arg in sys.argv[1:]:
-        if "cpu_minimal" in arg.replace(",", " ").split():
-            return True
-    return False
+    return any("cpu_minimal" in arg.replace(",", " ").split() for arg in sys.argv[1:])
 
 
-def profile() -> Dict[str, Any]:
+def profile() -> dict[str, Any]:
     """Compare all baseline/optimized pairs using formal harness."""
     if _requested_cpu_minimal() or not torch.cuda.is_available():
         from ch01.compare_cpu_minimal import profile as cpu_minimal_profile

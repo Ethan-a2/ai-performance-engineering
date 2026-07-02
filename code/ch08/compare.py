@@ -1,21 +1,26 @@
 """Chapter 8: Compare baseline vs optimized implementations using formal harness."""
 
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 # Import arch_config early to set up torch inductor cache directory
 # This prevents C++ compilation errors when torch.compile is used
-try:
+with suppress(ImportError):
     from ch08 import arch_config  # noqa: F401 - triggers cache setup
-except ImportError:
-    pass  # If arch_config not available, continue without it
 
+from core.benchmark.cpu_minimal import should_use_cpu_minimal
 from core.harness.benchmark_harness import BenchmarkConfig
 from core.utils.chapter_compare_template import profile_template
 
 
-def profile() -> Dict[str, Any]:
+def profile() -> dict[str, Any]:
     """Compare all baseline/optimized pairs using formal harness."""
+    if should_use_cpu_minimal():
+        from ch08.compare_cpu_minimal import profile as cpu_minimal_profile
+
+        return cpu_minimal_profile()
+
     chapter_dir = Path(__file__).parent
 
     return profile_template(

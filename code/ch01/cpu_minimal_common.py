@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 from core.benchmark.verification_mixin import VerificationPayloadMixin
@@ -23,12 +21,12 @@ class CpuMinimalBenchmark(VerificationPayloadMixin, BaseBenchmark):
         self.batch_size = 32
         self.input_dim = 64
         self.output_dim = 32
-        self.x: Optional[torch.Tensor] = None
-        self.weight: Optional[torch.Tensor] = None
-        self.bias: Optional[torch.Tensor] = None
-        self.result: Optional[torch.Tensor] = None
-        self._verify_input: Optional[torch.Tensor] = None
-        self._verify_output: Optional[torch.Tensor] = None
+        self.x: torch.Tensor | None = None
+        self.weight: torch.Tensor | None = None
+        self.bias: torch.Tensor | None = None
+        self.result: torch.Tensor | None = None
+        self._verify_input: torch.Tensor | None = None
+        self._verify_output: torch.Tensor | None = None
         ops = self.batch_size * self.input_dim * self.output_dim * 2
         self.register_workload_metadata(custom_units_per_iteration=float(ops), custom_unit_name="ops")
 
@@ -102,7 +100,7 @@ class CpuMinimalBenchmark(VerificationPayloadMixin, BaseBenchmark):
             track_memory_allocations=False,
         )
 
-    def validate_result(self) -> Optional[str]:
+    def validate_result(self) -> str | None:
         if self.result is None:
             return "Output was not produced"
         if self.x is None or self.weight is None or self.bias is None:
