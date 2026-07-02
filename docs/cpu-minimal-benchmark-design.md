@@ -135,7 +135,7 @@ flowchart LR
     H --> I[写入 results / manifest / report]
 
     C -- 否 --> J[原 GPU/Python targets]
-    J --> K[CUDA build、clock/profiler/能力门控保持严格]
+    J --> K["CUDA build、clock/profiler/能力门控保持严格"]
 ```
 
 ## 关键决策依据
@@ -246,7 +246,7 @@ flowchart LR
 
 ```mermaid
 mindmap
-  root((CPU-only Minimal Benchmark))
+  root(("CPU-only Minimal Benchmark"))
     目标
       无 GPU 可运行
       有明显优化效果
