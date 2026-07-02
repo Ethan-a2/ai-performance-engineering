@@ -61,6 +61,26 @@ python -m cli.aisp bench run --targets ch01 --profile minimal
 python -m cli.aisp bench run --targets ch01:gemm --profile deep_dive --single-gpu
 ```
 
+## CPU-Only Minimal Path
+Use this path on machines without CUDA or Typer when you only need a tiny before/after
+example that visibly improves performance on CPU:
+
+```bash
+python -m ch01.compare_cpu_minimal
+python -m ch01.compare --examples cpu_minimal --profile none
+```
+
+When the optional CLI dependencies are installed, the same pair is discoverable as
+`ch01:cpu_minimal`:
+
+```bash
+python -m cli.aisp bench list-targets --chapter ch01
+python -m cli.aisp bench run --targets ch01:cpu_minimal --profile none
+```
+
+The baseline intentionally uses scalar Python loops for a small matrix multiply;
+the optimized version uses the same inputs with `torch.addmm` on CPU.
+
 ## Learning Goals
 - Profile a minimal PyTorch training loop with the shared harness and reason about throughput vs latency.
 - Separate precision wins from batching wins instead of treating all training-loop speedups as one bundle.

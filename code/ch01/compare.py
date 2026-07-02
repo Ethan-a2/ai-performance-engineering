@@ -1,7 +1,10 @@
 """Chapter 1: Performance Basics - Compare baseline vs optimized implementations."""
 
+import sys
 from pathlib import Path
 from typing import Any, Dict
+
+import torch
 
 from core.utils.warning_filters import warn_optional_component_unavailable
 
@@ -19,8 +22,20 @@ from core.harness.benchmark_harness import BenchmarkConfig
 from core.utils.chapter_compare_template import profile_template
 
 
+def _requested_cpu_minimal() -> bool:
+    for arg in sys.argv[1:]:
+        if "cpu_minimal" in arg.replace(",", " ").split():
+            return True
+    return False
+
+
 def profile() -> Dict[str, Any]:
     """Compare all baseline/optimized pairs using formal harness."""
+    if _requested_cpu_minimal() or not torch.cuda.is_available():
+        from ch01.compare_cpu_minimal import profile as cpu_minimal_profile
+
+        return cpu_minimal_profile()
+
     chapter_dir = Path(__file__).parent
 
     return profile_template(
