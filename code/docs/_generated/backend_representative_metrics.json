@@ -1,0 +1,142 @@
+{
+  "ch02": {
+    "cpu": {
+      "rc": 0,
+      "parsed": {
+        "Baseline scalar loop": "1.189 ms",
+        "Optimized addmm": "0.005 ms",
+        "Speedup": "247.95x"
+      },
+      "text": "CH02 CPU minimal comparison\n  Baseline scalar loop: 1.189 ms\n  Optimized addmm:      0.005 ms\n  Speedup:             247.95x\n"
+    },
+    "htp": {
+      "rc": 0,
+      "parsed": {
+        "Scenario": "hvx_tile",
+        "HTP arch": "v81 (DSP reports v81)",
+        "HVX bytes": "128",
+        "Baseline": "12.236673 ms",
+        "Optimized": "2.760814 ms",
+        "Speedup": "4.43x",
+        "Optimized max error": "0"
+      },
+      "text": "CH02 HTP minimal comparison\n  Scenario:              hvx_tile\n  HTP arch:              v81 (DSP reports v81)\n  HVX bytes:             128\n  Baseline:              12.236673 ms\n  Optimized:             2.760814 ms\n  Speedup:               4.43x\n  Optimized max error:   0\n"
+    },
+    "adreno": {
+      "rc": 0,
+      "parsed": {
+        "Scenario": "xmem_gemm",
+        "Baseline": "3.932382 ms",
+        "Optimized": "0.487413 ms",
+        "Speedup": "8.07x",
+        "Optimized max error": "0.00009872"
+      },
+      "text": "CH02 Adreno minimal comparison\n  Scenario:              xmem_gemm\n  Baseline:              3.932382 ms\n  Optimized:             0.487413 ms\n  Speedup:               8.07x\n  Optimized max error:   0.00009872\n"
+    }
+  },
+  "ch05": {
+    "cpu": {
+      "rc": 0,
+      "parsed": {
+        "Baseline scalar loop": "1.197 ms",
+        "Optimized addmm": "0.006 ms",
+        "Speedup": "193.05x"
+      },
+      "text": "CH05 CPU minimal comparison\n  Baseline scalar loop: 1.197 ms\n  Optimized addmm:      0.006 ms\n  Speedup:             193.05x\n"
+    },
+    "htp": {
+      "rc": 0,
+      "parsed": {
+        "Scenario": "copy_vectorized",
+        "HTP arch": "v81 (DSP reports v81)",
+        "HVX bytes": "128",
+        "Baseline": "18.785638 ms",
+        "Optimized": "2.942982 ms",
+        "Speedup": "6.38x",
+        "Optimized max error": "0"
+      },
+      "text": "CH05 HTP minimal comparison\n  Scenario:              copy_vectorized\n  HTP arch:              v81 (DSP reports v81)\n  HVX bytes:             128\n  Baseline:              18.785638 ms\n  Optimized:             2.942982 ms\n  Speedup:               6.38x\n  Optimized max error:   0\n"
+    },
+    "adreno": {
+      "rc": 0,
+      "parsed": {
+        "Scenario": "copy_vectorized",
+        "Baseline": "1.494224 ms",
+        "Optimized": "0.735870 ms",
+        "Speedup": "2.03x",
+        "Optimized max error": "0.00000000"
+      },
+      "text": "CH05 Adreno minimal comparison\n  Scenario:              copy_vectorized\n  Baseline:              1.494224 ms\n  Optimized:             0.735870 ms\n  Speedup:               2.03x\n  Optimized max error:   0.00000000\n"
+    }
+  },
+  "ch13": {
+    "cpu": {
+      "rc": 0,
+      "parsed": {
+        "Baseline scalar loop": "1.165 ms",
+        "Optimized addmm": "0.005 ms",
+        "Speedup": "245.14x"
+      },
+      "text": "CH13 CPU minimal comparison\n  Baseline scalar loop: 1.165 ms\n  Optimized addmm:      0.005 ms\n  Speedup:             245.14x\n"
+    },
+    "htp": {
+      "rc": 0,
+      "parsed": {
+        "Scenario": "kv_block",
+        "HTP arch": "v81 (DSP reports v81)",
+        "HVX bytes": "128",
+        "Baseline": "7.066497 ms",
+        "Optimized": "2.266569 ms",
+        "Speedup": "3.12x",
+        "Optimized max error": "0"
+      },
+      "text": "CH13 HTP minimal comparison\n  Scenario:              kv_block\n  HTP arch:              v81 (DSP reports v81)\n  HVX bytes:             128\n  Baseline:              7.066497 ms\n  Optimized:             2.266569 ms\n  Speedup:               3.12x\n  Optimized max error:   0\n"
+    },
+    "adreno": {
+      "rc": 0,
+      "parsed": {
+        "Scenario": "kv_block",
+        "Baseline": "4.272861 ms",
+        "Optimized": "0.131790 ms",
+        "Speedup": "32.42x",
+        "Optimized max error": "0.00000000"
+      },
+      "text": "CH13 Adreno minimal comparison\n  Scenario:              kv_block\n  Baseline:              4.272861 ms\n  Optimized:             0.131790 ms\n  Speedup:               32.42x\n  Optimized max error:   0.00000000\n"
+    }
+  },
+  "ch20": {
+    "cpu": {
+      "rc": 0,
+      "parsed": {
+        "Baseline scalar loop": "1.176 ms",
+        "Optimized addmm": "0.005 ms",
+        "Speedup": "230.04x"
+      },
+      "text": "CH20 CPU minimal comparison\n  Baseline scalar loop: 1.176 ms\n  Optimized addmm:      0.005 ms\n  Speedup:             230.04x\n"
+    },
+    "htp": {
+      "rc": 0,
+      "parsed": {
+        "Scenario": "pipeline_fusion",
+        "HTP arch": "v81 (DSP reports v81)",
+        "HVX bytes": "128",
+        "Baseline": "16.033971 ms",
+        "Optimized": "2.568398 ms",
+        "Speedup": "6.24x",
+        "Optimized max error": "0"
+      },
+      "text": "CH20 HTP minimal comparison\n  Scenario:              pipeline_fusion\n  HTP arch:              v81 (DSP reports v81)\n  HVX bytes:             128\n  Baseline:              16.033971 ms\n  Optimized:             2.568398 ms\n  Speedup:               6.24x\n  Optimized max error:   0\n"
+    },
+    "adreno": {
+      "rc": 0,
+      "parsed": {
+        "Scenario": "pipeline_fusion",
+        "Baseline": "0.407622 ms",
+        "Optimized": "0.255790 ms",
+        "Speedup": "1.59x",
+        "Optimized max error": "0.00000000"
+      },
+      "text": "CH20 Adreno minimal comparison\n  Scenario:              pipeline_fusion\n  Baseline:              0.407622 ms\n  Optimized:             0.255790 ms\n  Speedup:               1.59x\n  Optimized max error:   0.00000000\n"
+    }
+  }
+}

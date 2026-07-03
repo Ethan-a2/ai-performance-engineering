@@ -26,6 +26,7 @@ class AdrenoScenario:
 
 
 CHAPTER_SCENARIOS: dict[str, AdrenoScenario] = {
+    "ch01": AdrenoScenario("xmem_gemm", "Adreno xmem GEMM mirrors the minimal hardware-aware matmul quick start"),
     "ch02": AdrenoScenario("xmem_gemm", "Adreno xmem GEMM mirrors tuned cuBLAS-style hardware-aware matmul"),
     "ch03": AdrenoScenario("xmem_gemm", "larger GEMM highlights runtime launch and provisioning overhead"),
     "ch04": AdrenoScenario("pipeline_fusion", "fused device-side work mirrors communication/gradient fusion"),
