@@ -81,6 +81,19 @@ python -m cli.aisp bench run --targets ch01:cpu_minimal --profile none
 The baseline intentionally uses scalar Python loops for a small matrix multiply;
 the optimized version uses the same inputs with `torch.addmm` on CPU.
 
+## Adreno OpenCL Minimal Path
+Use this path on an Android device with an Adreno OpenCL stack when you want a
+tiny baseline vs optimized GEMM comparison using the same xmem kernel style as
+the local llama.cpp OpenCL backend:
+
+```bash
+ANDROID_NDK=/opt/Android/Ndk/android-ndk-r28c python -m ch01.compare_adreno_xmem_minimal
+```
+
+The baseline uses a naive OpenCL GEMM. The optimized path reuses llama.cpp's
+Adreno xmem F16xF32 GEMM kernel source and runs the same pack/prepack/compute/store
+sequence as the backend path.
+
 ## Learning Goals
 - Profile a minimal PyTorch training loop with the shared harness and reason about throughput vs latency.
 - Separate precision wins from batching wins instead of treating all training-loop speedups as one bundle.
