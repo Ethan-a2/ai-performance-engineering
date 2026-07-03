@@ -1,0 +1,12 @@
+#ifndef AISP_HTP_MINIMAL_IDL
+#define AISP_HTP_MINIMAL_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface aisp_htp_minimal : remote_handle64 {
+    AEEResult hwinfo(rout uint32 n_threads, rout uint32 hvx_bytes, rout uint32 arch);
+    AEEResult run(in uint32 scenario, in uint32 mode, in uint32 elements, in uint32 repeats, rout uint64 checksum);
+};
+
+#endif
