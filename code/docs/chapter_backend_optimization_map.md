@@ -87,6 +87,39 @@ mindmap
 | CH20 | HTP | pipeline_fusion | 16.033971 ms | 2.568398 ms | 6.24x | 0 |
 | CH20 | Adreno | pipeline_fusion | 0.407622 ms | 0.255790 ms | 1.59x | 0.00000000 |
 
+## 远端 RTX 2060 GPU minimal 实测
+按用户给出的远端流程运行：`ssh mi && cd /opt/prj/ai-performance-engineering/code && source /opt/perf/bin/activate`。远端 GPU 为 `NVIDIA GeForce RTX 2060`，`torch 2.12.1+cu129`。这些数据是直接 PyTorch CUDA minimal 微基准，未锁频，属于非 canonical/教学对照数据；canonical GPU 指标仍以各章 README 表为准。
+
+| GPU minimal 场景 | 类比优化项 | Baseline | Optimized | Speedup | Max Error |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `torch_gemm` | looped small GEMMs → single batched matmul | 3.255376 ms | 0.031653 ms | 102.85x | 0 |
+| `pipeline_fusion` | three separate tensor ops → one vectorized expression | 0.343945 ms | 0.328471 ms | 1.05x | 0 |
+| `copy_vectorized` | chunked copy loop → single bulk device copy | 29.861829 ms | 0.136016 ms | 219.55x | 0 |
+| `kv_block` | per-token KV row update → block vectorized update | 1.640995 ms | 0.056059 ms | 29.27x | 0 |
+
+| 章节 | GPU minimal 场景 | Remote RTX 2060 speedup |
+| --- | --- | ---: |
+| CH01 | `torch_gemm` | 102.85x |
+| CH02 | `torch_gemm` | 102.85x |
+| CH03 | `torch_gemm` | 102.85x |
+| CH04 | `pipeline_fusion` | 1.05x |
+| CH05 | `copy_vectorized` | 219.55x |
+| CH06 | `pipeline_fusion` | 1.05x |
+| CH07 | `copy_vectorized` | 219.55x |
+| CH08 | `pipeline_fusion` | 1.05x |
+| CH09 | `pipeline_fusion` | 1.05x |
+| CH10 | `torch_gemm` | 102.85x |
+| CH11 | `kv_block` | 29.27x |
+| CH12 | `kv_block` | 29.27x |
+| CH13 | `kv_block` | 29.27x |
+| CH14 | `torch_gemm` | 102.85x |
+| CH15 | `kv_block` | 29.27x |
+| CH16 | `torch_gemm` | 102.85x |
+| CH17 | `kv_block` | 29.27x |
+| CH18 | `kv_block` | 29.27x |
+| CH19 | `copy_vectorized` | 219.55x |
+| CH20 | `pipeline_fusion` | 1.05x |
+
 ## 全章节优化点与后端 minimal 指标
 - **GPU canonical 列**：来自各章 README 的原始章节优化主线。
 - **HTP/Adreno/CPU 列**：本次 minimal runner 的全章节 smoke 指标，统一低迭代参数用于覆盖入口和正确性，不用于发布级性能结论。
@@ -234,9 +267,16 @@ ANDROID_NDK=/opt/Android/Ndk/android-ndk-r28c python ch02/compare_htp_minimal.py
 # Adreno OpenCL minimal
 ANDROID_NDK=/opt/Android/Ndk/android-ndk-r28c python ch02/compare_adreno_minimal.py
 
+# 远端 RTX 2060 GPU minimal，本次通过 ssh mi 运行
+ssh mi
+cd /opt/prj/ai-performance-engineering/code
+source /opt/perf/bin/activate
+python docs/_generated/collect_gpu_minimal.py
+
 # 全章节 smoke 指标已保存
 cat docs/_generated/backend_minimal_metrics.json
 cat docs/_generated/backend_representative_metrics.json
+cat docs/_generated/gpu_minimal_rtx2060_metrics.json
 ```
 
 ## 本次采集证据
@@ -244,4 +284,5 @@ cat docs/_generated/backend_representative_metrics.json
 - CPU 全章节 minimal：`ch01`–`ch20` 均完成，典型 `ch02` 为 `1.189 ms → 0.005 ms, 247.95x`。
 - HTP 真机：设备报告 `v81`、`HVX bytes=128`；代表默认指标见上表，所有 checked 场景 `Optimized max error=0`。
 - Adreno 真机：代表默认指标见上表，`xmem_gemm` 误差约 `9.872e-5`，copy/KV/fusion 为 0。
+- 远端 GPU：`ssh mi` 上的 `NVIDIA GeForce RTX 2060` 完成四类 GPU minimal 场景，结果保存到 `docs/_generated/gpu_minimal_rtx2060_metrics.json`；该主机未锁频，作为 portable/教学对照而非 canonical 发布数据。
 - 原 GPU 指标：来自每章 README 的 measured delta 表，代表原章节主线。
