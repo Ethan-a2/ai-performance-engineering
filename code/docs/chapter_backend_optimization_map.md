@@ -2,7 +2,7 @@
 
 > 生成日期：2026-07-03  
 > 位置：`docs/chapter_backend_optimization_map.md`  
-> 说明：GPU 指标来自各章 `README.md` 的 canonical/representative measured delta；HTP、Adreno、CPU 指标来自本机/真机 minimal runner。不同后端的 minimal workload 用来说明“同类优化思想如何落到不同硬件”，不是与原 GPU 章节目标逐项同 workload 对打。
+> 说明：GPU canonical 指标来自各章 `README.md` 的 canonical/representative measured delta；RTX 2060 GPU minimal、HTP、Adreno、CPU 指标来自标准 minimal runner。不同后端的 minimal workload 用来说明“同类优化思想如何落到不同硬件”，不是与原 GPU 章节目标逐项同 workload 对打。
 
 ## 关键词科普
 - **第一性原理**：性能 = 有效工作量 /（计算瓶颈、访存瓶颈、同步瓶颈、调度瓶颈中最大的那个）。优化不是“换一个快 API”，而是先证明瓶颈在哪里。
@@ -65,12 +65,13 @@ mindmap
 | 后端 | 本工程实现 | 主要优化手段 | 最适合 | 常见失败模式 | 指标解读 |
 | --- | --- | --- | --- | --- | --- |
 | GPU/CUDA | 各章 `baseline_*` / `optimized_*`、CUDA/Triton/PyTorch | Tensor Core、shared memory、TMA、fusion、graphs、NCCL、KV cache | 大吞吐训练/推理、服务端 | launch 多、访存乱、同步多、shape 不合适 | 看 canonical README 指标，代表原章节主线 |
+| GPU/CUDA minimal | `core/benchmark/gpu_minimal.py` + `chXX/compare_gpu_minimal.py`，`compare.py` 在 `sm_75` 及以下默认转入 | batched GEMM、PyTorch CUDA fusion、bulk copy、block KV | RTX 2060/Turing 等不能跑 Blackwell 专项代码的教学 GPU | 未锁频/非 canonical 环境、PyTorch 表达未必真融合 | 标准 2060 可运行入口，验证同类思想在 CUDA 老卡上可跑 |
 | Adreno/OpenCL | `core/benchmark/adreno_minimal.py` + OpenCL C++ | xmem GEMM、float4 copy、kernel fusion、block KV | Android 移动 GPU | OpenCL 编译差异、workgroup 不匹配、带宽瓶颈 | 真机 minimal，可验证同类思想在 Adreno 上可跑 |
 | HTP/Hexagon | `core/benchmark/htp_minimal.py` + FastRPC/IDL/skel | HVX vector add/copy、block KV、per-arch skel、power vote | 低功耗端侧固定流水 | FastRPC 固定成本、skel/签名/arch 不匹配、动态 shape 不友好 | 真机 minimal，验证 CDSP/HVX 路径和优化方向 |
 | CPU | `core/benchmark/cpu_minimal.py` | scalar loop → `torch.addmm`/BLAS | 正确性锚点、小规模 fallback | 把 CPU speedup 误读成端侧/GPU speedup | 适合教学和验证，不代表大模型最终吞吐 |
 
 ## 代表场景默认规模指标
-这些是默认参数的代表场景，不是低迭代 smoke；CPU 在 `/opt/perf` 环境，HTP/Adreno 在连接设备上运行。
+这些是默认参数的代表场景，不是低迭代 smoke；CPU 在 `/opt/perf` 环境，RTX 2060 GPU minimal 在远端 `ssh mi` 运行，HTP/Adreno 在连接设备上运行。
 
 | 章节 | 后端 | 场景 | Baseline | Optimized | Speedup | Correctness |
 | --- | --- | --- | ---: | ---: | ---: | --- |
@@ -88,37 +89,37 @@ mindmap
 | CH20 | Adreno | pipeline_fusion | 0.407622 ms | 0.255790 ms | 1.59x | 0.00000000 |
 
 ## 远端 RTX 2060 GPU minimal 实测
-按用户给出的远端流程运行：`ssh mi && cd /opt/prj/ai-performance-engineering/code && source /opt/perf/bin/activate`。远端 GPU 为 `NVIDIA GeForce RTX 2060`，`torch 2.12.1+cu129`。这些数据是直接 PyTorch CUDA minimal 微基准，未锁频，属于非 canonical/教学对照数据；canonical GPU 指标仍以各章 README 表为准。
+按用户给出的远端流程运行：`ssh mi && cd /opt/prj/ai-performance-engineering/code && source /opt/perf/bin/activate`。远端 GPU 为 `NVIDIA GeForce RTX 2060`，`torch 2.12.1+cu129`。这些数据来自标准 `core/benchmark/gpu_minimal.py` / `chXX/compare_gpu_minimal.py` PyTorch CUDA minimal 微基准，未锁频，属于非 canonical/教学对照数据；canonical GPU 指标仍以各章 README 表为准。
 
 | GPU minimal 场景 | 类比优化项 | Baseline | Optimized | Speedup | Max Error |
 | --- | --- | ---: | ---: | ---: | ---: |
-| `torch_gemm` | looped small GEMMs → single batched matmul | 3.255376 ms | 0.031653 ms | 102.85x | 0 |
-| `pipeline_fusion` | three separate tensor ops → one vectorized expression | 0.343945 ms | 0.328471 ms | 1.05x | 0 |
-| `copy_vectorized` | chunked copy loop → single bulk device copy | 29.861829 ms | 0.136016 ms | 219.55x | 0 |
-| `kv_block` | per-token KV row update → block vectorized update | 1.640995 ms | 0.056059 ms | 29.27x | 0 |
+| `torch_gemm` | looped small GEMMs → single batched matmul | 2.036330 ms | 0.029781 ms | 68.38x | 0 |
+| `pipeline_fusion` | three separate tensor ops → one vectorized expression | 0.098804 ms | 0.100959 ms | 0.98x | 0 |
+| `copy_vectorized` | chunked copy loop → single bulk device copy | 10.845355 ms | 0.120022 ms | 90.36x | 0 |
+| `kv_block` | per-token KV row update → block vectorized update | 1.240781 ms | 0.028814 ms | 43.06x | 0 |
 
 | 章节 | GPU minimal 场景 | Remote RTX 2060 speedup |
 | --- | --- | ---: |
-| CH01 | `torch_gemm` | 102.85x |
-| CH02 | `torch_gemm` | 102.85x |
-| CH03 | `torch_gemm` | 102.85x |
-| CH04 | `pipeline_fusion` | 1.05x |
-| CH05 | `copy_vectorized` | 219.55x |
-| CH06 | `pipeline_fusion` | 1.05x |
-| CH07 | `copy_vectorized` | 219.55x |
-| CH08 | `pipeline_fusion` | 1.05x |
-| CH09 | `pipeline_fusion` | 1.05x |
-| CH10 | `torch_gemm` | 102.85x |
-| CH11 | `kv_block` | 29.27x |
-| CH12 | `kv_block` | 29.27x |
-| CH13 | `kv_block` | 29.27x |
-| CH14 | `torch_gemm` | 102.85x |
-| CH15 | `kv_block` | 29.27x |
-| CH16 | `torch_gemm` | 102.85x |
-| CH17 | `kv_block` | 29.27x |
-| CH18 | `kv_block` | 29.27x |
-| CH19 | `copy_vectorized` | 219.55x |
-| CH20 | `pipeline_fusion` | 1.05x |
+| CH01 | `torch_gemm` | 68.38x |
+| CH02 | `torch_gemm` | 67.12x |
+| CH03 | `torch_gemm` | 67.23x |
+| CH04 | `pipeline_fusion` | 0.98x |
+| CH05 | `copy_vectorized` | 90.36x |
+| CH06 | `pipeline_fusion` | 1.01x |
+| CH07 | `copy_vectorized` | 87.84x |
+| CH08 | `pipeline_fusion` | 1.02x |
+| CH09 | `pipeline_fusion` | 0.98x |
+| CH10 | `torch_gemm` | 69.26x |
+| CH11 | `kv_block` | 43.06x |
+| CH12 | `kv_block` | 41.60x |
+| CH13 | `kv_block` | 37.12x |
+| CH14 | `torch_gemm` | 68.86x |
+| CH15 | `kv_block` | 41.86x |
+| CH16 | `torch_gemm` | 68.62x |
+| CH17 | `kv_block` | 42.28x |
+| CH18 | `kv_block` | 41.10x |
+| CH19 | `copy_vectorized` | 89.42x |
+| CH20 | `pipeline_fusion` | 1.03x |
 
 ## 全章节优化点与后端 minimal 指标
 - **GPU canonical 列**：来自各章 README 的原始章节优化主线。
@@ -148,28 +149,28 @@ mindmap
 | CH20 | staged pipeline, memory, and KV-cache optimizations combined into one workload; the same harness contract as every other chapter, so the end-to-end gains stay comparable to the lower-level chapters | integrated_kv_cache: 7.07x<br>bf16_mlp: 2.63x | pipeline_fusion / 1.18x | pipeline_fusion / 1.63x | CPU scalar→addmm / 239.64x |
 
 ## 全章节 minimal speedup 快表
-| 章节 | CPU scalar→addmm | HTP smoke | Adreno smoke |
-| --- | ---: | ---: | ---: |
-| CH01 | 41128.39x | 1.13x | 3.61x |
-| CH02 | 230.55x | 1.15x | 3.03x |
-| CH03 | 246.06x | 1.09x | 3.18x |
-| CH04 | 244.80x | 1.05x | 1.34x |
-| CH05 | 240.46x | 1.05x | 2.03x |
-| CH06 | 254.84x | 1.15x | 1.37x |
-| CH07 | 248.70x | 1.32x | 1.85x |
-| CH08 | 241.73x | 1.19x | 1.49x |
-| CH09 | 238.92x | 1.22x | 1.29x |
-| CH10 | 248.80x | 1.13x | 3.35x |
-| CH11 | 244.87x | 1.21x | 8.75x |
-| CH12 | 243.44x | 1.27x | 11.13x |
-| CH13 | 209.71x | 1.58x | 17.53x |
-| CH14 | 251.08x | 1.12x | 3.20x |
-| CH15 | 240.25x | 1.34x | 11.40x |
-| CH16 | 249.91x | 1.27x | 3.24x |
-| CH17 | 250.98x | 1.37x | 17.01x |
-| CH18 | 246.03x | 1.12x | 16.84x |
-| CH19 | 240.87x | 1.05x | 1.76x |
-| CH20 | 239.64x | 1.18x | 1.63x |
+| 章节 | CPU scalar→addmm | RTX 2060 GPU minimal | HTP smoke | Adreno smoke |
+| --- | ---: | ---: | ---: | ---: |
+| CH01 | 41128.39x | 68.38x | 1.13x | 3.61x |
+| CH02 | 230.55x | 67.12x | 1.15x | 3.03x |
+| CH03 | 246.06x | 67.23x | 1.09x | 3.18x |
+| CH04 | 244.80x | 0.98x | 1.05x | 1.34x |
+| CH05 | 240.46x | 90.36x | 1.05x | 2.03x |
+| CH06 | 254.84x | 1.01x | 1.15x | 1.37x |
+| CH07 | 248.70x | 87.84x | 1.32x | 1.85x |
+| CH08 | 241.73x | 1.02x | 1.19x | 1.49x |
+| CH09 | 238.92x | 0.98x | 1.22x | 1.29x |
+| CH10 | 248.80x | 69.26x | 1.13x | 3.35x |
+| CH11 | 244.87x | 43.06x | 1.21x | 8.75x |
+| CH12 | 243.44x | 41.60x | 1.27x | 11.13x |
+| CH13 | 209.71x | 37.12x | 1.58x | 17.53x |
+| CH14 | 251.08x | 68.86x | 1.12x | 3.20x |
+| CH15 | 240.25x | 41.86x | 1.34x | 11.40x |
+| CH16 | 249.91x | 68.62x | 1.27x | 3.24x |
+| CH17 | 250.98x | 42.28x | 1.37x | 17.01x |
+| CH18 | 246.03x | 41.10x | 1.12x | 16.84x |
+| CH19 | 240.87x | 89.42x | 1.05x | 1.76x |
+| CH20 | 239.64x | 1.03x | 1.18x | 1.63x |
 
 ## 解决痛点
 | 痛点 | GPU 解法 | Adreno 解法 | HTP 解法 | CPU 解法 |
@@ -261,6 +262,12 @@ cd /media/code/tools/ai-performance-engineering/code
 # CPU minimal
 python ch02/compare_cpu_minimal.py
 
+# RTX 2060 / Turing CUDA minimal：可直接跑标准章节入口
+python ch02/compare_gpu_minimal.py
+
+# 在 sm_75 及以下 GPU 上，默认 compare.py 会自动转入 gpu_minimal
+python ch02/compare.py
+
 # HTP minimal，构建 Android host + v73/v75/v79/v81 skel 后 adb 运行
 ANDROID_NDK=/opt/Android/Ndk/android-ndk-r28c python ch02/compare_htp_minimal.py
 
@@ -271,6 +278,7 @@ ANDROID_NDK=/opt/Android/Ndk/android-ndk-r28c python ch02/compare_adreno_minimal
 ssh mi
 cd /opt/prj/ai-performance-engineering/code
 source /opt/perf/bin/activate
+python ch02/compare_gpu_minimal.py
 python docs/_generated/collect_gpu_minimal.py
 
 # 全章节 smoke 指标已保存
@@ -284,5 +292,5 @@ cat docs/_generated/gpu_minimal_rtx2060_metrics.json
 - CPU 全章节 minimal：`ch01`–`ch20` 均完成，典型 `ch02` 为 `1.189 ms → 0.005 ms, 247.95x`。
 - HTP 真机：设备报告 `v81`、`HVX bytes=128`；代表默认指标见上表，所有 checked 场景 `Optimized max error=0`。
 - Adreno 真机：代表默认指标见上表，`xmem_gemm` 误差约 `9.872e-5`，copy/KV/fusion 为 0。
-- 远端 GPU：`ssh mi` 上的 `NVIDIA GeForce RTX 2060` 完成四类 GPU minimal 场景，结果保存到 `docs/_generated/gpu_minimal_rtx2060_metrics.json`；该主机未锁频，作为 portable/教学对照而非 canonical 发布数据。
+- 远端 GPU：`ssh mi` 上的 `NVIDIA GeForce RTX 2060` 通过标准 `gpu_minimal` 入口完成四类场景，结果保存到 `docs/_generated/gpu_minimal_rtx2060_metrics.json`；该主机未锁频，作为 portable/教学对照而非 canonical 发布数据。
 - 原 GPU 指标：来自每章 README 的 measured delta 表，代表原章节主线。

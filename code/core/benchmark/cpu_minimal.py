@@ -176,8 +176,25 @@ def requested_htp_minimal(argv: Sequence[str] | None = None) -> bool:
     return False
 
 
+def requested_gpu_minimal(argv: Sequence[str] | None = None) -> bool:
+    for arg in list(sys.argv[1:] if argv is None else argv):
+        if "gpu_minimal" in str(arg).replace(",", " ").split():
+            return True
+    return False
+
+
+def requested_adreno_minimal(argv: Sequence[str] | None = None) -> bool:
+    for arg in list(sys.argv[1:] if argv is None else argv):
+        if "adreno_minimal" in str(arg).replace(",", " ").split():
+            return True
+    return False
+
+
 def should_use_cpu_minimal(argv: Sequence[str] | None = None) -> bool:
-    return requested_cpu_minimal(argv) or (not requested_htp_minimal(argv) and not torch.cuda.is_available())
+    requested_other_minimal = (
+        requested_htp_minimal(argv) or requested_gpu_minimal(argv) or requested_adreno_minimal(argv)
+    )
+    return requested_cpu_minimal(argv) or (not requested_other_minimal and not torch.cuda.is_available())
 
 
 def _time_benchmark(

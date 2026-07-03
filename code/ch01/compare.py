@@ -1,9 +1,16 @@
 """Chapter 1: Performance Basics - Compare baseline vs optimized implementations."""
 
+import sys
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
 from core.benchmark.cpu_minimal import should_use_cpu_minimal
+from core.benchmark.gpu_minimal import should_use_gpu_minimal
 from core.utils.warning_filters import warn_optional_component_unavailable
 
 try:
@@ -26,6 +33,10 @@ def profile() -> dict[str, Any]:
         from ch01.compare_cpu_minimal import profile as cpu_minimal_profile
 
         return cpu_minimal_profile()
+    if should_use_gpu_minimal():
+        from ch01.compare_gpu_minimal import profile as gpu_minimal_profile
+
+        return gpu_minimal_profile()
 
     chapter_dir = Path(__file__).parent
 
