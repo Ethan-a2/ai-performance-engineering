@@ -1,4 +1,4 @@
-"""Tiny Adreno OpenCL xmem comparison path for Chapter 1."""
+"""Tiny Adreno OpenCL comparison path for CH05."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from core.benchmark.adreno_minimal import print_adreno_minimal_result, run_adren
 
 
 def profile() -> dict:
-    """Run the minimal Adreno xmem comparison and return machine-readable metrics."""
-    return run_adreno_minimal_profile("ch01")
+    """Run the minimal Adreno comparison and return machine-readable metrics."""
+    return run_adreno_minimal_profile("ch05")
 
 
 if __name__ == "__main__":
