@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import torch
 
@@ -74,6 +74,22 @@ def _coerce_metric_value(value: object) -> Optional[float | str]:
         return float(value)
     except (TypeError, ValueError):
         return str(value)
+
+
+def _is_nvml_not_supported(exc: BaseException) -> bool:
+    if pynvml is None:
+        return False
+    not_supported = getattr(pynvml, "NVMLError_NotSupported", None)
+    return bool(not_supported is not None and isinstance(exc, not_supported))
+
+
+def _optional_nvml_float(fn: Callable[..., object], *args: object) -> Optional[float]:
+    try:
+        return float(fn(*args))
+    except Exception as exc:
+        if _is_nvml_not_supported(exc):
+            return None
+        raise
 
 
 def query_gpu_telemetry(
@@ -155,16 +171,20 @@ def _query_via_nvml(logical_index: int) -> Dict[str, Optional[float]]:
     temp_gpu = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)  # type: ignore[attr-defined]
     temp_mem: Optional[float] = None
     if hasattr(pynvml, "NVML_TEMPERATURE_MEMORY"):
-        temp_mem = float(
-            pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_MEMORY)  # type: ignore[attr-defined]
+        temp_mem = _optional_nvml_float(
+            pynvml.nvmlDeviceGetTemperature, handle, pynvml.NVML_TEMPERATURE_MEMORY  # type: ignore[attr-defined]
         )
 
     power_draw_mw = pynvml.nvmlDeviceGetPowerUsage(handle)  # type: ignore[attr-defined]
     utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)  # type: ignore[attr-defined]
     graphics_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)  # type: ignore[attr-defined]
     memory_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)  # type: ignore[attr-defined]
-    app_graphics_clock = pynvml.nvmlDeviceGetApplicationsClock(handle, pynvml.NVML_CLOCK_SM)  # type: ignore[attr-defined]
-    app_memory_clock = pynvml.nvmlDeviceGetApplicationsClock(handle, pynvml.NVML_CLOCK_MEM)  # type: ignore[attr-defined]
+    app_graphics_clock = _optional_nvml_float(
+        pynvml.nvmlDeviceGetApplicationsClock, handle, pynvml.NVML_CLOCK_SM  # type: ignore[attr-defined]
+    )
+    app_memory_clock = _optional_nvml_float(
+        pynvml.nvmlDeviceGetApplicationsClock, handle, pynvml.NVML_CLOCK_MEM  # type: ignore[attr-defined]
+    )
 
     metrics: Dict[str, Optional[float]] = {
         "temperature_gpu_c": float(temp_gpu),
@@ -175,8 +195,8 @@ def _query_via_nvml(logical_index: int) -> Dict[str, Optional[float]]:
         "utilization_memory_pct": float(utilization.memory),  # type: ignore[attr-defined]
         "graphics_clock_mhz": float(graphics_clock),
         "memory_clock_mhz": float(memory_clock),
-        "applications_clock_sm_mhz": float(app_graphics_clock),
-        "applications_clock_memory_mhz": float(app_memory_clock),
+        "applications_clock_sm_mhz": app_graphics_clock,
+        "applications_clock_memory_mhz": app_memory_clock,
         # NVLink counters/utilization are not universally supported; keep keys but do not query here.
         "nvlink_tx_gbps": None,
         "nvlink_rx_gbps": None,
@@ -191,14 +211,18 @@ def _query_via_nvml(logical_index: int) -> Dict[str, Optional[float]]:
         "retired_pages_dbe": None,
     }
 
-    # PCIe metrics (supported on modern datacenter GPUs; fail-fast on NVML errors).
-    pcie_tx = pynvml.nvmlDeviceGetPcieThroughput(handle, pynvml.NVML_PCIE_UTIL_TX_BYTES)  # type: ignore[attr-defined]
-    pcie_rx = pynvml.nvmlDeviceGetPcieThroughput(handle, pynvml.NVML_PCIE_UTIL_RX_BYTES)  # type: ignore[attr-defined]
-    metrics["pcie_tx_bytes"] = float(pcie_tx) * 1024.0  # KB/s to bytes/s
-    metrics["pcie_rx_bytes"] = float(pcie_rx) * 1024.0
-    metrics["pcie_replay_counter"] = float(pynvml.nvmlDeviceGetPcieReplayCounter(handle))  # type: ignore[attr-defined]
-    metrics["pcie_generation"] = float(pynvml.nvmlDeviceGetCurrPcieLinkGeneration(handle))  # type: ignore[attr-defined]
-    metrics["pcie_link_width"] = float(pynvml.nvmlDeviceGetCurrPcieLinkWidth(handle))  # type: ignore[attr-defined]
+    # Optional PCIe/application-clock APIs are not universal on consumer GPUs such as RTX 2060.
+    pcie_tx = _optional_nvml_float(
+        pynvml.nvmlDeviceGetPcieThroughput, handle, pynvml.NVML_PCIE_UTIL_TX_BYTES  # type: ignore[attr-defined]
+    )
+    pcie_rx = _optional_nvml_float(
+        pynvml.nvmlDeviceGetPcieThroughput, handle, pynvml.NVML_PCIE_UTIL_RX_BYTES  # type: ignore[attr-defined]
+    )
+    metrics["pcie_tx_bytes"] = pcie_tx * 1024.0 if pcie_tx is not None else None
+    metrics["pcie_rx_bytes"] = pcie_rx * 1024.0 if pcie_rx is not None else None
+    metrics["pcie_replay_counter"] = _optional_nvml_float(pynvml.nvmlDeviceGetPcieReplayCounter, handle)  # type: ignore[attr-defined]
+    metrics["pcie_generation"] = _optional_nvml_float(pynvml.nvmlDeviceGetCurrPcieLinkGeneration, handle)  # type: ignore[attr-defined]
+    metrics["pcie_link_width"] = _optional_nvml_float(pynvml.nvmlDeviceGetCurrPcieLinkWidth, handle)  # type: ignore[attr-defined]
 
     # Performance state + throttle reasons.
     metrics["performance_state"] = float(pynvml.nvmlDeviceGetPerformanceState(handle))  # type: ignore[attr-defined]
