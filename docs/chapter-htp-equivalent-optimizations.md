@@ -89,7 +89,7 @@ cmake --install build-snapdragon --prefix pkg-snapdragon/llama.cpp
 ### 运行
 
 ```bash
-M=functiongemma-270m-it-BF16.gguf D=HTP0 \
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 \
   ./scripts/snapdragon/adb/run-completion.sh \
   -p "what is the most popular cookie in the world?" --verbose
 ```
@@ -151,7 +151,7 @@ AISP_HTP_N_PREDICT=4 \
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `AISP_HTP_LLAMA_CPP_ROOT` | `/media/code/llm/llama/llama.cpp` | llama.cpp checkout 位置 |
-| `AISP_HTP_MODEL` | `functiongemma-270m-it-BF16.gguf` | 设备端 `/data/local/tmp/gguf/` 下模型名 |
+| `AISP_HTP_MODEL` | `smollm2-360m-instruct-q4_k_m.gguf` | 设备端 `/data/local/tmp/gguf/` 下模型名 |
 | `AISP_HTP_DEVICE` | `HTP0` | llama.cpp `--device` |
 | `AISP_HTP_PROMPT` | `what is the most popular cookie in the world?` | completion prompt |
 | `AISP_HTP_N_PREDICT` | `16` | 生成 token 数；smoke 建议 `4`，正式对比建议更大 |
@@ -214,15 +214,15 @@ AISP_HTP_N_PREDICT=4 \
 
 ```bash
 # CPU/HTP 总体对照
-M=functiongemma-270m-it-BF16.gguf D=HTP0 V=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 V=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
 
 # HMX 消融：HMX off vs on
-M=functiongemma-270m-it-BF16.gguf D=HTP0 HMX=0 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
-M=functiongemma-270m-it-BF16.gguf D=HTP0 HMX=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 HMX=0 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 HMX=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
 
 # Fusion 消融
-M=functiongemma-270m-it-BF16.gguf D=HTP0 OC=0 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
-M=functiongemma-270m-it-BF16.gguf D=HTP0 OC=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 OC=0 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 OC=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
 ```
 
 ## Chapter 2 - GPU Hardware Architecture
@@ -333,13 +333,13 @@ M=functiongemma-270m-it-BF16.gguf D=HTP0 OC=1 PROF=1 ./scripts/snapdragon/adb/ru
 
 ```bash
 # HVX worker 数量
-M=functiongemma-270m-it-BF16.gguf D=HTP0 NHVX=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
-M=functiongemma-270m-it-BF16.gguf D=HTP0 NHVX=4 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 NHVX=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 NHVX=4 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
 
 # Matmul path 选择
-M=functiongemma-270m-it-BF16.gguf D=HTP0 MM=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
-M=functiongemma-270m-it-BF16.gguf D=HTP0 MM=2 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
-M=functiongemma-270m-it-BF16.gguf D=HTP0 MM=3 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 MM=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 MM=2 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 MM=3 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
 ```
 
 ## Chapter 9 - Arithmetic Intensity & Kernel Fusion
@@ -553,7 +553,7 @@ M=functiongemma-270m-it-BF16.gguf D=HTP0 MM=3 PROF=1 ./scripts/snapdragon/adb/ru
 
 ```bash
 cd /media/code/llm/llama/llama.cpp/
-M=functiongemma-270m-it-BF16.gguf D=HTP0 V=1 \
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 V=1 \
   ./scripts/snapdragon/adb/run-completion.sh \
   -p "what is the most popular cookie in the world?" --verbose
 ```
@@ -564,13 +564,13 @@ M=functiongemma-270m-it-BF16.gguf D=HTP0 V=1 \
 
 ```bash
 # per-op/basic profile
-M=functiongemma-270m-it-BF16.gguf D=HTP0 V=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 V=1 PROF=1 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
 
 # PMU profile
-M=functiongemma-270m-it-BF16.gguf D=HTP0 V=1 PROF=2 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 V=1 PROF=2 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
 
 # trace profile
-M=functiongemma-270m-it-BF16.gguf D=HTP0 V=1 PROF=3 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
+M=smollm2-360m-instruct-q4_k_m.gguf D=HTP0 V=1 PROF=3 ./scripts/snapdragon/adb/run-completion.sh -p "hello" -n 32
 ```
 
 通过标准：能分辨 DMA、HVX、HMX、FlashAttention 子阶段；对每个优化结论都能说明收益来自 fewer ops、better matmul path、less fallback、lower memory traffic、better queue overlap 中的哪一个。
