@@ -175,7 +175,9 @@ def _query_via_nvml(logical_index: int) -> Dict[str, Optional[float]]:
             pynvml.nvmlDeviceGetTemperature, handle, pynvml.NVML_TEMPERATURE_MEMORY  # type: ignore[attr-defined]
         )
 
-    power_draw_mw = pynvml.nvmlDeviceGetPowerUsage(handle)  # type: ignore[attr-defined]
+    power_draw_mw_w = _optional_nvml_float(
+        pynvml.nvmlDeviceGetPowerUsage, handle # type: ignore[attr-defined]
+    )
     utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)  # type: ignore[attr-defined]
     graphics_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_SM)  # type: ignore[attr-defined]
     memory_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)  # type: ignore[attr-defined]
@@ -189,7 +191,7 @@ def _query_via_nvml(logical_index: int) -> Dict[str, Optional[float]]:
     metrics: Dict[str, Optional[float]] = {
         "temperature_gpu_c": float(temp_gpu),
         "temperature_memory_c": temp_mem,
-        "power_draw_w": float(power_draw_mw) / 1000.0,
+        "power_draw_w": power_draw_mw_w,
         "fan_speed_pct": None,  # nvmlDeviceGetFanSpeed may raise NotSupported on datacenter GPUs
         "utilization_gpu_pct": float(utilization.gpu),  # type: ignore[attr-defined]
         "utilization_memory_pct": float(utilization.memory),  # type: ignore[attr-defined]
