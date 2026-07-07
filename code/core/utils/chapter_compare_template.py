@@ -411,7 +411,7 @@ def profile_template(
         logger.info(f"\nExample: {example_name}\n{table}")
     
     cli_args = _parse_compare_cli_args()
-    portable_examples = {"cpu_minimal", "htp_minimal"}
+    portable_examples = {"cpu_minimal", "htp_minimal", "htp_cuda_fair"}
     portable_examples_only = bool(cli_args.examples) and set(cli_args.examples).issubset(portable_examples)
 
     if not torch.cuda.is_available() and not portable_examples_only:

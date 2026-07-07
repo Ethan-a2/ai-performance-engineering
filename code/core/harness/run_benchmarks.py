@@ -4802,7 +4802,7 @@ def _test_chapter_impl(
         )
 
     requested_examples = {name.strip() for name in (only_examples or []) if name.strip()}
-    portable_targets = {"cpu_minimal", "htp_minimal"}
+    portable_targets = {"cpu_minimal", "htp_minimal", "htp_cuda_fair"}
     portable_target_possible = not only_cuda and (
         not requested_examples or bool(requested_examples & portable_targets)
     )
@@ -4974,9 +4974,9 @@ def _test_chapter_impl(
         profile_type = "none"
         enforce_environment_validation = False
         profiling_output_dir = None
-        if requested_examples == {"htp_minimal"}:
+        if requested_examples and requested_examples.issubset({"htp_minimal", "htp_cuda_fair"}):
             logger.warning(
-                "CUDA not available; running explicit HTP target htp_minimal. "
+                "CUDA not available; running explicit HTP target. "
                 "HTP capability checks remain explicit and may report SKIPPED."
             )
         else:

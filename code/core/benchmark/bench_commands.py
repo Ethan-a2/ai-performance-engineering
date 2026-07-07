@@ -660,7 +660,7 @@ def _execute_benchmarks(
             return False
         if not chapter_dirs:
             return False
-        portable_targets = {"cpu_minimal", "htp_minimal"}
+        portable_targets = {"cpu_minimal", "htp_minimal", "htp_cuda_fair"}
         for chapter_dir in chapter_dirs:
             chapter_id = chapter_slug(chapter_dir, active_bench_root, bench_root=active_bench_root)
             example_filter = chapter_filters.get(chapter_id)

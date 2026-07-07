@@ -64,15 +64,41 @@ CUDA 侧也使用 llama.cpp/ggml CUDA backend，而不是 PyTorch minimal：
 - 后端选择参数为 `--backend cuda` 或 `--backend htp`。
 - CUDA 结果作为同图 CUDA 实现，不混入 repo 现有章节里的 Blackwell/Triton/CUTLASS 特化目标。
 
+## 当前工程实现
+
+当前落地为 `llama.cpp` 同一 benchmark binary + 本工程章节封装：
+
+- 外部 ggml binary：`/media/code/llm/llama/llama.cpp/examples/fair-htp-cuda-bench/`
+- 当前工程封装：`core/benchmark/htp_cuda_fair.py`
+- 章节入口：`ch01/compare_htp_cuda_fair.py` 至 `ch20/compare_htp_cuda_fair.py`
+- 默认对比 backend：`AISP_HTP_CUDA_FAIR_BACKENDS=htp,cuda`
+- CPU 冒烟模式：`AISP_HTP_CUDA_FAIR_BACKENDS=cpu python ch01/compare_htp_cuda_fair.py`
+- HTP/CUDA 模式：`python ch11/compare_htp_cuda_fair.py`
+
+封装会自动按需构建：
+
+```bash
+cmake -B build-fair-cuda -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DGGML_OPENCL=OFF -DGGML_HEXAGON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build build-fair-cuda --target llama-fair-htp-cuda-bench -j16
+
+cmake --preset arm64-android-snapdragon-release -B build-snapdragon -DGGML_OPENCL=OFF
+cmake --build build-snapdragon --target llama-fair-htp-cuda-bench -j16
+```
+
+如果 CUDA toolkit、ADB、Snapdragon/HTP runtime 或 backend op 支持缺失，结果必须显式为 `SKIPPED:` 或 `INVALID:`，不会把 fallback 当成有效性能数字。
+
 ## Benchmark case 集合
 
-v0 先选择 HTP 和 CUDA 都可支持、且能代表 LLM 热路径的 3 个 case。所有 case 都用同一个 `fair_case_spec.json` 驱动。
+v0 选择 HTP 和 CUDA 都可支持、且能覆盖当前章节 CUDA minimal 优化主题的 4 个 case。
 
-| Case | 图边界 | Shape | Precision | 输出 | 目的 |
+| Case | 对应 CUDA 章节主题 | 图边界 | 默认 Shape | Precision | 目的 |
 | --- | --- | --- | --- | --- | --- |
-| `mm_decode_f16` | 单个 decode matmul：`Y = W @ X` | `batch=1, seq=1, in=1024, out=1024` | `W=f16, X=f16, Y=f32` | `Y[1024]` | 最小 GEMM 公平底座，验证同 dtype 与 VTCM 支持 |
-| `mlp_swiglu_f16` | `down(silu(gate(x)) * up(x))` | `hidden=1024, intermediate=2816, batch=1, seq=1` | weights/activation f16，acc/output f32 | `Y[1024]` | 对齐 LLM MLP 热路径，覆盖 matmul + activation + elementwise |
-| `attn_decode_f16_kv512` | 单 token decode attention | `hidden=1024, heads=8, head_dim=128, kv_len=512` | QKV/activation f16，scores/output f32 | `Y[1024]` | 对齐 decode attention + KV cache 边界，覆盖 RoPE/softmax/attention |
+| `mm_decode_f16` | small GEMM 合并 / backend specialization | `Y = W @ X` | `in=1024, out=1024` | `W=f16, X=f16, Y=f32` | 对齐 CH01/02/03/10/14/16 的 GEMM/编译/后端优化主题 |
+| `elementwise_fusion_f32` | pipeline/operator fusion | `Y = A * B + C` | `512 x 512 elements` | `A/B/C/Y=f32` | 对齐 CH04/06/08/09/20 的融合、ILP、带宽优化主题 |
+| `copy_f16_to_f32` | vectorized/coalesced copy | `Y = cpy(X)` | `1024 x 1024 elements` | `X=f16, Y=f32` | 对齐 CH05/07/19 的拷贝、预处理、低精度流量优化主题 |
+| `kv_set_rows_f16` | KV cache block update | `cache[indices] = update` | `width=1024, update_rows=64` | `cache=f16, update=f32, output=f16` | 对齐 CH11/12/13/15/17/18 的 KV/cache/launch amortization 主题 |
+
+章节映射在 `core/benchmark/htp_cuda_fair.py` 的 `CHAPTER_SCENARIOS` 中维护；每章保留与对应 CUDA minimal 类似的优化语义，但同一章的 HTP 与 CUDA 对比使用完全相同的 ggml graph、shape、seed、误差预算和计时边界。
 
 v1 扩展项：
 
@@ -91,14 +117,11 @@ v1 扩展项：
 {
   "suite": "htp_cuda_fair_v0",
   "seed": 20260707,
-  "precision": "f16_weight_f16_activation_f32_output",
-  "warmup": 10,
-  "iterations": 100,
+  "warmup": 2,
+  "iterations": 8,
   "cases": [
     {
       "name": "mm_decode_f16",
-      "batch": 1,
-      "seq": 1,
       "in_features": 1024,
       "out_features": 1024,
       "dtype_weight": "f16",
@@ -108,41 +131,44 @@ v1 扩展项：
       "rel_tol": 0.05
     },
     {
-      "name": "mlp_swiglu_f16",
-      "batch": 1,
-      "seq": 1,
-      "hidden": 1024,
-      "intermediate": 2816,
-      "dtype_weight": "f16",
-      "dtype_activation": "f16",
+      "name": "elementwise_fusion_f32",
+      "elements": 262144,
+      "logical_shape": [512, 512],
+      "dtype_input": "f32",
       "dtype_output": "f32",
-      "abs_tol": 0.20,
-      "rel_tol": 0.08
+      "abs_tol": 0.08,
+      "rel_tol": 0.05
     },
     {
-      "name": "attn_decode_f16_kv512",
-      "batch": 1,
-      "seq": 1,
-      "hidden": 1024,
-      "heads": 8,
-      "head_dim": 128,
-      "kv_len": 512,
-      "dtype_weight": "f16",
-      "dtype_activation": "f16",
+      "name": "copy_f16_to_f32",
+      "elements": 1048576,
+      "logical_shape": [1024, 1024],
+      "dtype_input": "f16",
       "dtype_output": "f32",
-      "abs_tol": 0.25,
-      "rel_tol": 0.10
+      "abs_tol": 0.08,
+      "rel_tol": 0.05
+    },
+    {
+      "name": "kv_set_rows_f16",
+      "width": 1024,
+      "update_rows": 64,
+      "cache_rows": 135,
+      "dtype_cache": "f16",
+      "dtype_update": "f32",
+      "dtype_output": "f16",
+      "abs_tol": 0.08,
+      "rel_tol": 0.05
     }
   ]
 }
 ```
 
-### 为什么先选 `hidden=1024`
+### 为什么先选 `1024` 与 `512 x 512`
 
-- 足够像 LLM decode 热路径，但不会一开始就把 HTP VTCM、Android memory、ADB artifact 流程压到极限。
-- `head_dim=128`、`hidden=1024` 对 HTP/CUDA 都是常见对齐形状。
-- `intermediate=2816` 接近 Llama 小模型比例，避免过小 shape 只测 launch 固定成本。
-- 后续可以扩展到 `hidden=2048/4096`，但 v0 应先建立无 fallback、公平输入和误差闭环。
+- `1024 x 1024` matmul 足够像 decode GEMM 热路径，但不会一开始就把 HTP VTCM、Android memory、ADB artifact 流程压到极限。
+- `512 x 512` elementwise fusion 保持足够的内存流量，避免过小 shape 只测 launch 固定成本。
+- `width=1024, update_rows=64` 的 KV 写回能覆盖 cache row update，同时保持 HTP/CUDA 都容易无 fallback 执行。
+- 后续可以扩展到 `hidden=2048/4096` 或完整 transformer block，但 v0 应先建立无 fallback、公平输入和误差闭环。
 
 ## 输入生成与 artifact 契约
 
@@ -161,12 +187,13 @@ artifacts/fair_htp_cuda/<RUN_ID>/
   inputs/
     mm_decode_f16.weights.f16.bin
     mm_decode_f16.x.f16.bin
-    mlp_swiglu_f16.w_gate.f16.bin
-    mlp_swiglu_f16.w_up.f16.bin
-    mlp_swiglu_f16.w_down.f16.bin
-    attn_decode_f16_kv512.qkv_weights.f16.bin
-    attn_decode_f16_kv512.k_cache.f16.bin
-    attn_decode_f16_kv512.v_cache.f16.bin
+    elementwise_fusion_f32.a.f32.bin
+    elementwise_fusion_f32.b.f32.bin
+    elementwise_fusion_f32.c.f32.bin
+    copy_f16_to_f32.x.f16.bin
+    kv_set_rows_f16.cache.f16.bin
+    kv_set_rows_f16.update.f32.bin
+    kv_set_rows_f16.indices.i32.bin
   reference/
     <case>.cpu_f32_output.f32.bin
     <case>.reference_metrics.json
@@ -511,4 +538,3 @@ v0 只有同时满足下面条件才算公平 benchmark 可用：
 - 这套 benchmark 不替代现有 `chXX/compare_htp_minimal.py`；后者仍是教学/覆盖入口。
 - 这套 benchmark 也不替代各章默认 CUDA canonical 数字；它是一个新的 **HTP-vs-CUDA fair pair**，用来回答“同 shape/输入/精度/边界下，HTP 与 CUDA 的实际差异”。
 - 如果后续把结果写入章节对比文档，必须明确标注为 `fair_htp_cuda_v0`，不能混入 `htp_minimal` 或 `gpu_minimal` speedup 表。
-
