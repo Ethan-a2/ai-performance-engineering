@@ -1314,6 +1314,8 @@ Autotune 必须：
 
 ## 9. Adreno 专项最佳实践
 
+3×3 homography、OpenCL image sampler、CandySDK 定位比较与 Adreno 840 真机实现见：`docs/candysdk-and-adreno-3x3-matrix-warp.md`。
+
 ### 9.1 必须 runtime 查询，禁止按型号硬编码
 
 检查：
